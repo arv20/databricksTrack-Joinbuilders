@@ -27,7 +27,7 @@ fn resolve_all(g: &G, t: &mut TState) {
     }
 }
 
-fn clicks_a(g: &G, tid: usize) {
+pub fn clicks_a(g: &G, tid: usize) {
     let t = g.t(tid);
     resolve_all(g, t);
     loop {
@@ -54,17 +54,35 @@ fn clicks_a(g: &G, tid: usize) {
     t.odd_clicks = odd;
 }
 
-fn persons_b(g: &G, tid: usize) {
-    let t = g.t(tid);
-    let mut evs: Vec<Rec> = Vec::new();
-    let mut cks: Vec<[u64; 3]> = Vec::new();
-    let mut dec: Vec<(u128, u64, [u64; 3])> = Vec::new();
-    let mut name = Vec::new();
+#[derive(Default)]
+pub struct PScratch {
+    evs: Vec<Rec>,
+    cks: Vec<[u64; 3]>,
+    dec: Vec<(u128, u64, [u64; 3])>,
+    name: Vec<u8>,
+}
+
+pub fn shard_order(g: &G) -> Vec<usize> {
+    let mut w: Vec<(usize, usize)> = (0..NSHARD).map(|s| ((0..g.nt).map(|th| g.t(th).cx_ev[s].len() + g.t(th).cx_ck[s].len()).sum(), s)).collect();
+    w.sort_unstable_by(|a, b| b.cmp(a));
+    w.into_iter().map(|x| x.1).collect()
+}
+
+fn persons_b(g: &G, tid: usize, order: &[usize]) {
+    let mut sc = PScratch::default();
     loop {
-        let s = g.next.fetch_add(1, Ordering::Relaxed);
-        if s >= NSHARD {
+        let i = g.next.fetch_add(1, Ordering::Relaxed);
+        if i >= order.len() {
             break;
         }
+        person_shard(g, tid, order[i], &mut sc);
+    }
+}
+
+pub fn person_shard(g: &G, tid: usize, s: usize, sc: &mut PScratch) {
+    let t = g.t(tid);
+    let PScratch { evs, cks, dec, name } = sc;
+    {
         evs.clear();
         cks.clear();
         for th in 0..g.nt {
@@ -72,14 +90,14 @@ fn persons_b(g: &G, tid: usize) {
             cks.extend_from_slice(&g.t(th).cx_ck[s]);
         }
         if evs.is_empty() {
-            continue;
+            return;
         }
         evs.sort_unstable_by_key(|r| (r.w1 as u128) << 64 | r.w0 as u128);
         if cks.iter().all(|c| c[2] & RAW == 0) {
             dec.clear();
             dec.extend(cks.iter().map(|c| ((c[0] as u128) << 64 | (c[1] >> 32) as u128, !enc36(c[2]).0, *c)));
             dec.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
-            for (d, x) in cks.iter_mut().zip(&dec) {
+            for (d, x) in cks.iter_mut().zip(dec.iter()) {
                 *d = x.2;
             }
         } else {
@@ -100,14 +118,31 @@ fn persons_b(g: &G, tid: usize) {
                 t.ck.push([cks[j][1], cks[j][2]]);
                 j += 1;
             }
-            name_of(g, pk, &mut name);
-            t.core.person(g, &evs[i..i2], &t.ck, Name::Bytes(&name));
+            name_of(g, pk, name);
+            t.core.person(g, &evs[i..i2], &t.ck, Name::Bytes(name));
             i = i2;
         }
     }
 }
 
 pub fn stage4(g: &mut G) {
+    stage4_pre(g);
+    g.next.store(0, Ordering::Relaxed);
+    {
+        let gr: &G = g;
+        sys::run_par(gr.nt, |tid| clicks_a(gr, tid));
+    }
+    crate::sys::lap("c.a");
+    let order = shard_order(g);
+    g.next.store(0, Ordering::Relaxed);
+    {
+        let gr: &G = g;
+        let o = &order;
+        sys::run_par(gr.nt, |tid| persons_b(gr, tid, o));
+    }
+}
+
+pub fn stage4_pre(g: &mut G) {
     let users: Vec<u32> = g.extra.keys().copied().collect();
     for u in users {
         let tv = unsafe { *g.utab.add(u as usize) };
@@ -133,15 +168,4 @@ pub fn stage4(g: &mut G) {
     }
     g.cxu = cxu;
     crate::sys::lap("c.pre");
-    g.next.store(0, Ordering::Relaxed);
-    {
-        let gr: &G = g;
-        sys::run_par(gr.nt, |tid| clicks_a(gr, tid));
-    }
-    crate::sys::lap("c.a");
-    g.next.store(0, Ordering::Relaxed);
-    {
-        let gr: &G = g;
-        sys::run_par(gr.nt, |tid| persons_b(gr, tid));
-    }
 }

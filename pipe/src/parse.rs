@@ -253,19 +253,31 @@ impl Out {
 }
 
 struct Tabs {
-    prod: Vec<u8>,
-    camp: Vec<u8>,
+    prod: std::mem::ManuallyDrop<Vec<u8>>,
+    camp: std::mem::ManuallyDrop<Vec<u8>>,
 }
 static TABS: std::sync::OnceLock<Tabs> = std::sync::OnceLock::new();
-fn tabs(g: &G) -> &'static Tabs {
-    TABS.get_or_init(|| {
-        let mut prod = vec![0u8; PBOUND + 1 + 64];
-        prod[..PBOUND + 1].copy_from_slice(&g.prod[..PBOUND + 1]);
-        let mut camp = vec![255u8; CBOUND + 64];
-        camp[..CBOUND].copy_from_slice(&g.camp[..CBOUND]);
-        Tabs { prod, camp }
-    })
+fn make_tabs(gprod: &[u8], gcamp: &[u8]) -> Tabs {
+    let mut prod = vec![0u8; PBOUND + 1 + 64];
+    prod[..PBOUND + 1].copy_from_slice(&gprod[..PBOUND + 1]);
+    let mut camp = vec![255u8; CBOUND + 64];
+    camp[..CBOUND].copy_from_slice(&gcamp[..CBOUND]);
+    Tabs { prod: std::mem::ManuallyDrop::new(prod), camp: std::mem::ManuallyDrop::new(camp) }
 }
+fn tabs(g: &G) -> &'static Tabs {
+    TABS.get_or_init(|| make_tabs(&g.prod, &g.camp))
+}
+pub fn init_tabs(prod: &[u8], camp: &[u8]) {
+    let _ = TABS.set(make_tabs(prod, camp));
+}
+pub unsafe fn init_tabs_shared(prod: *const u8, np: usize, camp: *const u8, nc: usize) {
+    if np < PBOUND + 1 + 64 || nc < CBOUND + 64 {
+        fallback("lookup table padding");
+    }
+    let v = |p: *const u8, n: usize| std::mem::ManuallyDrop::new(Vec::from_raw_parts(p as *mut u8, n, n));
+    let _ = TABS.set(Tabs { prod: v(prod, np), camp: v(camp, nc) });
+}
+pub static CORE_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct Ctx<'a> {
     g: &'a G,
@@ -305,7 +317,9 @@ impl<'a> Ctx<'a> {
         if idx >= (1 << 34) {
             fallback("too many raw IDs");
         }
-        self.t.raws.push((off, len as u32));
+        let at = self.t.rawbuf.len() as u64;
+        self.t.rawbuf.extend_from_slice(unsafe { std::slice::from_raw_parts(self.g.region.add(off as usize), len) });
+        self.t.raws.push((at, len as u32));
         RAW | self.tid << 34 | idx
     }
 
@@ -1184,6 +1198,9 @@ fn drv() -> &'static Drv {
         Drv { rd: n("XL_RD", RD_DEFAULT) << 10, pin: n("XL_PIN", PIN_DEFAULT) as u32, qord: n("XL_QORD", QORD_DEFAULT) as u32, ch: n("XL_CH", CH_DEFAULT) << 10 }
     })
 }
+pub fn pin_mode() -> u32 {
+    drv().pin
+}
 const RD_DEFAULT: usize = env_u32(option_env!("XL_RD_DEF"), 0) as usize;
 const PIN_DEFAULT: usize = env_u32(option_env!("XL_PIN_DEF"), 2) as usize;
 const QORD_DEFAULT: usize = env_u32(option_env!("XL_QORD_DEF"), 0) as usize;
@@ -1201,6 +1218,16 @@ pub unsafe fn keep_fd(f: std::fs::File) {
     FDS.push(-1);
 }
 const KEEP_FDS: usize = 40;
+#[allow(static_mut_refs)]
+pub unsafe fn fds_init(n: usize) {
+    FDS = vec![-1; n];
+}
+#[allow(static_mut_refs)]
+pub unsafe fn set_fd(i: usize, f: std::fs::File) {
+    if drv().rd > 0 && i < KEEP_FDS {
+        *FDS.as_mut_ptr().add(i) = std::os::fd::IntoRawFd::into_raw_fd(f);
+    }
+}
 extern "C" {
     fn pread(fd: i32, buf: *mut u8, n: usize, off: i64) -> isize;
     fn syscall(n: i64, ...) -> i64;
@@ -1221,7 +1248,7 @@ unsafe fn read_at(fd: i32, dst: *mut u8, n: usize, off: usize, flen: usize) -> u
     got
 }
 
-fn cpu_order() -> &'static Vec<usize> {
+pub(crate) fn cpu_order() -> &'static Vec<usize> {
     static O: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
     O.get_or_init(|| {
         let mut m = [0u64; 16];
@@ -1380,9 +1407,12 @@ unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, ou
 pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "pmu")]
     let pm = pmu::start();
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 0);
     let d = drv();
     let mut saved = [0u64; 16];
-    let pinned = d.pin != 0 && {
+    let pre = tid >= 1 && tid < 16 && crate::sys::PINNED[tid].load(Ordering::Acquire);
+    let pinned = d.pin != 0 && !pre && {
         let o = cpu_order();
         !o.is_empty() && unsafe { syscall(204, 0i32, 128usize, saved.as_mut_ptr()) } > 0 && {
             let cpu = o[tid % o.len()];
@@ -1391,24 +1421,48 @@ pub fn stage1(g: &G, tid: usize) {
             unsafe { syscall(203, 0i32, 128usize, m.as_ptr()) == 0 }
         }
     };
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 6);
     let t = g.t(tid);
     t.ev = Part::new(&g.ev_arena, g.nb);
     t.us = Part::new(&g.us_arena, g.nub);
-    t.core = crate::core::Core::new(g.nc, g.nd, g.row_cap, g.ws_mod, g.day0);
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 7);
+    if !CORE_READY.load(Ordering::Relaxed) {
+        t.core = crate::core::Core::new(g.nc, g.nd, g.row_cap, g.ws_mod, g.day0);
+    }
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 8);
     let mut eb = EvBatch::new();
     let mut cb = CkBatch::new();
     let mut out = Out::new();
     let tb = tabs(g);
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 9);
     let rd = d.rd;
     #[allow(static_mut_refs)]
     let fds: &[i32] = unsafe { &FDS };
     let use_rd = rd > 0 && fds.len() == g.files.len() && unsafe { SKIP } & 512 == 0;
     let rb = if use_rd { unsafe { anon(rd + 8192).add(4096) } } else { std::ptr::null_mut() };
     let q = work_queue(g);
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 1);
+    #[cfg(feature = "tl")]
+    let mut first = true;
     loop {
         let i = g.qnext.fetch_add(1, Ordering::Relaxed);
         if i >= q.len() {
             break;
+        }
+        #[cfg(feature = "tl")]
+        if first {
+            crate::sys::tl::mark(tid, 2);
+        } else if unsafe { crate::sys::tl::MK[tid][3] } == 0 {
+            crate::sys::tl::mark(tid, 3);
+        }
+        #[cfg(feature = "tl")]
+        {
+            first = false;
         }
         let c = q[i];
         let f = &g.files[c.file as usize];
@@ -1442,8 +1496,12 @@ pub fn stage1(g: &G, tid: usize) {
             }
         }
     }
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 4);
     t.ev.finish();
     t.us.finish();
+    #[cfg(feature = "tl")]
+    crate::sys::tl::mark(tid, 5);
     if !rb.is_null() {
         unsafe { madvise(rb.sub(4096), rd + 8192, MADV_DONTNEED) };
     }

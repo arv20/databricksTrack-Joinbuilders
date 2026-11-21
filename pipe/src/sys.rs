@@ -46,6 +46,22 @@ pub unsafe fn release_heap_part(tid: usize, nt: usize) {
     release((base + a) as *const u8, b - a);
 }
 pub static RELEASE: AtomicBool = AtomicBool::new(true);
+pub static ANON_REGION: AtomicBool = AtomicBool::new(true);
+pub static ANON_TINY: AtomicBool = AtomicBool::new(false);
+pub static PREFAULT: AtomicBool = AtomicBool::new(false);
+pub static FIRST_SMALL: AtomicBool = AtomicBool::new(false);
+pub static PIN_AT_START: AtomicBool = AtomicBool::new(false);
+pub static PINNED: [AtomicBool; 16] = [const { AtomicBool::new(false) }; 16];
+pub static SPIN_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100_000);
+
+pub fn pin_to(cpu: usize) -> bool {
+    let mut m = [0u64; 16];
+    if cpu >= 1024 {
+        return false;
+    }
+    m[cpu / 64] |= 1 << (cpu % 64);
+    unsafe { syscall(203, 0i32, 128usize, m.as_ptr()) == 0 }
+}
 
 pub static WORKERS: AtomicBool = AtomicBool::new(false);
 
@@ -93,7 +109,19 @@ pub fn fallback(why: &str) -> ! {
 }
 
 pub fn anon(len: usize) -> *mut u8 {
+    if ANON_TINY.load(Ordering::Relaxed) && len <= 4096 && A_BASE.load(Ordering::Relaxed) != 0 {
+        let p = a_region(4096, 4096);
+        if p != 0 {
+            return p as *mut u8;
+        }
+    }
     let len = (len + HP - 1) & !(HP - 1);
+    if ANON_REGION.load(Ordering::Relaxed) && A_BASE.load(Ordering::Relaxed) != 0 {
+        let p = a_region(len, HP);
+        if p != 0 {
+            return p as *mut u8;
+        }
+    }
     unsafe {
         let p = mmap(std::ptr::null_mut(), len + HP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if p as isize == -1 {
@@ -126,6 +154,9 @@ impl Arena {
     }
     pub fn used(&self) -> usize {
         self.next.load(Ordering::Relaxed)
+    }
+    pub fn span(&self) -> (*mut u8, usize) {
+        (self.base, self.cap)
     }
     pub fn release_part(&self, tid: usize, nt: usize) {
         if !RELEASE.load(Ordering::Relaxed) {
@@ -221,15 +252,29 @@ pub fn pool_start(nt: usize) {
     }
     WORKERS.store(true, Ordering::SeqCst);
     POOL_N.store(nt - 1, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        for t in 2..nt {
-            std::thread::spawn(move || worker(t));
-        }
-        worker(1)
-    });
+    std::thread::spawn(move || worker(1, nt));
 }
 
-fn worker(tid: usize) -> ! {
+fn worker(tid: usize, nt: usize) -> ! {
+    for c in [2 * tid, 2 * tid + 1] {
+        if c < nt {
+            std::thread::spawn(move || worker(c, nt));
+        }
+    }
+    #[cfg(feature = "tl")]
+    tl::mark(tid, 10);
+    if PIN_AT_START.load(Ordering::Relaxed) && tid < 16 {
+        let order = crate::parse::cpu_order();
+        if !order.is_empty() && pin_to(order[tid % order.len()]) {
+            PINNED[tid].store(true, Ordering::Release);
+        }
+    }
+    if PREFAULT.load(Ordering::Relaxed) {
+        prefault_chunk();
+    }
+    #[cfg(feature = "tl")]
+    tl::mark(tid, 11);
+    let spin = SPIN_TICKS.load(Ordering::Relaxed);
     let mut seen = 0u32;
     loop {
         let t0 = rdtsc();
@@ -239,7 +284,7 @@ fn worker(tid: usize) -> ! {
                 seen = g;
                 break;
             }
-            if rdtsc() - t0 < 100_000 {
+            if rdtsc() - t0 < spin {
                 std::hint::spin_loop();
                 continue;
             }
@@ -251,12 +296,26 @@ fn worker(tid: usize) -> ! {
             #[allow(static_mut_refs)]
             if let Some(f) = JOB {
                 if tid < JOB_NT {
+                    #[cfg(feature = "tl")]
+                    let c = tl::CUR;
+                    #[cfg(feature = "tl")]
+                    {
+                        tl::ST[c][tid] = tl::now();
+                    }
                     f(tid);
+                    #[cfg(feature = "tl")]
+                    {
+                        tl::EN[c][tid] = tl::now();
+                    }
                 }
             }
         }
         DONE.fetch_add(1, Ordering::AcqRel);
     }
+}
+
+pub fn pool_size() -> usize {
+    POOL_N.load(Ordering::SeqCst)
 }
 
 pub fn run_par<F: Fn(usize) + Sync>(nt: usize, f: F) {
@@ -277,16 +336,194 @@ pub fn run_par<F: Fn(usize) + Sync>(nt: usize, f: F) {
         JOB = Some(std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(r));
         JOB_NT = nt;
     }
+    #[cfg(feature = "tl")]
+    let c = unsafe {
+        let c = tl::CALL.min(tl::MAXC - 1);
+        tl::CALL = c + 1;
+        tl::CUR = c;
+        tl::NTH[c] = nt;
+        tl::POST[c] = tl::now();
+        c
+    };
     DONE.store(0, Ordering::SeqCst);
     GEN.fetch_add(1, Ordering::SeqCst);
     if SLEEPERS.load(Ordering::SeqCst) != 0 {
         unsafe { syscall(SYS_FUTEX, GEN.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX as i64, 0usize, 0usize, 0usize) };
     }
+    #[cfg(feature = "tl")]
+    unsafe {
+        tl::ST[c][0] = tl::now();
+    }
     f(0);
+    #[cfg(feature = "tl")]
+    unsafe {
+        tl::EN[c][0] = tl::now();
+    }
     while DONE.load(Ordering::Acquire) != n {
         std::hint::spin_loop();
     }
+    #[cfg(feature = "tl")]
+    unsafe {
+        tl::DONE_T[c] = tl::now();
+    }
     unsafe { JOB = None };
+}
+
+
+#[cfg(feature = "tl")]
+pub mod tl {
+    pub const MAXC: usize = 64;
+    pub static mut CALL: usize = 0;
+    pub static mut CUR: usize = 0;
+    pub static mut POST: [u64; MAXC] = [0; MAXC];
+    pub static mut DONE_T: [u64; MAXC] = [0; MAXC];
+    pub static mut NTH: [usize; MAXC] = [0; MAXC];
+    pub static mut ST: [[u64; 16]; MAXC] = [[0; 16]; MAXC];
+    pub static mut EN: [[u64; 16]; MAXC] = [[0; 16]; MAXC];
+    pub static mut MK: [[u64; 12]; 16] = [[0; 12]; 16];
+    pub static mut LAPT: Vec<(&'static str, u64)> = Vec::new();
+    pub static mut T0: u64 = 0;
+    pub static mut T0_NS: u64 = 0;
+    pub static mut REL: u64 = 0;
+    pub static WR_IO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static WR_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static WR_CLOSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static WR_COL: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+    pub static mut TASK: [(u64, u64, u64); 64] = [(0, 0, 0); 64];
+    pub static mut SH: [(u64, u64, u64); 64] = [(0, 0, 0); 64];
+    #[inline(always)]
+    pub fn now() -> u64 {
+        unsafe { std::arch::x86_64::_rdtsc() }
+    }
+    #[inline(always)]
+    pub fn mark(tid: usize, k: usize) {
+        unsafe {
+            if tid < 16 {
+                MK[tid][k] = now();
+            }
+        }
+    }
+    pub fn realtime_ns() -> u64 {
+        let mut t = [0i64; 2];
+        extern "C" {
+            fn clock_gettime(clk: i32, ts: *mut i64) -> i32;
+        }
+        unsafe { clock_gettime(0, t.as_mut_ptr()) };
+        t[0] as u64 * 1_000_000_000 + t[1] as u64
+    }
+    fn exit_prof(tpm: f64) {
+        extern "C" {
+            fn munmap(p: *mut u8, n: usize) -> i32;
+        }
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        let ab = super::A_BASE.load(std::sync::atomic::Ordering::Relaxed);
+        let mut v: Vec<(usize, usize, u8)> = Vec::with_capacity(4096);
+        for l in maps.lines() {
+            let mut it = l.split_whitespace();
+            let r = it.next().unwrap_or("");
+            let perm = it.next().unwrap_or("");
+            let _off = it.next();
+            let _dev = it.next();
+            let ino = it.next().unwrap_or("0");
+            let name = it.next().unwrap_or("");
+            let mut rr = r.split('-');
+            let a = usize::from_str_radix(rr.next().unwrap_or("0"), 16).unwrap_or(0);
+            let b = usize::from_str_radix(rr.next().unwrap_or("0"), 16).unwrap_or(0);
+            if name.starts_with('[') || name.contains("pipeline") || name.contains("s_tl") || (ab != 0 && a <= ab && ab < b) {
+                continue;
+            }
+            let kind = if ino != "0" { 0 } else if perm.starts_with("---") { 2 } else { 1 };
+            v.push((a, b, kind));
+        }
+        let mut tk = [0u64; 3];
+        let mut nk = [0usize; 3];
+        let mut sz = [0usize; 3];
+        for &(a, b, k) in &v {
+            let t = now();
+            unsafe { munmap(a as *mut u8, b - a) };
+            tk[k as usize] += now() - t;
+            nk[k as usize] += 1;
+            sz[k as usize] += b - a;
+        }
+        eprintln!("[tl] exitprof: file {} vmas {:.0} MB {:.3} ms | anon {} vmas {:.0} MB {:.3} ms | none {} vmas {:.3} ms", nk[0], sz[0] as f64 / 1e6, tk[0] as f64 / tpm, nk[1], sz[1] as f64 / 1e6, tk[1] as f64 / tpm, nk[2], tk[2] as f64 / tpm);
+    }
+    #[allow(static_mut_refs)]
+    pub fn report(t0: std::time::Instant) {
+        unsafe {
+            let tn = now();
+            let el = t0.elapsed().as_secs_f64() * 1e3;
+            let tpm = (tn - T0) as f64 / el;
+            let ms = |a: u64, b: u64| (b as f64 - a as f64) / tpm;
+            eprintln!("[tl] realtime_ns start={} end={} endrel_ms={:.3}", T0_NS, realtime_ns(), REL as f64 / tpm);
+            let mut prev = T0;
+            let mut c = 0usize;
+            let mut tot_idle = 0.0;
+            for &(name, t) in LAPT.iter() {
+                let lw = ms(prev, t);
+                let mut par = 0.0;
+                let mut s = String::new();
+                while c < CALL && POST[c] < t {
+                    let n = NTH[c];
+                    let w = ms(POST[c], DONE_T[c]);
+                    let mut busy = 0.0;
+                    let (mut lag, mut mine, mut maxe) = (0.0f64, f64::MAX, 0.0f64);
+                    for k in 0..n {
+                        busy += ms(ST[c][k], EN[c][k]);
+                        lag = lag.max(ms(POST[c], ST[c][k]));
+                        mine = mine.min(ms(POST[c], EN[c][k]));
+                        maxe = maxe.max(ms(POST[c], EN[c][k]));
+                    }
+                    let idle = w * n as f64 - busy;
+                    tot_idle += idle;
+                    s.push_str(&format!(" | job{c}: wall {w:.2} busy {busy:.1} idle {idle:.2} ({:.0}%) wake_lag {lag:.3} first_end {mine:.2} last_end {maxe:.2} done {:.3}", 100.0 * idle / (w * n as f64), w - maxe));
+                    par += w;
+                    c += 1;
+                }
+                let ser = lw - par;
+                eprintln!("[tl] {name:>10} wall {lw:6.2} serial {ser:5.2}{s}");
+                prev = t;
+            }
+            eprintln!("[tl] total {el:.2} ms; idle in jobs {tot_idle:.1} thread-ms");
+            let o = std::sync::atomic::Ordering::Relaxed;
+            eprintln!("[tl] write syscalls (thread-ms): create {:.2} write {:.2} close {:.2}", WR_OPEN.load(o) as f64 / tpm, WR_IO.load(o) as f64 / tpm, WR_CLOSE.load(o) as f64 / tpm);
+            eprintln!("[tl] write columns (thread-ms, incl. flushes inside): {:?} plan {:.2}", (0..7).map(|j| format!("{:.2}", WR_COL[j].load(o) as f64 / tpm)).collect::<Vec<_>>(), WR_COL[7].load(o) as f64 / tpm);
+            let mut s = String::new();
+            for t in 0..15 {
+                if MK[t][0] == 0 {
+                    continue;
+                }
+                let b = POST[0];
+                s.push_str(&format!("\n[tl] parse t{t}: start {:.3} pin {:.3} parts {:.3} core {:.3} tabs {:.3} init {:.3} c1 {:.3}..{:.3} qempty {:.3} fin {:.3}", ms(b, MK[t][0]), ms(b, MK[t][6]), ms(b, MK[t][7]), ms(b, MK[t][8]), ms(b, MK[t][9]), ms(b, MK[t][1]), ms(b, MK[t][2]), ms(b, MK[t][3]), ms(b, MK[t][4]), ms(b, MK[t][5])));
+            }
+            eprintln!("[tl] parse marks (ms after post){s}");
+            let mut s = String::new();
+            for t in 1..15 {
+                if MK[t][10] != 0 {
+                    s.push_str(&format!(" t{t} {:.3}/{:.3}", ms(T0, MK[t][10]), ms(T0, MK[t][11])));
+                }
+            }
+            eprintln!("[tl] worker start/ready (ms after t0):{s}");
+            let mut s = String::new();
+            for (i, &(a, b, th)) in TASK.iter().enumerate() {
+                if a != 0 {
+                    s.push_str(&format!(" {i}:t{th} {:.3}-{:.3}", ms(T0, a), ms(T0, b)));
+                }
+            }
+            eprintln!("[tl] setup tasks (ms after t0):{s}");
+            let mut s = String::new();
+            for (i, &(a, b, sh)) in SH.iter().enumerate() {
+                if a != 0 && ms(a, b) > 0.05 {
+                    s.push_str(&format!(" {i}:s{sh} {:.3}+{:.3}", ms(T0, a), ms(a, b)));
+                }
+            }
+            eprintln!("[tl] shards over 0.05 ms (start+dur):{s}");
+            eprintln!("[tl] campaign: agg {:.3} cols {:.3} file {:.3}", ms(TASK[8].0, MK[15][4]), ms(MK[15][4], MK[15][5]), ms(MK[15][5], MK[15][6]));
+            eprintln!("[tl] lookups (ms after t0): start {:.3} prod read {:.3} prod parsed {:.3} done {:.3}", ms(T0, MK[15][0]), ms(T0, MK[15][1]), ms(T0, MK[15][2]), ms(T0, MK[15][3]));
+            if std::env::var("XL_EXITPROF").is_ok() {
+                exit_prof(tpm);
+            }
+        }
+    }
 }
 
 pub struct U64Map {
@@ -405,6 +642,24 @@ pub fn alloc_enable() {
     }
 }
 
+pub fn prefault_chunk() {
+    if A_BASE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let v: Vec<u64> = Vec::with_capacity(8);
+    std::hint::black_box(&v);
+    drop(v);
+    TL.with(|t| unsafe {
+        let t = &*t.get();
+        let mut p = (t.cur + 4095) & !4095;
+        let step = if HUGE.load(Ordering::Relaxed) { HP } else { 4096 };
+        while p < t.end {
+            std::ptr::write_volatile(p as *mut u8, 0);
+            p = (p + step) & !(step - 1);
+        }
+    });
+}
+
 #[inline(always)]
 fn a_class(size: usize, align: usize) -> usize {
     let s = size.max(align).max(16);
@@ -455,9 +710,13 @@ impl Alloc {
                 let al = sz.min(4096);
                 let mut a = (t.cur + al - 1) & !(al - 1);
                 if t.cur == 0 || a + sz > t.end {
+                    let first = t.cur == 0;
                     let ch = a_region(A_CHUNK, A_CHUNK);
                     if ch == 0 {
                         return 0;
+                    }
+                    if first && FIRST_SMALL.load(Ordering::Relaxed) && HUGE.load(Ordering::Relaxed) {
+                        madvise(ch as *mut u8, A_CHUNK, MADV_NOHUGEPAGE);
                     }
                     t.cur = ch;
                     t.end = ch + A_CHUNK;
@@ -525,6 +784,15 @@ pub fn lap(name: &'static str) {
         let now = std::time::Instant::now();
         if let Some(l) = LAST {
             LAPS.push((name, (now - l).as_secs_f64() * 1e3));
+        }
+        #[cfg(feature = "tl")]
+        tl::LAPT.push((name, tl::now()));
+        #[cfg(feature = "tl")]
+        if std::env::var("XL_RSSAT").is_ok() {
+            if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+                let f: Vec<&str> = s.lines().filter(|l| l.starts_with("RssFile") || l.starts_with("RssAnon")).collect();
+                eprintln!("[tl] after {name}: {:?}", f);
+            }
         }
         LAST = Some(now);
     }
