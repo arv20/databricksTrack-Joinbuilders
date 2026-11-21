@@ -1,10 +1,8 @@
 //! Nova's event pipeline. The scan builds one cache-friendly stream family by event ID.
 
-use crate::{
-    DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, hs, lap, pack_ref, parse_price,
-    unpack_ref,
-};
+use crate::{DAY, EvP, LazyChunks, P, People, ReadAhead, Users, event_rows, lap, parse_price};
 use ahash::AHashMap;
+use rayon::prelude::*;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
@@ -53,6 +51,59 @@ fn permute_short(key: u64) -> u64 {
 #[inline]
 pub(super) fn user_key(uid: &[u8]) -> Option<u64> {
     short_key(uid, b'u').map(permute_short)
+}
+
+#[derive(Default)]
+struct PersonName {
+    bytes: [u8; 9],
+    len: u8,
+}
+
+impl PersonName {
+    fn decode(key: u64) -> Self {
+        if key == 0 {
+            return Self::default();
+        }
+        const INVERSE: u64 = 0x71de_83e1_9937_733d;
+        let value = key & (SHORT_KEY - 1);
+        let mixed = value ^ (value >> 31) ^ (value >> 62);
+        let shifted = mixed.wrapping_mul(INVERSE) & (SHORT_KEY - 1);
+        let raw = shifted ^ (shifted >> 27) ^ (shifted >> 54);
+        let mut bytes = [0; 9];
+        bytes[0] = b'u' ^ (((raw >> 55) & 1) as u8 * 32);
+        bytes[1..].copy_from_slice(&(raw & 0x7f7f_7f7f_7f7f_7f7f).to_le_bytes());
+        let tail = if raw & (1 << 31) != 0 {
+            8
+        } else {
+            ((raw >> 7) & 1) | ((raw >> 14) & 2) | ((raw >> 21) & 4)
+        };
+        Self {
+            bytes,
+            len: tail as u8 + 1,
+        }
+    }
+}
+
+fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec<&'static [u8]>)> {
+    let n = (users.next.load(Relaxed) as usize).min(users.names.len());
+    if n < linked.len() || n >= crate::PERSON_SET as usize {
+        return None;
+    }
+    let names: &'static [PersonName] = Box::leak(
+        (linked.len()..n)
+            .into_par_iter()
+            .map(|id| PersonName::decode(users.names[id].load(Relaxed)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let mut all = Vec::with_capacity(n);
+    all.extend_from_slice(linked);
+    all.extend(
+        names
+            .iter()
+            .map(|person| &person.bytes[..person.len as usize]),
+    );
+    Some((n.div_ceil(P) as u32, all))
 }
 
 /// A producer owns disjoint blocks within demand-paged slabs. Stream order is
@@ -171,7 +222,6 @@ const _: () = assert!(size_of::<Event>() == 24);
 struct Pending {
     row: Event,
     uid: u64,
-    name: u64,
 }
 
 impl Pending {
@@ -184,7 +234,6 @@ impl Pending {
             price: 0,
         },
         uid: 0,
-        name: 0,
     };
 }
 
@@ -449,15 +498,6 @@ pub(super) struct EventInput<'a> {
     pub(super) end: i64,
 }
 
-#[inline]
-fn event_hash(key: u64) -> u64 {
-    if key & SHORT_KEY != 0 {
-        key
-    } else {
-        hs(unpack_ref(key), 0).0
-    }
-}
-
 struct Parser<'a, 'catalog, 'table> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
@@ -483,10 +523,9 @@ impl Parser<'_, '_, '_> {
             if row.ts != INVALID {
                 row.person =
                     self.users
-                        .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
+                        .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
             }
-            self.streams
-                .push((event_hash(row.key) >> 55) as u8 as usize, row);
+            self.streams.push((row.key >> 55) as u8 as usize, row);
         }
         self.count = 0;
     }
@@ -499,15 +538,11 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         if id.is_empty() {
             return;
         }
-        let key = match short_key(id, b'e') {
-            Some(key) => permute_short(key),
-            None => {
-                let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0) else {
-                    self.declined.store(true, Relaxed);
-                    return;
-                };
-                name
-            }
+        // The parser can release its input chunk after this call. No
+        // captured identities reference the source buffer.
+        let Some(key) = short_key(id, b'e').map(permute_short) else {
+            self.declined.store(true, Relaxed);
+            return;
         };
         let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
             self.declined.store(true, Relaxed);
@@ -548,14 +583,13 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.row.price = value | (category << 24);
             }
-            let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
+            let Some(uid) = user_key(user) else {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
             self.users.prefetch(uid);
             pending.row.ts = relative as u32;
             pending.uid = uid;
-            pending.name = name;
         }
         self.batch[self.count] = pending;
         self.count += 1;
@@ -649,7 +683,7 @@ impl Router {
 
         for (file, fold) in folds.iter().enumerate() {
             for (index, row) in fold.records(shard).enumerate() {
-                let hash = event_hash(row.key);
+                let hash = row.key;
                 let tag = ((hash >> 23) as u32) & !LOCATION_MASK;
                 let location = ((file << shift) + index + 1) as u32;
                 let mut slot = hash as usize & mask;
@@ -664,7 +698,7 @@ impl Router {
                         let prior_file = previous >> shift;
                         let prior_index = previous & (stride - 1);
                         let prior = folds[prior_file].get(shard, prior_index);
-                        if same_event(prior.key, row.key) {
+                        if prior.key == row.key {
                             // Invalid copies still compete for earliest ingest.
                             if row.ingest < prior.ingest {
                                 self.losers[self.bases[prior_file] + prior_index] = 1;
@@ -698,11 +732,6 @@ impl Router {
     }
 }
 
-#[inline]
-fn same_event(a: u64, b: u64) -> bool {
-    a == b || ((a | b) & SHORT_KEY == 0 && unpack_ref(a) == unpack_ref(b))
-}
-
 pub(super) fn run_events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
@@ -712,7 +741,10 @@ pub(super) fn run_events(
     declined: &AtomicBool,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
     let folds = events(work, read_ahead, users, input, declined);
-    let (local_count, names) = users.names(linked_names, declined);
+    if declined.load(Relaxed) {
+        return None;
+    }
+    let (local_count, names) = person_names(users, linked_names)?;
     lap(&format!(
         "events parsed (nova, {} folds, {} persons)",
         folds.len(),
@@ -750,6 +782,25 @@ pub(super) fn run_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_names_round_trip_byte_for_byte() {
+        for name in [
+            &b"u"[..],
+            b"U",
+            b"u0",
+            b"U\0",
+            b"u ab",
+            b"u00AB ",
+            b"U1234567",
+            b"uABCDEFGH",
+            b"U\0\0\0\0\0\0\0\0",
+            b"u\x7f1234567",
+        ] {
+            let decoded = PersonName::decode(user_key(name).unwrap());
+            assert_eq!(&decoded.bytes[..decoded.len as usize], name);
+        }
+    }
 
     #[test]
     fn timestamp_cache_and_word_decoder_match_general_parser() {
