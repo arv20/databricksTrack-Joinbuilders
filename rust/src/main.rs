@@ -564,6 +564,7 @@ impl Tab {
         Tab { slots: vec![(0, 0); cap], mask: cap - 1 }
     }
     #[inline]
+    #[allow(dead_code)]
     fn prefetch(&self, key: u64) {
         let index = (if key == 0 { 1 } else { key }) as usize & self.mask;
         let ptr = self.slots.as_ptr().wrapping_add(index);
@@ -579,6 +580,7 @@ impl Tab {
         let _ = ptr;
     }
     #[inline]
+    #[allow(dead_code)]
     fn get(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
@@ -613,9 +615,8 @@ const NO_EVENT: u64 = UNPARSED_INGEST - 1;
 /// can change during dedup, and only by the shard owning this copy's event ID.
 #[repr(C)]
 struct EvP {
-    // Low-only values are linked root IDs. Unlinked names have a nonzero
-    // length in their high 16 bits and point into the immutable input.
-    person: u64,
+    // The dense person id from the all-uid table: partition = person % P, local = person / P.
+    person: u32,
     ts: AtomicU32,
     price: u32,
 }
@@ -627,7 +628,7 @@ impl EvP {
     fn session_input(&self) -> Option<(u64, u64)> {
         let ts = self.ts.load(Relaxed);
         (ts != TOMBSTONE).then(|| {
-            (self.person, (u64::from(ts) << 32) | u64::from(self.price))
+            (u64::from(self.person), (u64::from(ts) << 32) | u64::from(self.price))
         })
     }
 
@@ -638,7 +639,7 @@ impl EvP {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<EvP>() == 16);
+const _: () = assert!(std::mem::size_of::<EvP>() == 12);
 
 /// Every well-formed event ID has a record, even when its copy is invalid.
 #[repr(C)]
@@ -799,6 +800,149 @@ impl ShortWriter<'_> {
         } else {
             self.overflow[shard].push(row);
         }
+    }
+}
+
+const PERSON_SET: u64 = 1 << 31;
+
+/// The all-uid table over the link table's slots (see `fast`): key, then
+/// (check << 32) | PERSON_SET | person. A claimed key whose value is still 0 is being
+/// inserted by another thread, which publishes the value right after its key.
+struct Users<'a> {
+    sl: &'a [std::sync::atomic::AtomicU64],
+    mask: usize,
+    limit: usize,
+    used: std::sync::atomic::AtomicUsize,
+    next: std::sync::atomic::AtomicU32,
+    names: &'a [std::sync::atomic::AtomicU64],
+}
+
+impl<'a> Users<'a> {
+    fn new(tab: &'a mut Tab, nids: usize, npersons: usize) -> Self {
+        use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
+        let cap = tab.mask + 1;
+        // The slots are not otherwise accessed until the table is dropped; AtomicU64 has u64's layout.
+        let sl = unsafe { std::slice::from_raw_parts(tab.slots.as_mut_ptr() as *const AtomicU64, cap * 2) };
+        // Dense ids never exceed: linked persons, one block of padding, one id per slot,
+        // and one partial block per worker.
+        let first = npersons.div_ceil(P) * P;
+        let ids = first + cap + (rayon::current_num_threads() + 1) * P;
+        let v: Vec<u64> = vec![0; ids];
+        let names = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const AtomicU64, ids) };
+        std::mem::forget(v);
+        Users { sl, mask: tab.mask, limit: cap / 4 * 3, used: AtomicUsize::new(nids), next: AtomicU32::new(first as u32), names }
+    }
+
+    #[inline]
+    fn fresh(&self, block: &mut (u32, u32), coll: &AtomicBool) -> u32 {
+        if block.0 == block.1 {
+            let b = self.next.fetch_add(P as u32, Relaxed);
+            *block = (b, b.wrapping_add(P as u32));
+            if self.used.fetch_add(P, Relaxed) > self.limit || b as u64 + P as u64 >= PERSON_SET {
+                coll.store(true, Relaxed);
+            }
+        }
+        block.0 += 1;
+        block.0 - 1
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn prefetch(&self, key: u64) {
+        let index = (if key == 0 { 1 } else { key }) as usize & self.mask;
+        let ptr = self.sl.as_ptr().wrapping_add(2 * index);
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = ptr;
+    }
+
+    /// The person of a user id on a valid event copy, inserting an unlinked id.
+    #[inline]
+    fn person(&self, k: u64, c: u32, name: u64, block: &mut (u32, u32), coll: &AtomicBool) -> u32 {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let k = if k == 0 { 1 } else { k };
+        let mut i = (k as usize) & self.mask;
+        loop {
+            let mut kk = self.sl[2 * i].load(Acquire);
+            if kk == 0 {
+                match self.sl[2 * i].compare_exchange(0, k, AcqRel, Acquire) {
+                    Ok(_) => {
+                        let id = self.fresh(block, coll);
+                        if let Some(slot) = self.names.get(id as usize) {
+                            slot.store(name, Relaxed);
+                        } else {
+                            coll.store(true, Relaxed);
+                        }
+                        let v = (u64::from(c) << 32) | PERSON_SET | u64::from(id & (PERSON_SET as u32 - 1));
+                        self.sl[2 * i + 1].store(v, Release);
+                        return id & (PERSON_SET as u32 - 1);
+                    }
+                    Err(x) => kk = x,
+                }
+            }
+            if kk == k {
+                let mut v = self.sl[2 * i + 1].load(Acquire);
+                while v == 0 {
+                    std::hint::spin_loop();
+                    v = self.sl[2 * i + 1].load(Acquire);
+                }
+                if (v >> 32) as u32 != c {
+                    coll.store(true, Relaxed);
+                }
+                return (v as u32) & (PERSON_SET as u32 - 1);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// The person of a user id, if it is linked or on a valid event (lookup only; every
+    /// insert has finished).
+    #[inline]
+    fn find(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
+        let k = if k == 0 { 1 } else { k };
+        let mut i = (k as usize) & self.mask;
+        loop {
+            let kk = self.sl[2 * i].load(Relaxed);
+            if kk == 0 {
+                return None;
+            }
+            if kk == k {
+                let v = self.sl[2 * i + 1].load(Relaxed);
+                if (v >> 32) as u32 != c {
+                    coll.store(true, Relaxed);
+                    return None;
+                }
+                return Some((v as u32) & (PERSON_SET as u32 - 1));
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Names of all dense ids (padded to whole blocks; unused ids are empty and have no
+    /// events) and the per-partition local id bound.
+    fn names(&self, linked: &[&'static [u8]], coll: &AtomicBool) -> (u32, Vec<&'static [u8]>) {
+        let n = (self.next.load(Relaxed) as usize).min(self.names.len());
+        if n >= PERSON_SET as usize {
+            coll.store(true, Relaxed);
+        }
+        let all: Vec<&'static [u8]> = (0..n).into_par_iter().map(|id| {
+            if id < linked.len() {
+                linked[id]
+            } else {
+                match self.names[id].load(Relaxed) {
+                    0 => &[][..],
+                    r => unpack_ref(r),
+                }
+            }
+        }).collect();
+        ((n.div_ceil(P)) as u32, all)
     }
 }
 
@@ -1337,7 +1481,14 @@ fn fast(seed: u64) -> bool {
     // key), and the slot index is its union-find node. Unions link the larger root under the
     // smaller by CAS; the components do not depend on the order. Capacity > 2 * edges >= ids,
     // so the table always keeps an empty slot (sized for a low load: most event lookups miss).
-    let mut ltab = Tab::new(edges.len() * 2 + 16);
+    // The table also takes every unlinked user id seen on a valid event (inserted during the
+    // event parse), so size it for both; a fuller table than 3/4 declines to slow.rs.
+    let est_users = evb.iter().find(|b| b.len() >= 1 << 16).map_or(0, |b| {
+        let rows = memchr::memchr_iter(b'\n', &b[..1 << 16]).count().max(1);
+        let total: usize = evb.iter().map(|b| b.len()).sum();
+        total / ((1 << 16) / rows).max(1) / 12
+    });
+    let mut ltab = Tab::new((edges.len() * 2 + 16).max(est_users));
     let cap = ltab.slots.len();
     let mask = ltab.mask;
     let lcoll = AtomicBool::new(false);
@@ -1498,7 +1649,7 @@ fn fast(seed: u64) -> bool {
                         p => (p - 1) as usize,
                     };
                     let v = sl[2 * i + 1].load(Relaxed);
-                    sl[2 * i + 1].store((v & !0xffff_ffff) | pnum[r].load(Relaxed) as u64, Relaxed);
+                    sl[2 * i + 1].store((v & !0xffff_ffff) | PERSON_SET | pnum[r].load(Relaxed) as u64, Relaxed);
                 }
             }
         });
@@ -1506,13 +1657,10 @@ fn fast(seed: u64) -> bool {
     };
     lap("  links repointed");
     let coll = AtomicBool::new(false);
-    let resolve_person = |key, check, name| {
-        match ltab.get(key, check, &coll) {
-            Some(root) => (root as usize & (P - 1), u64::from(root)),
-            None => ((key >> (64 - PB)) as usize, name),
-        }
-    };
-    let linked_count = pname.len().div_ceil(P) as u32;
+    // All-uid table: linked ids already map to persons 0..npersons. Each unlinked user id
+    // seen on a valid event copy gets the next dense id when first inserted, from per-thread
+    // blocks of P ids so every partition receives one id per block.
+    let users = Users::new(&mut ltab, nids, pname.len());
     lap(&format!("links: {} edges, {} ids, {} persons", edges.len(), nids, pname.len()));
 
     // Events phase A: route valid copies directly to people, and record
@@ -1532,10 +1680,12 @@ fn fast(seed: u64) -> bool {
                 let mut dates = Dates::default();
                 let mut batch = Vec::<ParsedEvent>::with_capacity(16);
                 let mut short_writer = acc.short_copies.writer();
+                let mut block = (0u32, 0u32);
                 let mut flush = |batch: &mut Vec<ParsedEvent>| {
                     for mut r in batch.drain(..) {
                         if r.ts != TOMBSTONE {
-                            let (partition, person) = resolve_person(r.pkey, r.pchk, r.name_ref);
+                            let person = users.person(r.pkey, r.pchk, r.name_ref, &mut block, &coll);
+                            let partition = person as usize & (P - 1);
                             let events = &mut acc.people;
                             let Ok(index) = u32::try_from(events.len(partition)) else {
                                 coll.store(true, Relaxed);
@@ -1611,7 +1761,7 @@ fn fast(seed: u64) -> bool {
                         };
                         r.name_ref = name;
                         (r.pkey, r.pchk) = hs(user, seed);
-                        ltab.prefetch(r.pkey);
+                        users.prefetch(r.pkey);
                         r.ts = (t - w0) as u32;
                     }
                     batch.push(r);
@@ -1623,7 +1773,8 @@ fn fast(seed: u64) -> bool {
                 acc
             },
         );
-    lap(&format!("events parsed ({} folds)", folds.len()));
+    let (linked_count, pname) = users.names(&pname, &coll);
+    lap(&format!("events parsed ({} folds, {} persons)", folds.len(), pname.len()));
     if coll.load(Relaxed) {
         return false;
     }
@@ -1652,9 +1803,10 @@ fn fast(seed: u64) -> bool {
             let mut batch = Vec::with_capacity(16);
             let mut flush = |batch: &mut Vec<PendingClick>| {
                 for PendingClick { mut click, key, check } in batch.drain(..) {
-                    let (partition, person) = resolve_person(key, check, click.person);
-                    click.person = person;
-                    acc[partition].push(click);
+                    // A user id not in the table has no valid event, so no session to credit.
+                    let Some(person) = users.find(key, check, &coll) else { continue };
+                    click.person = u64::from(person);
+                    acc[person as usize & (P - 1)].push(click);
                 }
             };
             csv_rows(chunk, |_, [cid, user, cmp, ts]| {
@@ -1671,7 +1823,7 @@ fn fast(seed: u64) -> bool {
                     return;
                 };
                 let (key, check) = hs(user, seed);
-                ltab.prefetch(key);
+                users.prefetch(key);
                 batch.push(PendingClick { click: Click { person, id, ts, campaign }, key, check });
                 if batch.len() == 16 {
                     flush(&mut batch);
