@@ -133,6 +133,89 @@ fn fields<'a, const N: usize>(line: &'a [u8]) -> Option<[&'a [u8]; N]> {
     if k == N && !line.is_empty() { Some(out) } else { None }
 }
 
+// A row ends at a newline regardless of quoting. Track separators with SIMD,
+// then check the endpoints of each field and account for every quote in the row.
+#[inline]
+fn csv_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; N])) {
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2")))]
+    let bytes = {
+        #[cfg(target_arch = "aarch64")]
+        const WIDTH: usize = 16;
+        #[cfg(target_arch = "aarch64")]
+        const STRIDE: u32 = 4;
+        #[cfg(target_arch = "x86_64")]
+        const WIDTH: usize = 32;
+        #[cfg(target_arch = "x86_64")]
+        const STRIDE: u32 = 1;
+
+        let mut start = 0;
+        let mut field_start = 0;
+        let mut count = 0;
+        let mut quote_count = 0;
+        let mut expected_quotes = 0;
+        let mut values = [&[][..]; N];
+        for base in (0..bytes.len() / WIDTH).map(|i| i * WIDTH) {
+            // Each mask contains exactly one bit per matching byte, at STRIDE * index.
+            // The loop takes only full vectors and every separator lies inside its vector.
+            let (mut separators, mut quotes, newlines) = unsafe {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let b = vld1q_u8(bytes.as_ptr().add(base));
+                    let mask = |v| vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(v)))) & 0x1111_1111_1111_1111;
+                    let newline = vceqq_u8(b, vdupq_n_u8(b'\n'));
+                    (mask(vorrq_u8(newline, vceqq_u8(b, vdupq_n_u8(b',')))), mask(vceqq_u8(b, vdupq_n_u8(b'"'))), mask(newline))
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use std::arch::x86_64::*;
+                    let b = _mm256_loadu_si256(bytes.as_ptr().add(base).cast());
+                    let mask = |v| _mm256_movemask_epi8(v) as u32 as u64;
+                    let newline = _mm256_cmpeq_epi8(b, _mm256_set1_epi8(b'\n' as i8));
+                    (mask(_mm256_or_si256(newline, _mm256_cmpeq_epi8(b, _mm256_set1_epi8(b',' as i8)))), mask(_mm256_cmpeq_epi8(b, _mm256_set1_epi8(b'"' as i8))), mask(newline))
+                }
+            };
+            while separators != 0 {
+                let bit = separators & separators.wrapping_neg();
+                let end = base + (bit.trailing_zeros() / STRIDE) as usize;
+                separators ^= bit;
+                if count < N {
+                    // field_start is the previous separator + 1 (or the chunk start).
+                    let mut field = unsafe { bytes.get_unchecked(field_start..end) };
+                    if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+                        field = unsafe { field.get_unchecked(1..field.len() - 1) };
+                        expected_quotes += 2;
+                    }
+                    values[count] = field;
+                    count += 1;
+                } else {
+                    count = N + 1;
+                }
+                field_start = end + 1;
+                if newlines & bit != 0 {
+                    let before = quotes & (bit - 1);
+                    quotes ^= before;
+                    if count == N && start != end && quote_count + before.count_ones() as usize == expected_quotes {
+                        row(unsafe { bytes.get_unchecked(start..end) }, values);
+                    }
+                    start = end + 1;
+                    count = 0;
+                    quote_count = 0;
+                    expected_quotes = 0;
+                }
+            }
+            quote_count += quotes.count_ones() as usize;
+        }
+        &bytes[start..]
+    };
+    // The tail may start in the preceding vector, and may lack a final newline.
+    for_lines(bytes, |line| {
+        if let Some(values) = fields::<N>(line) {
+            row(line, values);
+        }
+    });
+}
+
 /// Address ranges of the mapped files, to recover a whole line from a pointer into it.
 struct Lines {
     ranges: Vec<(usize, usize)>,
@@ -176,6 +259,47 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     let a = s[i].wrapping_sub(b'0');
     let b = s[i + 1].wrapping_sub(b'0');
     if a < 10 && b < 10 { Some((a * 10 + b) as i64) } else { None }
+}
+
+// One small cache per parsing task. Store all ten date bytes, so a hit also
+// verifies the calendar date and punctuation validated by the cold path.
+#[derive(Default)]
+struct Dates([([u8; 10], i64); 32]);
+
+impl Dates {
+    #[inline]
+    fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        if s.len() == 20 && s[19] == b'Z' && s[10] == b'T' && s[13] == b':' && s[16] == b':' {
+            let date: [u8; 10] = s[..10].try_into().unwrap();
+            let index = (date[8] as usize * 10 + date[9] as usize) & 31;
+            let entry = &mut self.0[index];
+            let h = d2(s, 11)?;
+            let m = d2(s, 14)?;
+            let sec = d2(s, 17)?;
+            if h > 23 || m > 59 || sec > 59 {
+                return None;
+            }
+            let time = (h * 3600 + m * 60 + sec) * 1000;
+            if entry.0 == date {
+                return Some(entry.1 + time);
+            }
+            let t = parse_ts(s)?;
+            *entry = (date, t - time);
+            return Some(t);
+        }
+        if !s.is_empty() && s.len() <= 18 {
+            let mut value = 0;
+            for &c in s {
+                let digit = c.wrapping_sub(b'0');
+                if digit > 9 {
+                    return None;
+                }
+                value = value * 10 + i64::from(digit);
+            }
+            return Some(value);
+        }
+        parse_ts(s)
+    }
 }
 /// ms since epoch, or None if bad. Overlong F3 saturates to i64::MAX (out of any window).
 #[inline]
@@ -393,18 +517,31 @@ struct CkB {
     camp: u32,
 }
 
-const SHB: u32 = 10; // dedup shards by event-id hash
+const SHB: u32 = 8; // dedup shards by event-id hash
 const SH: usize = 1 << SHB;
 const PB: u32 = 10; // person partitions
 const P: usize = 1 << PB;
 
 struct UdRow {
-    line: u64, // an event line of this person (its user resolves to the person's name)
+    // Pointer and length packed as ptr | len << 48.  Kept only after aggregation so
+    // parquet needn't parse and hash a representative event line for every output row.
+    // `fast` declines if either part cannot be represented.
+    name: u64,
     day: i32,
     ns: i64,
     ne: i64,
     nr: i64,
     top: u32, // category index, u32::MAX = null
+}
+
+#[inline]
+fn pack_ref(s: &[u8]) -> Option<u64> {
+    let p = s.as_ptr() as u64;
+    if p >> 48 != 0 || s.len() >= (1 << 16) { None } else { Some(p | ((s.len() as u64) << 48)) }
+}
+#[inline]
+fn unpack_ref(r: u64) -> &'static [u8] {
+    unsafe { std::slice::from_raw_parts((r & ((1u64 << 48) - 1)) as *const u8, (r >> 48) as usize) }
 }
 
 fn main() {
@@ -576,13 +713,13 @@ fn fast(seed: u64) -> bool {
     let accs: Vec<Vec<Vec<EvA>>> = pt(ech.par_iter(),
             || (0..SH).map(|_| Vec::new()).collect::<Vec<Vec<EvA>>>(),
             |mut acc, c| {
-                for_lines(c, |l| {
-                    let Some([id, user, ts, ing, et, pr, pc]) = fields::<7>(l) else { return };
+                let mut dates = Dates::default();
+                csv_rows(c, |l, [id, user, ts, ing, et, pr, pc]| {
                     if id.is_empty() {
                         return;
                     }
                     let (hid, hchk) = hs(id, seed);
-                    let ingest = parse_ts(ing).unwrap_or(i64::MAX);
+                    let ingest = dates.parse(ing).unwrap_or(i64::MAX);
                     let mut r = EvA { hid, pkey: 0, line: l.as_ptr() as u64, ingest, hchk, pchk: 0, ts: u32::MAX, price: 0 };
                     'v: {
                         if user.is_empty() || pr.is_empty() || ingest == i64::MAX {
@@ -593,7 +730,7 @@ fn fast(seed: u64) -> bool {
                             b"purchase" => true,
                             _ => break 'v,
                         };
-                        let t = match parse_ts(ts) {
+                        let t = match dates.parse(ts) {
                             Some(t) if t >= w0 && t < w1 => t,
                             _ => break 'v,
                         };
@@ -736,6 +873,12 @@ fn fast(seed: u64) -> bool {
                 while i < ev.len() {
                     let pk = ev[i].pkey;
                     let pc = ev[i].pchk;
+                    // Resolve once per person rather than once per output day while writing.
+                    // Pointer references are into immutable mmaps, which outlive parquet.
+                    let Some(name) = pack_ref(name_of(ev[i].line)) else {
+                        coll.store(true, Relaxed);
+                        return st;
+                    };
                     let mut j = i;
                     while j < ev.len() && ev[j].pkey == pk {
                         if ev[j].pchk != pc {
@@ -787,7 +930,7 @@ fn fast(seed: u64) -> bool {
                             }
                         }
                         let purch = rev > 0;
-                        let r = row.get_or_insert(UdRow { line: ev[i].line, day: day as i32, ns: 0, ne: 0, nr: 0, top: u32::MAX });
+                        let r = row.get_or_insert(UdRow { name, day: day as i32, ns: 0, ne: 0, nr: 0, top: u32::MAX });
                         r.ns += 1;
                         r.ne += nev;
                         r.nr += rev;
@@ -913,7 +1056,7 @@ fn fast(seed: u64) -> bool {
             let mut uid = StringBuilder::with_capacity(part.len(), part.len() * 12);
             let mut top = StringBuilder::with_capacity(part.len(), part.len() * 8);
             for r in part.iter() {
-                uid.append_value(st(name_of(r.line)));
+                uid.append_value(st(unpack_ref(r.name)));
                 if r.top == u32::MAX {
                     top.append_null();
                 } else {
