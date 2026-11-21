@@ -1263,13 +1263,11 @@ fn fast(seed: u64) -> bool {
         .par_iter()
         .flat_map_iter(|c| {
             let mut v = vec![];
-            for_lines(c, |l| {
-                if let Some([a, b]) = fields::<2>(l) {
-                    if !a.is_empty() && !b.is_empty() {
-                        let (ka, ca) = hs(a, seed);
-                        let (kb, cb) = hs(b, seed);
-                        v.push([End { s: a, k: ka, c: ca }, End { s: b, k: kb, c: cb }]);
-                    }
+            csv_rows(c, |_, [a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    let (ka, ca) = hs(a, seed);
+                    let (kb, cb) = hs(b, seed);
+                    v.push([End { s: a, k: ka, c: ca }, End { s: b, k: kb, c: cb }]);
                 }
             });
             v
