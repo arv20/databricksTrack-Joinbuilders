@@ -661,7 +661,7 @@ fn meminfo(keys: &[&str]) -> String {
 }
 
 // ------------------------------------------------------------------ pipeline measurements
-const PREF: [&str; 8] = ["fc", "f", "fc256", "f256", "zmm", "ymm", "fc14", "fc16"];
+const PREF: [&str; 8] = ["fc", "n", "nn", "fc256", "zmm", "ymm", "fc14", "fc16"];
 fn variants(dir: &str) -> Vec<(String, String)> {
     let mut names: Vec<String> = match std::fs::read_dir(dir) { Ok(r) => r.flatten().filter(|e| e.path().is_file()).map(|e| e.file_name().to_string_lossy().to_string()).collect(), Err(_) => vec![] };
     names.sort_by_key(|n| (PREF.iter().position(|p| p == n).unwrap_or(99), n.clone()));

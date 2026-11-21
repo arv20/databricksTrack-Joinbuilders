@@ -11,6 +11,8 @@ path = "src/main.rs"
 [features]
 stats = []
 free = []
+free2 = []
+free2n = []
 free256 = []
 freec256 = []
 ymm = []

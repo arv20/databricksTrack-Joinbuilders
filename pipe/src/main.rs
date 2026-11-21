@@ -23,6 +23,12 @@ mod k_free;
 mod k_ymm;
 #[cfg(feature = "zmm")]
 mod k_zmm;
+#[cfg(any(feature = "free2", feature = "free2n"))]
+mod k_free2;
+#[cfg(feature = "free2")]
+pub type K = k_free2::Free;
+#[cfg(feature = "free2n")]
+pub type K = k_free2::FreeN;
 #[cfg(feature = "ymm")]
 pub type K = k_ymm::Ymm;
 #[cfg(feature = "zmm")]
@@ -33,7 +39,7 @@ pub type K = k_free::Free;
 pub type K = k_free::Free256;
 #[cfg(feature = "freec256")]
 pub type K = k_free::FreeC256;
-#[cfg(not(any(feature = "ymm", feature = "zmm", feature = "free", feature = "free256", feature = "freec256")))]
+#[cfg(not(any(feature = "ymm", feature = "zmm", feature = "free", feature = "free256", feature = "freec256", feature = "free2", feature = "free2n")))]
 pub type K = k_free::FreeC;
 
 fn dirs(args: &[String], skip: usize) -> (String, String) {
