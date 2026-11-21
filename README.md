@@ -1,83 +1,87 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions: Rust pipeline
 
-This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+An exact CSV-to-Parquet pipeline for the Shopping Sessions buildathon. **`rules.md`
+is the specification.** The root Dockerfile builds the Rust engine in `rust/`;
+`pipeline/pipeline.py` and `Dockerfile.python` preserve the older DuckDB alternative.
+`PLAN.md` is historical and does not describe the current engine.
 
-If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
+The pipeline resolves linked IDs, deduplicates and validates events, builds
+30-minute sessions, applies seven-day last-click attribution and campaign assists,
+and writes `user_daily/` and `campaign_daily/` as Parquet with DATE columns.
 
-## What to do first
+## Build and check locally
 
-- Read `rules.md` for the full rules.
-- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
-- Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
-
-## Run and test locally
-
-You need Docker with buildx, and Python 3.10+ with `polars` for the test scripts. Install it with `pip install polars`.
-
-Build the image and run all 36 fixtures:
+Use a current stable Rust toolchain and Python 3.10+ with Polars. Run from the repo
+root. Generated datasets, binaries, environments and outputs are gitignored.
 
 ```sh
-make build        # docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
-make fixtures     # runs the image on all 36 fixtures with scorer flags, diffs each against expected/
+python3 -m venv .venv
+.venv/bin/python -m pip install polars
+cargo build --release --locked --manifest-path rust/Cargo.toml
+cargo build --release --locked --manifest-path generator/Cargo.toml
+cargo test --release --locked --manifest-path rust/Cargo.toml
+.venv/bin/python scripts/run_fixtures.py fixtures -- rust/target/release/rproto
+.venv/bin/python scripts/test_long_ids.py -- rust/target/release/rproto
+PIPELINE=rust/target/release/rproto reference/cross_check.sh
 ```
 
-Build, run, and check the 1M-event dev set. `make dev` needs `generate` on your PATH: build it from the track page's generator.zip (Rust 1.85 or newer; its README has the two commands).
+The last command compares nine generated seeds against the independent Python
+reference, including leap-day windows. It deletes each generated seed after use.
+`FORCE_SLOW=1` selects the exact fallback engine for additional validation.
+
+For the public 1M development answer, obtain `dev-answer.zip` from the competition,
+unzip it as `dev-answer/`, then:
 
 ```sh
-make dev                                # generate --seed 1 --events 1000000 --clicks 250000 --output dev
-make run-dev                            # runs your image on dev/ with scorer flags and times it
-make check-dev                          # exact diff against dev-answer/, the track page's dev-answer.zip unzipped here
+generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+DATA_DIR=dev OUTPUT_DIR=out NCPU=8 rust/target/release/rproto
+make check-dev
 ```
 
-If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make run-dev CPUS=4 MEM=8g`. Your local times will not match the scorer anyway; only the board's times count.
+## Reproduce a practice-size benchmark
 
-- **x86 Linux and Windows machines.** Build and run the amd64 image natively.
-- **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
-
-To iterate without Docker:
+Use a fresh output directory for each different dataset or thread count. Output
+files from an earlier run must not be mixed with the new run's files.
 
 ```sh
-pip install duckdb==1.5.6
-python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+generator/target/release/generate --seed 3 --events 20000000 --clicks 5000000 --output big
+DATA_DIR=big OUTPUT_DIR=out NCPU=8 TIMING=1 /usr/bin/time -v rust/target/release/rproto
 ```
 
-## Submitting and scoring
+On macOS use `/usr/bin/time -l` instead of `-v`. `TIMING=1` prints cumulative stage
+elapsed times to stderr. Build time, generation and correctness comparisons are
+outside the measured run. See [BENCHMARKS.md](BENCHMARKS.md) for measured results
+and the differences between local hardware and the scorer.
 
-Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.
+## Verify the submitted container
 
-The image's `CMD` runs with no arguments. Exit code 0 means "done, check my output". Build time is never timed; only the run is timed. The track page lists the current practice limits and how the final is scored.
+```sh
+make build                         # linux/amd64
+make fixtures                      # all 36 fixtures, scorer-like restrictions
+CPUS=8 MEM=24g scripts/docker_run.sh big out-container
+.venv/bin/python scripts/compare.py out out-container
+```
 
-## Container limits
+The container runs as uid 1000 with read-only root, no network, a 64 MB `/tmp`,
+read-only `/data`, and writable `/output` and `/scratch`. Defaults are 8 CPUs and
+24 GB with no swap. Set `CPUS`/`MEM` lower if your development machine cannot
+provide those resources. Apple-silicon native container builds use
+`PLATFORM=linux/arm64`; they do not establish amd64 performance.
 
-Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX-512 available. Your container gets:
+## Implementation
 
-| Resource | Setting |
-| --- | --- |
-| `/data` | The dataset, read-only |
-| `/output` | Empty, writable. Write `/output/user_daily/` and `/output/campaign_daily/` as Parquet |
-| `/scratch` | Empty, writable, fast local disk for spills and temp files |
-| CPU / RAM | 8 vCPUs, hyperthreads of an Intel Xeon, 24 GB, no swap |
-| Network | None |
-| Env vars | `DATA_DIR=/data`, `OUTPUT_DIR=/output`, `SCRATCH_DIR=/scratch`, `HOME=/scratch`, `NCPU=8`, `MEM_GB=24` |
-| Filesystem | Root is read-only apart from `/tmp`, 64 MB in memory. The process runs as uid 1000, not root |
+- Memory-mapped inputs and parallel CSV parsing; quoted fields, malformed lines
+  and timestamp validation follow `rules.md` rather than a general CSV reader.
+- Union-find resolves linked IDs to the byte-wise smallest name.
+- Hash partitions accelerate deduplication and person grouping. Hash equality is
+  checked against exact bytes; a collision triggers the exact fallback.
+- IDs up to 15 bytes are copied into records. Longer IDs remain fully supported.
+- Consumed shards and partitions are released as the next stage progresses.
+- Sessions, attribution, assists and aggregates are computed together per partition.
+- Output names are retained independently of the input mappings, avoiding random
+  input rereads during Parquet writing.
 
-## Common pitfalls
-
-- **DuckDB's CSV reader differs from `rules.md`.** It reads a quoted empty field `""` as an empty string, not null. Its malformed-line handling, including `ignore_errors`, `strict_mode`, and `null_padding`, does not match `rules.md`. Test against the fixtures before relying on it.
-- **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
-- **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
-- **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
-- **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
-
-## Self-checks
-
-- Summed over all rows, `sessions` and `revenue_cents` are equal in both tables.
-- `day` must be a Parquet `DATE`, not a string or timestamp.
-- Row order and the number of Parquet files do not matter. Exact column names do, and there must be no extra columns.
-
-## Files in this starter
-
-- `pipeline/pipeline.py` holds your pipeline code.
-- `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
-- `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
-- `scripts/` runs your image the way the scorer does and diffs the output.
+`fixtures/` contains 36 hand-written edge cases. `reference/reference.py` is an
+independent correctness oracle. `ship.sh` is an older convenience script that
+commits and pushes after checks; the commands above allow checking without those
+side effects.

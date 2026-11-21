@@ -1,0 +1,185 @@
+{
+  "date": "2026-11-20",
+  "hardware": {
+    "cpu": "Apple M3",
+    "ram_bytes": 8589934592,
+    "os": "macOS 27.2 arm64",
+    "workers": 8
+  },
+  "toolchain": "rustc 1.100.0, cargo release profile, default native-platform target; no target-cpu override",
+  "baseline_commit": "5cf2f652a7b658d58fd1bac058e3131eb850a877",
+  "dataset": {
+    "seed": 3,
+    "events": 20000000,
+    "clicks": 5000000
+  },
+  "run_order": [
+    "optimized",
+    "baseline",
+    "baseline",
+    "optimized",
+    "optimized",
+    "baseline"
+  ],
+  "baseline": [
+    {
+      "wall_seconds": 25.07,
+      "user_cpu_seconds": 8.25,
+      "system_cpu_seconds": 5.73,
+      "maximum_resident_set_size": 2407415808,
+      "peak_memory_footprint": 2867614448,
+      "page_faults": 417620,
+      "cumulative_stage_ms": {
+        "mapped files": 10.2,
+        "links: 883459 edges, 1194204 ids, 382149 persons": 131.2,
+        "events parsed (8 folds)": 4455.7,
+        "events dedup + validate": 4905.2,
+        "clicks parsed": 5537.5,
+        "sessions + credit + aggregate": 5755.3,
+        "merged: user_daily 2255788": 5759.5,
+        "parquet written": 24901.9
+      }
+    },
+    {
+      "wall_seconds": 14.87,
+      "user_cpu_seconds": 7.93,
+      "system_cpu_seconds": 4.86,
+      "maximum_resident_set_size": 2598993920,
+      "peak_memory_footprint": 2924679968,
+      "page_faults": 299323,
+      "cumulative_stage_ms": {
+        "mapped files": 4.2,
+        "links: 883459 edges, 1194204 ids, 382149 persons": 104.9,
+        "events parsed (8 folds)": 2616.6,
+        "events dedup + validate": 3128.2,
+        "clicks parsed": 3690.9,
+        "sessions + credit + aggregate": 3863.4,
+        "merged: user_daily 2255788": 3867.9,
+        "parquet written": 14700.7
+      }
+    },
+    {
+      "wall_seconds": 13.98,
+      "user_cpu_seconds": 7.87,
+      "system_cpu_seconds": 4.1,
+      "maximum_resident_set_size": 2572124160,
+      "peak_memory_footprint": 2860077496,
+      "page_faults": 272606,
+      "cumulative_stage_ms": {
+        "mapped files": 5.2,
+        "links: 883459 edges, 1194204 ids, 382149 persons": 98.7,
+        "events parsed (8 folds)": 3567.1,
+        "events dedup + validate": 4012.5,
+        "clicks parsed": 4806.7,
+        "sessions + credit + aggregate": 5078.4,
+        "merged: user_daily 2255788": 5082.7,
+        "parquet written": 13838.3
+      }
+    }
+  ],
+  "optimized": [
+    {
+      "wall_seconds": 5.82,
+      "user_cpu_seconds": 10.15,
+      "system_cpu_seconds": 2.79,
+      "maximum_resident_set_size": 2762719232,
+      "peak_memory_footprint": 2738524168,
+      "page_faults": 117841,
+      "cumulative_stage_ms": {
+        "mapped files": 9.3,
+        "links: 883459 edges, 1194204 ids, 382149 persons": 150.2,
+        "events parsed (8 folds)": 3525.7,
+        "events dedup + validate": 4061.9,
+        "clicks parsed": 5255.0,
+        "sessions + credit + aggregate": 5547.9,
+        "merged: user_daily 2255788": 5551.3,
+        "parquet written": 5748.0
+      }
+    },
+    {
+      "wall_seconds": 4.79,
+      "user_cpu_seconds": 10.65,
+      "system_cpu_seconds": 2.71,
+      "maximum_resident_set_size": 2953510912,
+      "peak_memory_footprint": 2754400240,
+      "page_faults": 76239,
+      "cumulative_stage_ms": {
+        "mapped files": 4.5,
+        "links: 883459 edges, 1194204 ids, 382149 persons": 125.8,
+        "events parsed (8 folds)": 3430.9,
+        "events dedup + validate": 3849.5,
+        "clicks parsed": 4515.7,
+        "sessions + credit + aggregate": 4673.1,
+        "merged: user_daily 2255788": 4675.7,
+        "parquet written": 4746.7
+      }
+    },
+    {
+      "wall_seconds": 4.76,
+      "user_cpu_seconds": 10.39,
+      "system_cpu_seconds": 2.59,
+      "maximum_resident_set_size": 3121020928,
+      "peak_memory_footprint": 2799505488,
+      "page_faults": 101852,
+      "cumulative_stage_ms": {
+        "mapped files": 3.6,
+        "links: 883459 edges, 1194204 ids, 382149 persons": 114.4,
+        "events parsed (8 folds)": 3337.3,
+        "events dedup + validate": 3691.9,
+        "clicks parsed": 4446.4,
+        "sessions + credit + aggregate": 4629.2,
+        "merged: user_daily 2255788": 4631.7,
+        "parquet written": 4689.0
+      }
+    }
+  ],
+  "final_scale": {
+    "seed": 3,
+    "events": 60000000,
+    "clicks": 15000000,
+    "wall_seconds": 90.59,
+    "user_cpu_seconds": 33.9,
+    "system_cpu_seconds": 13.72,
+    "maximum_resident_set_size": 2091843584,
+    "peak_memory_footprint": 5211840792,
+    "page_faults": 417654,
+    "cumulative_stage_ms": {
+      "mapped files": 128.8,
+      "links: 2655854 edges, 3589163 ids, 1148770 persons": 926.5,
+      "events parsed (8 folds)": 32284.6,
+      "events dedup + validate": 70089.3,
+      "clicks parsed": 74872.2,
+      "sessions + credit + aggregate": 89570.9,
+      "merged: user_daily 6682907": 89578.1,
+      "parquet written": 90241.9
+    }
+  },
+  "final_scale_invariants": {
+    "user_daily": {
+      "rows": 6682907,
+      "unique_keys": 6682907,
+      "sessions": 10122826,
+      "events": 58948162,
+      "revenue_cents": 19335517459,
+      "invalid_rows": 0
+    },
+    "campaign_daily": {
+      "rows": 28014,
+      "unique_keys": 28014,
+      "sessions": 10122826,
+      "revenue_cents": 19335517459,
+      "assisted_sessions": 109015980,
+      "nonorganic_sessions": 6256554,
+      "invalid_rows": 0
+    },
+    "status": "PASS"
+  },
+  "limitations": [
+    "Native ARM, not linux/amd64 scorer",
+    "Uncontrolled OS page cache and background desktop activity",
+    "No simultaneous builds, generators or other benchmark runs during paired measurements",
+    "60M run used OS swap; not a 24GB no-swap container measurement",
+    "20M compared exactly to baseline; 1M and nine smaller seeds compared to independent reference",
+    "Published dev-answer archive not available locally; container verification remains for Linux runner"
+  ]
+}

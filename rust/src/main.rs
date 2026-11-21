@@ -2,9 +2,9 @@
 // Env: DATA_DIR, OUTPUT_DIR, NCPU, TIMING (stage times on stderr), FORCE_SLOW (use the fallback).
 //
 // Fast engine: input files are memory-mapped; strings are identified by a 64-bit hash plus an
-// independent 32-bit check instead of being interned. Events are scattered by event-id hash for
+// independent 32-bit check; matching hashes are verified against the original bytes. Events are scattered by event-id hash for
 // dedup, then by person key into partitions; each partition is sorted, sessionized, credited and
-// aggregated on its own. Any hash collision (same 64-bit key, different check) or unsupported input
+// aggregated on its own. Any hash collision or unsupported input
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
 mod slow;
 
@@ -340,7 +340,7 @@ impl Tab {
         }
     }
     #[inline]
-    fn get(&self, k: u64, c: u32, coll: &AtomicBool) -> Option<u32> {
+    fn get(&self, k: u64, c: u32, name: &[u8], ids: &[&[u8]], coll: &AtomicBool) -> Option<u32> {
         let k = if k == 0 { 1 } else { k };
         let mut i = (k as usize) & self.mask;
         loop {
@@ -349,7 +349,7 @@ impl Tab {
                 return None;
             }
             if kk == k {
-                if (vv >> 32) as u32 != c {
+                if (vv >> 32) as u32 != c || ids[vv as u32 as usize] != name {
                     coll.store(true, Relaxed);
                     return None;
                 }
@@ -360,6 +360,44 @@ impl Tab {
     }
 }
 
+/// An exact byte identity. Short IDs live directly in the record; long IDs borrow
+/// their immutable input mapping. Byte 15 is the inline length, or 255 for a pointer.
+/// All borrowed values must be consumed before their mapping/owned buffer is dropped.
+#[derive(Clone, Copy)]
+struct Id([u8; 16]);
+impl Id {
+    fn new(bytes: &[u8]) -> Self {
+        let mut value = [0; 16];
+        if bytes.len() <= 15 {
+            value[..bytes.len()].copy_from_slice(bytes);
+            value[15] = bytes.len() as u8;
+        } else {
+            assert!(bytes.len() < (1usize << 56));
+            value[..8].copy_from_slice(&(bytes.as_ptr() as u64).to_ne_bytes());
+            let length = (bytes.len() as u64).to_le_bytes();
+            value[8..15].copy_from_slice(&length[..7]);
+            value[15] = 255;
+        }
+        Self(value)
+    }
+    fn is_inline(self) -> bool { self.0[15] != 255 }
+    fn bytes(&self) -> &[u8] {
+        if self.is_inline() { return &self.0[..self.0[15] as usize]; }
+        let pointer = u64::from_ne_bytes(self.0[..8].try_into().unwrap());
+        let mut length = [0; 8];
+        length[..7].copy_from_slice(&self.0[8..15]);
+        // The caller retains the input mappings (or owned output name) for this Id.
+        unsafe { std::slice::from_raw_parts(pointer as *const u8, u64::from_le_bytes(length) as usize) }
+    }
+}
+impl PartialEq for Id {
+    fn eq(&self, other: &Self) -> bool {
+        if self.is_inline() || other.is_inline() { self.0 == other.0 }
+        else { self.bytes() == other.bytes() }
+    }
+}
+impl Eq for Id {}
+
 // ------------------------------------------------------------------ records
 /// One parsed copy of an event, kept until dedup. ts == u32::MAX marks a copy that fails
 /// validation (it can still win dedup and so drop the event).
@@ -367,19 +405,17 @@ impl Tab {
 struct EvA {
     hid: u64,
     pkey: u64,
-    line: u64,
+    id: Id,
+    name: Id,
     ingest: i64,
-    hchk: u32,
-    pchk: u32,
-    ts: u32,    // ms after window_start
-    price: u32, // purchase: price | cat << 24; view/cart: 0
+    ts: u32,    // ms after window_start; MAX means invalid, still eligible for dedup
+    price: u32, // price in low 24 bits, category in high 8 bits
 }
 /// A surviving event, routed to its person's partition.
 #[derive(Clone, Copy)]
 struct EvB {
     pkey: u64,
-    line: u64,
-    pchk: u32,
+    name: Id,
     ts: u32,
     price: u32,
 }
@@ -389,7 +425,7 @@ struct CkB {
     pkey: u64,
     ts: i64,
     line: u64,
-    pchk: u32,
+    name: Id,
     camp: u32,
 }
 
@@ -399,7 +435,7 @@ const PB: u32 = 10; // person partitions
 const P: usize = 1 << PB;
 
 struct UdRow {
-    line: u64, // an event line of this person (its user resolves to the person's name)
+    name: Id, // inline, or borrowed from the owning worker's boxed name
     day: i32,
     ns: i64,
     ne: i64,
@@ -409,7 +445,7 @@ struct UdRow {
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
-    if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3) {
+    if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, hs) {
         if std::env::var_os("TIMING").is_some() {
             eprintln!("fast engine declined; running the exact fallback");
         }
@@ -419,7 +455,7 @@ fn main() {
 }
 
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
-fn fast(seed: u64) -> bool {
+fn fast(seed: u64, hash: impl Fn(&[u8], u64) -> (u64, u32) + Sync) -> bool {
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -445,7 +481,6 @@ fn fast(seed: u64) -> bool {
     let ckb = as_slices(&ckm);
     let lkb = as_slices(&lkm);
     let smb = as_slices(&smm);
-    let ev_lines = Lines::new(&evb);
     let ck_lines = Lines::new(&ckb);
     lap("mapped files");
 
@@ -513,10 +548,11 @@ fn fast(seed: u64) -> bool {
     for &(a, b) in &edges {
         let mut idx = [0u32; 2];
         for (j, s) in [a, b].into_iter().enumerate() {
-            let (k, c) = hs(s, seed);
+            let (k, c) = hash(s, seed);
             match ltab.get_or_insert(k, c, ids.len() as u32) {
                 Err(()) => return false,
                 Ok((i, ins)) => {
+                    if !ins && ids[i as usize] != s { return false; }
                     if ins {
                         ids.push(s);
                         parent.push(i);
@@ -545,31 +581,26 @@ fn fast(seed: u64) -> bool {
         }
         link_person[i] = p;
     }
-    // re-point the table: id -> person; person keys are the hash of the person's name
-    for s in ltab.slots.iter_mut() {
-        if s.0 != 0 {
-            s.1 = (s.1 & !0xffff_ffff) | link_person[(s.1 as u32) as usize] as u64;
-        }
-    }
-    let pkeys: Vec<(u64, u32)> = pname.iter().map(|n| hs(n, seed)).collect();
+    // Keep link-table values as exact ID indices, so lookups can verify bytes.
+    let pkeys: Vec<(u64, u32)> = pname.iter().map(|n| hash(n, seed)).collect();
     let coll = AtomicBool::new(false);
     // person key of a user id: linked ids share their person's key; others are their own person
-    let person = |u: &[u8]| -> (u64, u32) {
-        let (k, c) = hs(u, seed);
-        match ltab.get(k, c, &coll) {
-            Some(p) => pkeys[p as usize],
-            None => (k, c),
-        }
-    };
-    let name_of = |line: u64| -> &[u8] {
-        let u = fields::<7>(ev_lines.line(line)).unwrap()[1];
-        let (k, c) = hs(u, seed);
-        match ltab.get(k, c, &coll) {
-            Some(p) => pname[p as usize],
-            None => u,
-        }
+    let person = |u: &[u8]| -> (u64, Id) {
+        let (k, c) = hash(u, seed);
+        let (key, name) = match ltab.get(k, c, u, &ids, &coll) {
+            Some(i) => {
+                let p = link_person[i as usize] as usize;
+                (pkeys[p].0, pname[p])
+            }
+            None => (k, u),
+        };
+        (key, Id::new(name))
     };
     lap(&format!("links: {} edges, {} ids, {} persons", edges.len(), ids.len(), pname.len()));
+
+    drop(edges);
+    drop(parent);
+    drop(root_p);
 
     // events phase A: parse + validate every copy, scatter by event-id hash
     let ech = chunks(&evb, 1 << 20);
@@ -581,9 +612,9 @@ fn fast(seed: u64) -> bool {
                     if id.is_empty() {
                         return;
                     }
-                    let (hid, hchk) = hs(id, seed);
+                    let (hid, _) = hash(id, seed);
                     let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-                    let mut r = EvA { hid, pkey: 0, line: l.as_ptr() as u64, ingest, hchk, pchk: 0, ts: u32::MAX, price: 0 };
+                    let mut r = EvA { hid, pkey: 0, id: Id::new(id), ingest, name: Id::new(b""), ts: u32::MAX, price: 0 };
                     'v: {
                         if user.is_empty() || pr.is_empty() || ingest == i64::MAX {
                             break 'v;
@@ -605,9 +636,9 @@ fn fast(seed: u64) -> bool {
                             let cat = *prod.get(pr).unwrap_or(&unknown);
                             r.price = p | (cat << 24);
                         }
-                        let (pk, pc2) = person(user);
+                        let (pk, name) = person(user);
                         r.pkey = pk;
-                        r.pchk = pc2;
+                        r.name = name;
                         r.ts = (t - w0) as u32;
                     }
                     acc[(hid >> (64 - SHB)) as usize].push(r);
@@ -617,19 +648,26 @@ fn fast(seed: u64) -> bool {
         );
     lap(&format!("events parsed ({} folds)", accs.len()));
 
+    // Transfer ownership without copying records. Each consumed shard is freed
+    // while surviving records are routed, bounding the overlap of both stages.
+    let mut shards: Vec<Vec<Vec<EvA>>> = (0..SH).map(|_| Vec::new()).collect();
+    for acc in accs {
+        for (shard, rows) in shards.iter_mut().zip(acc) { shard.push(rows); }
+    }
+
     // events phase B: dedup each shard (smallest ingest wins), route survivors by person
-    let paccs: Vec<Vec<Vec<EvB>>> = pt((0..SH).into_par_iter(),
+    let paccs: Vec<Vec<Vec<EvB>>> = pt(shards.into_par_iter(),
             || ((0..P).map(|_| Vec::new()).collect::<Vec<Vec<EvB>>>(), Vec::<u64>::new(), Vec::<u32>::new(), Vec::<EvA>::new()),
-            |(mut out, mut keys, mut slot, mut win), s| {
-                let n: usize = accs.iter().map(|a| a[s].len()).sum();
+            |(mut out, mut keys, mut slot, mut win), inputs| {
+                let n: usize = inputs.iter().map(Vec::len).sum();
                 let cap = (n * 2).next_power_of_two().max(16);
                 let mask = cap - 1;
                 keys.clear();
                 keys.resize(cap, 0);
                 slot.resize(cap, 0);
                 win.clear();
-                for a in &accs {
-                    for r in &a[s] {
+                for a in &inputs {
+                    for r in a {
                         let k = if r.hid == 0 { 1 } else { r.hid };
                         let mut i = (k as usize) & mask;
                         loop {
@@ -642,7 +680,7 @@ fn fast(seed: u64) -> bool {
                             }
                             if kk == k {
                                 let w = &mut win[slot[i] as usize];
-                                if w.hchk != r.hchk {
+                                if w.id != r.id {
                                     coll.store(true, Relaxed);
                                 } else if r.ingest < w.ingest {
                                     *w = *r;
@@ -655,7 +693,9 @@ fn fast(seed: u64) -> bool {
                 }
                 for w in &win {
                     if w.ts != u32::MAX {
-                        out[(w.pkey >> (64 - PB)) as usize].push(EvB { pkey: w.pkey, line: w.line, pchk: w.pchk, ts: w.ts, price: w.price });
+                        out[(w.pkey >> (64 - PB)) as usize].push(EvB {
+                            pkey: w.pkey, name: w.name, ts: w.ts, price: w.price,
+                        });
                     }
                 }
                 (out, keys, slot, win)
@@ -664,7 +704,6 @@ fn fast(seed: u64) -> bool {
         .into_iter()
         .map(|x| x.0)
         .collect();
-    std::mem::forget(accs);
     lap("events dedup + validate");
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
@@ -683,13 +722,25 @@ fn fast(seed: u64) -> bool {
                         Some(t) if t >= w0 - LOOK && t < w1 => t,
                         _ => return,
                     };
-                    let (pk, pc) = person(user);
-                    acc[(pk >> (64 - PB)) as usize].push(CkB { pkey: pk, ts: t, line: l.as_ptr() as u64, pchk: pc, camp: ci });
+                    let (pk, name) = person(user);
+                    acc[(pk >> (64 - PB)) as usize].push(CkB { pkey: pk, ts: t, line: l.as_ptr() as u64, name, camp: ci });
                 });
                 acc
             },
         );
     lap("clicks parsed");
+
+    // Consume each partition once. Largest partitions start early, reducing
+    // the tail caused by whale users and shared-device connected components.
+    let mut jobs: Vec<(Vec<Vec<EvB>>, Vec<Vec<CkB>>)> = (0..P).map(|_| (vec![], vec![])).collect();
+    for acc in paccs {
+        for (job, rows) in jobs.iter_mut().zip(acc) { job.0.push(rows); }
+    }
+    for acc in caccs {
+        for (job, rows) in jobs.iter_mut().zip(acc) { job.1.push(rows); }
+    }
+    jobs.sort_unstable_by_key(|(ev, ck)| std::cmp::Reverse(
+        ev.iter().map(Vec::len).sum::<usize>() + ck.iter().map(Vec::len).sum::<usize>()));
 
     // per partition: sort, sessionize, credit, aggregate
     let ncs = ncamp + 1; // index ncamp = organic
@@ -701,12 +752,13 @@ fn fast(seed: u64) -> bool {
         catsum: Vec<i64>,
         touched: Vec<u32>,
         rows: Vec<UdRow>,
+        names: Vec<Box<[u8]>>,
         ev: Vec<EvB>,
         ck: Vec<CkB>,
     }
     let ncat = cat_names.len();
     let cid_of = |line: u64| -> &[u8] { fields::<4>(ck_lines.line(line)).unwrap()[0] };
-    let states: Vec<St> = pt((0..P).into_par_iter(),
+    let states: Vec<St> = pt(jobs.into_par_iter(),
             || St {
                 cd: vec![[0; 4]; ncs * ndays],
                 cnt: vec![0; ncamp],
@@ -715,30 +767,27 @@ fn fast(seed: u64) -> bool {
                 catsum: vec![0; ncat],
                 touched: vec![],
                 rows: vec![],
+                names: vec![],
                 ev: vec![],
                 ck: vec![],
             },
-            |mut st, p| {
+            |mut st, (events, clicks)| {
                 st.ev.clear();
-                for a in &paccs {
-                    st.ev.extend_from_slice(&a[p]);
-                }
+                for a in events { st.ev.extend(a); }
                 st.ck.clear();
-                for a in &caccs {
-                    st.ck.extend_from_slice(&a[p]);
-                }
+                for a in clicks { st.ck.extend(a); }
                 st.ev.sort_unstable_by_key(|e| (e.pkey, e.ts));
                 st.ck.sort_unstable_by_key(|c| (c.pkey, c.ts));
-                let St { cd, cnt, inact, active, catsum, touched, rows, ev, ck } = &mut st;
+                let St { cd, cnt, inact, active, catsum, touched, rows, names, ev, ck } = &mut st;
                 let (ev, ck) = (&ev[..], &ck[..]);
                 let mut ci = 0;
                 let mut i = 0;
                 while i < ev.len() {
                     let pk = ev[i].pkey;
-                    let pc = ev[i].pchk;
+                    let person_name = ev[i].name;
                     let mut j = i;
                     while j < ev.len() && ev[j].pkey == pk {
-                        if ev[j].pchk != pc {
+                        if ev[j].name != person_name {
                             coll.store(true, Relaxed);
                         }
                         j += 1;
@@ -748,12 +797,17 @@ fn fast(seed: u64) -> bool {
                     }
                     let c0 = ci;
                     while ci < ck.len() && ck[ci].pkey == pk {
-                        if ck[ci].pchk != pc {
+                        if ck[ci].name != person_name {
                             coll.store(true, Relaxed);
                         }
                         ci += 1;
                     }
                     let c1 = ci;
+                    // Save the name once per person, before input mappings are released.
+                    let saved_name = if person_name.is_inline() { person_name } else {
+                        names.push(person_name.bytes().into());
+                        Id::new(names.last().unwrap())
+                    };
                     // this person's sessions
                     let (mut lo, mut hi) = (c0, c0);
                     let mut row: Option<UdRow> = None;
@@ -787,7 +841,7 @@ fn fast(seed: u64) -> bool {
                             }
                         }
                         let purch = rev > 0;
-                        let r = row.get_or_insert(UdRow { line: ev[i].line, day: day as i32, ns: 0, ne: 0, nr: 0, top: u32::MAX });
+                        let r = row.get_or_insert(UdRow { name: saved_name, day: day as i32, ns: 0, ne: 0, nr: 0, top: u32::MAX });
                         r.ns += 1;
                         r.ne += nev;
                         r.nr += rev;
@@ -852,8 +906,9 @@ fn fast(seed: u64) -> bool {
                 st
             },
         );
-    std::mem::forget(paccs);
-    std::mem::forget(caccs);
+    // Output rows now refer only to owned names, not to the event/click files.
+    drop(evm);
+    drop(ckm);
     if coll.load(Relaxed) {
         return false;
     }
@@ -913,7 +968,7 @@ fn fast(seed: u64) -> bool {
             let mut uid = StringBuilder::with_capacity(part.len(), part.len() * 12);
             let mut top = StringBuilder::with_capacity(part.len(), part.len() * 8);
             for r in part.iter() {
-                uid.append_value(st(name_of(r.line)));
+                uid.append_value(st(r.name.bytes()));
                 if r.top == u32::MAX {
                     top.append_null();
                 } else {
@@ -1012,3 +1067,6 @@ fn top_cat(catsum: &mut [i64], touched: &mut Vec<u32>, names: &[&[u8]]) -> u32 {
     touched.clear();
     top
 }
+
+#[cfg(test)]
+mod tests;
