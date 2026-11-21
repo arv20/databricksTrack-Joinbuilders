@@ -75,3 +75,13 @@ pub fn populate(data: &[u8], s: usize, e: usize) {
     #[cfg(not(target_os = "linux"))]
     let _ = (data, s, e);
 }
+
+/// Unmaps a slice returned by `map` (its padding included).
+/// SAFETY: nothing may read `data` (or anything borrowed from it) afterwards.
+pub unsafe fn unmap(data: &'static [u8]) {
+    let page = page_size();
+    let total = data.len().div_ceil(page) * page + page;
+    unsafe {
+        libc::munmap(data.as_ptr() as *mut libc::c_void, total);
+    }
+}

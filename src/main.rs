@@ -714,6 +714,16 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     let persons = persons_slot.into_inner().unwrap().unwrap();
     let persons = &persons;
     tm.lap("parse");
+    // nothing reads the input mappings after the parse (keys are copied), so
+    // a helper thread unmaps them now: page-table teardown of ~2 GB of file
+    // pages is otherwise ~10 ms of single-threaded work inside exit()
+    drop(chunks);
+    let in_files: Vec<&'static [u8]> = link_files.into_iter().chain(event_files).chain(click_files).collect();
+    std::thread::spawn(move || {
+        for f in in_files {
+            unsafe { io::unmap(f) };
+        }
+    });
 
     // ---- dedup events by event_id, map to persons; scatter by person
     let total_ev: usize = parse_out.iter().map(|p| (0..ne).map(|b| p.ev.len(b)).sum::<usize>()).sum();
