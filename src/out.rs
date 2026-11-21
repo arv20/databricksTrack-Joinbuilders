@@ -1,7 +1,7 @@
 use crate::pqw::*;
 use crate::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn die(what: &str) -> ! {
     eprintln!("[v2b] write error: {what}");
@@ -328,6 +328,8 @@ fn cut_guided(rows: &[(usize, usize)], nt: usize) -> Vec<(usize, usize, usize)> 
     v
 }
 
+pub static REGION_UNMAP: AtomicBool = AtomicBool::new(true);
+
 pub fn stage45(g: &mut G, outdir: &str) {
     crate::complex::stage4_pre(g);
     let ud = Path::new(outdir).join("user_daily");
@@ -353,6 +355,8 @@ pub fn stage45(g: &mut G, outdir: &str) {
     let nf = 2 * nt;
     let csum: Vec<std::sync::Mutex<[i64; 4]>> = (0..nt).map(|_| std::sync::Mutex::new([0; 4])).collect();
     let ncp = gr_nc_plus1(g);
+    let rg_len = gr.files.last().map_or(0, |f| f.off + f.len);
+    let rg_todo = AtomicBool::new(REGION_UNMAP.load(Ordering::Relaxed) && rg_len > 0 && !gr.region.is_null());
     run_par(nt, |tid| {
         crate::complex::clicks_a(gr, tid);
         ca_done.fetch_add(1, Ordering::AcqRel);
@@ -378,6 +382,13 @@ pub fn stage45(g: &mut G, outdir: &str) {
             }
             let shards_done = ca_done.load(Ordering::Acquire) == nt && sh_done.load(Ordering::Acquire) == ns;
             if !shards_done || fq.load(Ordering::Relaxed) >= nf {
+                if rg_todo.load(Ordering::Relaxed) && rg_todo.swap(false, Ordering::AcqRel) {
+                    extern "C" {
+                        fn munmap(p: *mut u8, n: usize) -> i32;
+                    }
+                    unsafe { munmap(gr.region as *mut u8, rg_len) };
+                    continue;
+                }
                 if pq.load(Ordering::Relaxed) < np {
                     let i = pq.fetch_add(1, Ordering::Relaxed);
                     if i < np {

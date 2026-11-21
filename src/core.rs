@@ -214,7 +214,11 @@ pub fn simple_name_key(ukey: u64, u: u32, class: u32) -> (u64, usize) {
 impl Core {
     pub fn new(nc: usize, nd: usize, row_cap: usize, ws_mod: u64, day0: i32) -> Core {
         let mut names_off = Col::new(row_cap + 1);
-        names_off.push(0u32);
+        if crate::sys::CORE_NOTOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+            names_off.truncate(1);
+        } else {
+            names_off.push(0u32);
+        }
         Core {
             ws_mod,
             day0,

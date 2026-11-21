@@ -274,6 +274,11 @@ unsafe fn sort_big(g: &G, src: *const [u64; 2], s: &mut [[u64; 2]], sc: &mut Scr
         sort_net::<32>(g, src, s);
     } else if n <= SPLIT_MIN.min(NET_MAX) {
         sort_net::<64>(g, src, s);
+    } else if n >= LSD_MIN {
+        if src != s.as_ptr() {
+            std::ptr::copy_nonoverlapping(src, s.as_mut_ptr(), n);
+        }
+        lsd_sort(g, s, sc);
     } else {
         if src != s.as_ptr() {
             std::ptr::copy_nonoverlapping(src, s.as_mut_ptr(), n);
@@ -287,6 +292,55 @@ unsafe fn sort_big(g: &G, src: *const [u64; 2], s: &mut [[u64; 2]], sc: &mut Scr
         sc.tmp = tmp;
     }
 }
+const LSD_MIN: usize = env_u32(option_env!("XL_LSD_MIN"), 2048) as usize;
+
+#[inline(never)]
+unsafe fn lsd_sort(g: &G, s: &mut [[u64; 2]], sc: &mut Scratch) {
+    let n = s.len();
+    if n > u32::MAX as usize {
+        return slow_sort(g, s);
+    }
+    let mut tmp = std::mem::take(&mut sc.tmp);
+    tmp.clear();
+    tmp.reserve(n + 16);
+    let p = s.as_mut_ptr();
+    let mut h = [[0u32; 256]; 4];
+    for i in 0..n {
+        let k = ((*p.add(i))[0] >> 32) as usize;
+        h[0][k & 255] += 1;
+        h[1][(k >> 8) & 255] += 1;
+        h[2][(k >> 16) & 255] += 1;
+        h[3][k >> 24] += 1;
+    }
+    let k0 = ((*p)[0] >> 32) as usize;
+    let (mut src, mut dst) = (p, tmp.as_mut_ptr());
+    for d in 0..4 {
+        let sh = 32 + 8 * d as u32;
+        if h[d][(k0 >> (8 * d)) & 255] as usize == n {
+            continue;
+        }
+        let mut pos = [0u32; 256];
+        let mut at = 0u32;
+        for b in 0..256 {
+            pos[b] = at;
+            at += h[d][b];
+        }
+        for i in 0..n {
+            let r = src.add(i);
+            let b = (((*r)[0] >> sh) & 255) as usize;
+            let a = *pos.get_unchecked(b);
+            *pos.get_unchecked_mut(b) = a + 1;
+            _mm_storeu_si128(dst.add(a as usize) as *mut __m128i, _mm_loadu_si128(r as *const __m128i));
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    if src != p {
+        std::ptr::copy_nonoverlapping(src, p, n);
+    }
+    sc.tmp = tmp;
+    fix_ties(g, s);
+}
+
 const SPLIT_MIN: usize = env_u32(option_env!("XL_SPLIT_MIN"), 128) as usize;
 const SPLIT_PER: usize = env_u32(option_env!("XL_SPLIT_PER"), 6) as usize;
 
@@ -695,7 +749,7 @@ struct Heavy {
     sort_fin: AtomicUsize,
 }
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-const HEAVY_DIV: usize = env_u32(option_env!("XL_HEAVY_DIV"), 32) as usize;
+const HEAVY_DIV: usize = env_u32(option_env!("XL_HEAVY_DIV"), 4) as usize;
 const SORT_UNITS: usize = 64 + UBSIZE / 64 - 1;
 pub static DBG: AtomicBool = AtomicBool::new(false);
 
@@ -2024,9 +2078,9 @@ pub fn sort_bench(g: &G) {
         x ^= x << 17;
         x
     };
-    let sizes: Vec<usize> = (2..=40).chain([47, 48, 49, 63, 64, 65, 100, 127, 128, 129, 200, 255, 256, 257, 300, 400, 511, 512, 513, 600, 1500, 5000]).collect();
+    let sizes: Vec<usize> = (2..=40).chain([47, 48, 49, 63, 64, 65, 100, 127, 128, 129, 200, 255, 256, 257, 300, 400, 511, 512, 513, 600, 1500, 2047, 2048, 2049, 5000, 20000]).collect();
     for &n in &sizes {
-        let checks = if n <= 64 { 4000 } else { 300 };
+        let checks = if n <= 64 { 4000 } else if n <= 5000 { 300 } else { 40 };
         for rep in 0..checks {
             let tr = match rep % 4 {
                 0 => 4,
@@ -2063,17 +2117,14 @@ pub fn sort_bench(g: &G) {
         }
     }
     eprintln!("[sortbench] checks passed for {} sizes", sizes.len());
-    for &n in &[2usize, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 40, 48, 63, 64, 100, 128, 200, 300, 512, 600, 1500, 5000, 75000] {
+    for &n in &[2usize, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 40, 48, 63, 64, 100, 128, 200, 300, 512, 600, 1500, 2048, 5000, 20000, 75000] {
         let reps = (400_000 / n).max(4);
         let mut data: Vec<[u64; 2]> = (0..reps * n).map(|_| { let ts = rnd() % 1_000_000_000; let c = rnd() % 2000; [ts << 32 | c << 4 | (rnd() % 3), rnd() % (1 << 40)] }).collect();
         let t0 = unsafe { std::arch::x86_64::_rdtsc() };
         let mut r = 0;
         for _ in 0..reps {
             sort_clicks(g, &mut data[r * n..(r + 1) * n], &mut sc);
-            r += 37;
-            if r >= reps {
-                r -= reps;
-            }
+            r = (r + 37) % reps;
         }
         let el = unsafe { std::arch::x86_64::_rdtsc() } - t0;
         eprintln!("[sortbench] n={n}: {:.0} cycles/call, {:.1} per click", el as f64 / reps as f64, el as f64 / (reps * n) as f64);

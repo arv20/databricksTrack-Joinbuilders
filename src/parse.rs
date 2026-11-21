@@ -47,7 +47,16 @@ impl Part {
     pub fn empty() -> Part {
         Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
     }
+    pub fn new_unbound(nb: usize) -> Part {
+        Part::build(std::ptr::null(), nb)
+    }
+    pub fn set_arena(&mut self, arena: &Arena) {
+        self.arena = arena;
+    }
     pub fn new(arena: &Arena, nb: usize) -> Part {
+        Part::build(arena, nb)
+    }
+    fn build(arena: *const Arena, nb: usize) -> Part {
         Part {
             lines: vec![Line([0; 8]); nb],
             fill: vec![0; nb + 64],
@@ -259,6 +268,32 @@ pub(crate) unsafe fn mul8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::_
     _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
 }
 
+#[inline(always)]
+unsafe fn mul8m<const D: usize, const D2: usize>(base: *const u8, j: usize, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::*;
+    let (lo, hi): (__m256i, __m256i);
+    std::arch::asm!(
+        "vpmullq {lo}, {y}, ymmword ptr [{a} + 8*{i} + {d}]",
+        "vpmullq {hi}, {y}, ymmword ptr [{a} + 8*{i} + {d2}]",
+        lo = out(ymm_reg) lo, hi = out(ymm_reg) hi, y = in(ymm_reg) _mm512_castsi512_si256(b), a = in(reg) base, i = in(reg) j, d = const D, d2 = const D2,
+        options(pure, readonly, nostack, preserves_flags)
+    );
+    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
+}
+
+#[inline(always)]
+unsafe fn mulu32_8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::*;
+    let m = |x: __m256i, y: __m256i| {
+        let r: __m256i;
+        std::arch::asm!("vpmuludq {r}, {x}, {y}", r = lateout(ymm_reg) r, x = in(ymm_reg) x, y = in(ymm_reg) y, options(pure, nomem, nostack, preserves_flags));
+        r
+    };
+    let lo = m(_mm512_castsi512_si256(a), _mm512_castsi512_si256(b));
+    let hi = m(_mm512_extracti64x4_epi64::<1>(a), _mm512_extracti64x4_epi64::<1>(b));
+    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
+}
+
 
 #[inline(always)]
 unsafe fn mask64(m: &[u8; 16]) -> u64 {
@@ -306,39 +341,17 @@ unsafe fn mul4(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> 
 }
 #[inline(always)]
 unsafe fn line_out<const NT: bool>(dst: *mut u8, src: *const u8) {
+    use std::arch::x86_64::*;
     if NT {
-        std::arch::asm!(
-            "vmovdqa {a}, ymmword ptr [{s}]",
-            "vmovdqa {b}, ymmword ptr [{s} + 32]",
-            "vmovntdq ymmword ptr [{d}], {a}",
-            "vmovntdq ymmword ptr [{d} + 32], {b}",
-            a = out(ymm_reg) _, b = out(ymm_reg) _, s = in(reg) src, d = in(reg) dst,
-            options(nostack, preserves_flags)
-        );
+        _mm512_stream_si512(dst as *mut __m512i, _mm512_load_si512(src as *const __m512i));
     } else {
-        std::arch::asm!(
-            "vmovdqa {a}, ymmword ptr [{s}]",
-            "vmovdqa {b}, ymmword ptr [{s} + 32]",
-            "vmovdqu ymmword ptr [{d}], {a}",
-            "vmovdqu ymmword ptr [{d} + 32], {b}",
-            a = out(ymm_reg) _, b = out(ymm_reg) _, s = in(reg) src, d = in(reg) dst,
-            options(nostack, preserves_flags)
-        );
+        _mm512_storeu_si512(dst as *mut __m512i, _mm512_load_si512(src as *const __m512i));
     }
 }
 #[inline(always)]
 pub(crate) unsafe fn eq64(p: *const u8, c: u8) -> u64 {
     use std::arch::x86_64::*;
-    let m: u64;
-    std::arch::asm!(
-        "vpcmpeqb {k1}, {c}, ymmword ptr [{p}]",
-        "vpcmpeqb {k2}, {c}, ymmword ptr [{p} + 32]",
-        "kunpckdq {k1}, {k2}, {k1}",
-        "kmovq {m}, {k1}",
-        k1 = out(kreg) _, k2 = out(kreg) _, c = in(ymm_reg) _mm256_set1_epi8(c as i8), p = in(reg) p, m = lateout(reg) m,
-        options(pure, readonly, nostack, preserves_flags)
-    );
-    m
+    _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p as *const __m512i), _mm512_set1_epi8(c as i8))
 }
 #[repr(C, align(64))]
 pub struct Out {
@@ -382,6 +395,7 @@ pub unsafe fn init_tabs_shared(prod: *const u8, np: usize, camp: *const u8, nc: 
     let _ = TABS.set(Tabs { prod: v(prod, np), camp: v(camp, nc), crange });
 }
 pub static CORE_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static PARTS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn camp_range(t: &[u8]) -> Option<(u64, u64)> {
     let lo = t.iter().position(|&c| c != 255)?;
@@ -631,33 +645,29 @@ struct EvP {
 #[inline(always)]
 unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
     use std::arch::x86_64::*;
-    let mut mk = [[0u8; 16]; 3];
-    let s = |v: u64| _mm256_set1_epi64x(v as i64);
+    let mut mk = [[0u8; 8]; 3];
+    let s = |v: u64| _mm512_set1_epi64(v as i64);
     let m40 = s(crate::keyrec::MASK);
     let binv = s(crate::keyrec::BINV);
     let ainv = s(crate::keyrec::AINV);
     let ukey = s(p.ukey & crate::keyrec::MASK);
     let ekey = s(p.ekey & crate::keyrec::MASK);
     let lim40 = s(1 << 40);
-    let unscr = |yb: __m256i, key: __m256i| {
-        let x = _mm256_and_si256(yb, m40);
-        let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
-        _mm256_and_si256(mul4(_mm256_xor_si256(x, key), ainv), m40)
+    let unscr = |yb: __m512i, key: __m512i| {
+        let x = _mm512_and_si512(yb, m40);
+        let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
+        _mm512_and_si512(mul8(_mm512_xor_si512(x, key), ainv), m40)
     };
     let ebp = eb as *const EvBatch as *const u8;
     const UID: usize = std::mem::offset_of!(EvBatch, uid);
     const EID: usize = std::mem::offset_of!(EvBatch, eid);
-    const OB: usize = std::mem::offset_of!(Out, ob);
-    const LP: usize = std::mem::offset_of!(Out, lp);
-    const RC: usize = std::mem::offset_of!(Out, rec);
-    let outp = out as *mut Out as *mut u8;
     let ing_base = s(p.ing_base as u64);
     let ing_lim = s(ING_MAX * 1000);
     let ts_bad = s(TS_BAD as u64);
     let ws = s(p.ws as u64);
     let wlen = s(p.wlen);
     let empty = s(ID_EMPTY);
-    let zero = _mm256_setzero_si256();
+    let zero = _mm512_setzero_si512();
     let p24 = s(0xFF_FFFF);
     let day = s(DAY_MS as u64);
     let ucap = s(p.ucap);
@@ -668,53 +678,53 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     let magic = s(274_877_907);
     let ones = s(u64::MAX);
     let lines = s(p.lines as u64);
-    let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
-    let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
+    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
     let mut j = 0;
     let mut g = 0;
     while j < n {
-        let ingr = _mm256_load_si256(eb.ing.as_ptr().add(j) as *const __m256i);
-        let ing = _mm256_sub_epi64(ingr, ing_base);
-        let bad = if TSB { kor(_mm256_cmpeq_epi64_mask(ingr, ts_bad), _mm256_cmpge_epu64_mask(ing, ing_lim)) } else { _mm256_cmpge_epu64_mask(ing, ing_lim) };
-        let ing_s = _mm256_srli_epi64::<38>(_mm256_mul_epu32(ing, magic));
-        let ts = _mm256_load_si256(eb.ts.as_ptr().add(j) as *const __m256i);
-        let rel = _mm256_sub_epi64(ts, ws);
-        let eid = _mm256_load_si256(eb.eid.as_ptr().add(j) as *const __m256i);
-        let uid = _mm256_load_si256(eb.uid.as_ptr().add(j) as *const __m256i);
-        let pp = _mm256_load_si256(eb.pp.as_ptr().add(j) as *const __m256i);
-        let price = _mm256_and_si256(_mm256_srli_epi64::<32>(pp), p24);
-        let valid = _mm256_cmpneq_epi64_mask(uid, empty);
-        let valid = _mm256_mask_cmplt_epu64_mask(valid, rel, wlen);
-        let valid = _mm256_mask_cmpgt_epi64_mask(valid, pp, ones);
-        let valid = _mm256_mask_cmple_epi64_mask(valid, _mm256_sub_epi64(ingr, ts), day);
-        let w = unscr(mul4m::<UID>(ebp, j, binv), ukey);
-        let user = _mm256_srli_epi64::<9>(w);
-        let alias = _mm256_and_si256(w, m511);
-        let normal = _mm256_mask_cmplt_epu64_mask(_mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
-        let pm = _mm256_mask_cmpneq_epi64_mask(valid, price, zero);
-        let w0v = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi64::<33>(rel), _mm256_slli_epi64::<9>(price)), alias);
-        let w0v = _mm256_mask_blend_epi64(valid, ones, w0v);
-        let userv = _mm256_maskz_mov_epi64(valid, user);
-        let v = unscr(mul4m::<EID>(ebp, j, binv), ekey);
-        let evok = _mm256_mask_cmplt_epu64_mask(_mm256_cmplt_epu64_mask(eid, lim40), v, ecap);
-        let w1v = _mm256_or_si256(_mm256_and_si256(v, slotm), _mm256_or_si256(_mm256_slli_epi64::<16>(ing_s), _mm256_slli_epi64::<37>(userv)));
+        let ingr = _mm512_load_si512(eb.ing.as_ptr().add(j) as *const __m512i);
+        let ing = _mm512_sub_epi64(ingr, ing_base);
+        let bad = if TSB { kor(_mm512_cmpeq_epi64_mask(ingr, ts_bad), _mm512_cmpge_epu64_mask(ing, ing_lim)) } else { _mm512_cmpge_epu64_mask(ing, ing_lim) };
+        let ing_s = _mm512_srli_epi64::<38>(mulu32_8(ing, magic));
+        let ts = _mm512_load_si512(eb.ts.as_ptr().add(j) as *const __m512i);
+        let rel = _mm512_sub_epi64(ts, ws);
+        let eid = _mm512_load_si512(eb.eid.as_ptr().add(j) as *const __m512i);
+        let uid = _mm512_load_si512(eb.uid.as_ptr().add(j) as *const __m512i);
+        let pp = _mm512_load_si512(eb.pp.as_ptr().add(j) as *const __m512i);
+        let price = _mm512_and_si512(_mm512_srli_epi64::<32>(pp), p24);
+        let valid = _mm512_cmpneq_epi64_mask(uid, empty);
+        let valid = _mm512_mask_cmplt_epu64_mask(valid, rel, wlen);
+        let valid = _mm512_mask_cmpgt_epi64_mask(valid, pp, ones);
+        let valid = _mm512_mask_cmple_epi64_mask(valid, _mm512_sub_epi64(ingr, ts), day);
+        let w = unscr(mul8m::<UID, { UID + 32 }>(ebp, j, binv), ukey);
+        let user = _mm512_srli_epi64::<9>(w);
+        let alias = _mm512_and_si512(w, m511);
+        let normal = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
+        let pm = _mm512_mask_cmpneq_epi64_mask(valid, price, zero);
+        let w0v = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi64::<33>(rel), _mm512_slli_epi64::<9>(price)), alias);
+        let w0v = _mm512_mask_blend_epi64(valid, ones, w0v);
+        let userv = _mm512_maskz_mov_epi64(valid, user);
+        let v = unscr(mul8m::<EID, { EID + 32 }>(ebp, j, binv), ekey);
+        let evok = _mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(eid, lim40), v, ecap);
+        let w1v = _mm512_or_si512(_mm512_and_si512(v, slotm), _mm512_or_si512(_mm512_slli_epi64::<16>(ing_s), _mm512_slli_epi64::<37>(userv)));
         let ok = kandn(kandn(normal, valid), evok);
-        let bv = _mm256_srli_epi64::<{ BB as i32 }>(v);
-        st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_lo, w1v));
-        st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(w0v, ix_hi, w1v));
-        st4::<OB>(outp, j, bv);
-        st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
+        let bv = _mm512_srli_epi64::<BB>(v);
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j) as *mut __m512i, _mm512_permutex2var_epi64(w0v, ix_lo, w1v));
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4) as *mut __m512i, _mm512_permutex2var_epi64(w0v, ix_hi, w1v));
+        _mm512_store_si512(out.ob.as_mut_ptr().add(j) as *mut __m512i, bv);
+        _mm512_store_si512(out.lp.as_mut_ptr().add(j) as *mut __m512i, _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
         kst(mk[0].as_mut_ptr(), g, bad);
         kst(mk[1].as_mut_ptr(), g, pm);
         kst(mk[2].as_mut_ptr(), g, ok);
-        j += 4;
+        j += 8;
         g += 1;
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let badb = mask64(&mk[0]);
-    let okb = mask64(&mk[2]) & nm;
+    let badb = u64::from_le_bytes(mk[0]);
+    let okb = u64::from_le_bytes(mk[2]) & nm;
     let spb = !okb & nm;
-    let mut pmb = mask64(&mk[1]) & nm;
+    let mut pmb = u64::from_le_bytes(mk[1]) & nm;
     while pmb != 0 {
         let i = pmb.trailing_zeros() as usize;
         pmb &= pmb - 1;
@@ -876,22 +886,41 @@ unsafe fn link_fast(p: *const u8, len: usize) -> Option<(u64, u64)> {
 }
 
 #[inline(always)]
-unsafe fn b36_vec4(w: std::arch::x86_64::__m256i, n: std::arch::x86_64::__m256i) -> (std::arch::x86_64::__m256i, u8) {
+unsafe fn b36_vec8(w: std::arch::x86_64::__m512i, n: std::arch::x86_64::__m512i) -> (std::arch::x86_64::__m512i, u8) {
     use std::arch::x86_64::*;
-    let s = |v: u64| _mm256_set1_epi64x(v as i64);
-    let sh = _mm256_slli_epi64::<3>(_mm256_sub_epi64(s(8), n));
-    let fill = _mm256_srlv_epi64(s(0x3030_3030_3030_3030 >> 1), _mm256_sub_epi64(s(63), sh));
-    let w2 = _mm256_or_si256(_mm256_sllv_epi64(w, sh), fill);
-    let d0 = _mm256_sub_epi8(w2, _mm256_set1_epi8(b'0' as i8));
-    let isdig = _mm256_cmplt_epu8_mask(d0, _mm256_set1_epi8(10));
-    let islow = _mm256_cmplt_epu8_mask(_mm256_sub_epi8(w2, _mm256_set1_epi8(b'a' as i8)), _mm256_set1_epi8(26));
-    let badb = _mm256_movm_epi8(!(isdig | islow));
-    let good = _mm256_testn_epi64_mask(badb, badb);
-    let d = _mm256_mask_sub_epi8(d0, islow, d0, _mm256_set1_epi8(39));
-    let q = _mm256_madd_epi16(_mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0124)), _mm256_set1_epi32(0x0001_0510));
-    let r = _mm256_add_epi64(_mm256_mul_epu32(q, s(1_679_616)), _mm256_srli_epi64::<32>(q));
-    let canon = _mm256_cmpeq_epi64_mask(n, s(1)) | _mm256_cmpneq_epi64_mask(_mm256_and_si256(w, s(0xFF)), s(0x30));
-    (r, good & canon & _mm256_cmple_epu64_mask(r, s(crate::keyrec::MASK)))
+    let s = |v: u64| _mm512_set1_epi64(v as i64);
+    let sh = _mm512_slli_epi64::<3>(_mm512_sub_epi64(s(8), n));
+    let fill = _mm512_srlv_epi64(s(0x3030_3030_3030_3030 >> 1), _mm512_sub_epi64(s(63), sh));
+    let w2 = _mm512_or_si512(_mm512_sllv_epi64(w, sh), fill);
+    let d0 = _mm512_sub_epi8(w2, _mm512_set1_epi8(b'0' as i8));
+    let isdig = _mm512_cmplt_epu8_mask(d0, _mm512_set1_epi8(10));
+    let islow = _mm512_cmplt_epu8_mask(_mm512_sub_epi8(w2, _mm512_set1_epi8(b'a' as i8)), _mm512_set1_epi8(26));
+    let badb = _mm512_movm_epi8(!(isdig | islow));
+    let good = _mm512_testn_epi64_mask(badb, badb);
+    let d = _mm512_mask_sub_epi8(d0, islow, d0, _mm512_set1_epi8(39));
+    let (dl, dh) = (_mm512_castsi512_si256(d), _mm512_extracti64x4_epi64::<1>(d));
+    let k1 = _mm256_set1_epi16(0x0124);
+    let k2 = _mm256_set1_epi32(0x0001_0510);
+    let k3 = _mm256_set1_epi64x(1_679_616);
+    let (pl, ph): (__m256i, __m256i);
+    let (ql, qh): (__m256i, __m256i);
+    let (rl, rh): (__m256i, __m256i);
+    std::arch::asm!(
+        "vpmaddubsw {pl}, {dl}, {k1}",
+        "vpmaddubsw {ph}, {dh}, {k1}",
+        "vpmaddwd {ql}, {pl}, {k2}",
+        "vpmaddwd {qh}, {ph}, {k2}",
+        "vpmuludq {rl}, {ql}, {k3}",
+        "vpmuludq {rh}, {qh}, {k3}",
+        dl = in(ymm_reg) dl, dh = in(ymm_reg) dh, k1 = in(ymm_reg) k1, k2 = in(ymm_reg) k2, k3 = in(ymm_reg) k3,
+        pl = out(ymm_reg) pl, ph = out(ymm_reg) ph, ql = out(ymm_reg) ql, qh = out(ymm_reg) qh, rl = out(ymm_reg) rl, rh = out(ymm_reg) rh,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    let _ = (pl, ph);
+    let q = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql), qh);
+    let r = _mm512_add_epi64(_mm512_inserti64x4::<1>(_mm512_castsi256_si512(rl), rh), _mm512_srli_epi64::<32>(q));
+    let canon = _mm512_cmpeq_epi64_mask(n, s(1)) | _mm512_cmpneq_epi64_mask(_mm512_and_si512(w, s(0xFF)), s(0x30));
+    (r, good & canon & _mm512_cmple_epu64_mask(r, s(crate::keyrec::MASK)))
 }
 
 #[inline(never)]
@@ -924,58 +953,166 @@ fn link_slow(c: &mut Ctx, buf: &[u8], s: usize, e: usize) {
     c.t.gen_edges.push((ta, tb));
 }
 
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct LkRow {
+    e: [u8; 32],
+    m: [u8; 32],
+    offa: i64,
+    offb: i64,
+    na: u64,
+    nb: u64,
+    _pad: [u64; 4],
+}
+const LK_ROWS: usize = 32 * 16 + 33;
+const fn lk_rows() -> [LkRow; LK_ROWS] {
+    let mut t = [LkRow { e: [0; 32], m: [0; 32], offa: -1, offb: 0, na: 0, nb: 0, _pad: [0; 4] }; LK_ROWS];
+    let mut c0 = 2;
+    while c0 <= 11 {
+        let mut rb = 2;
+        while rb <= 11 {
+            let nl = c0 + 1 + rb;
+            let (qa, qb) = ((c0 >= 10) as usize, (rb >= 10) as usize);
+            let mut r = LkRow { e: [0; 32], m: [0; 32], offa: 1 + qa as i64, offb: (c0 + 2 + qb) as i64, na: (c0 - 1 - 2 * qa) as u64, nb: (rb - 1 - 2 * qb) as u64, _pad: [0; 4] };
+            let f = [(0, c0, qa), (c0 + 1, nl, qb)];
+            let mut k = 0;
+            while k < 2 {
+                let (s, e, q) = f[k];
+                if q == 1 {
+                    r.e[s] = b'"';
+                    r.m[s] = 0xFF;
+                    r.e[e - 1] = b'"';
+                    r.m[e - 1] = 0xFF;
+                }
+                r.e[s + q] = b'u';
+                r.m[s + q] = 0xFF;
+                k += 1;
+            }
+            r.e[c0] = b',';
+            r.m[c0] = 0xFF;
+            r.e[nl] = b'\n';
+            r.m[nl] = 0xFF;
+            t[nl * 16 + c0] = r;
+            rb += 1;
+        }
+        c0 += 1;
+    }
+    t
+}
+static LKP: [LkRow; LK_ROWS] = lk_rows();
+const _: () = assert!(std::mem::size_of::<LkRow>() == 128 && std::mem::offset_of!(LkRow, m) == 32 && std::mem::offset_of!(LkRow, offa) == 64 && std::mem::offset_of!(LkRow, na) == 80);
+
+const LK_REACH: usize = 40;
+
+#[inline(never)]
+unsafe fn lk_loop(p: *const u8, lim: *const u8, lb: *mut LkBatch, n: usize) -> (u64, *const u8, usize) {
+    let (code, np, nn): (u64, *const u8, usize);
+    unsafe {
+        std::arch::asm!(
+            "mov eax, 0x0a0a0a0a",
+            "vmovd xmm14, eax",
+            "vpbroadcastd ymm14, xmm14",
+            "mov eax, 0x2c2c2c2c",
+            "vmovd xmm15, eax",
+            "vpbroadcastd ymm15, xmm15",
+            "sub rdx, {NB}",
+            "jmp 3f",
+            ".p2align 5",
+            "2:",
+            "vmovdqu ymm0, ymmword ptr [rdi]",
+            "vpcmpeqb ymm1, ymm0, ymm14",
+            "vpmovmskb eax, ymm1",
+            "tzcnt eax, eax",
+            "vpcmpeqb ymm2, ymm0, ymm15",
+            "vpmovmskb ecx, ymm2",
+            "tzcnt ecx, ecx",
+            "imul r9d, eax, 2048",
+            "shl ecx, 7",
+            "add r9d, ecx",
+            "mov r10, qword ptr [{LKP} + r9 + 64]",
+            "test r10, r10",
+            "js 8f",
+            "vpxor ymm1, ymm0, ymmword ptr [{LKP} + r9]",
+            "vptest ymm1, ymmword ptr [{LKP} + r9 + 32]",
+            "jnz 8f",
+            "mov r11, qword ptr [{LKP} + r9 + 72]",
+            "mov r10, qword ptr [rdi + r10]",
+            "mov r11, qword ptr [rdi + r11]",
+            "mov qword ptr [rsi + rdx*8 + {LA} + 8*{NB}], r10",
+            "mov qword ptr [rsi + rdx*8 + {LBB} + 8*{NB}], r11",
+            "vmovdqu xmm3, xmmword ptr [{LKP} + r9 + 80]",
+            "vmovq qword ptr [rsi + rdx*8 + {LNA} + 8*{NB}], xmm3",
+            "vmovhps qword ptr [rsi + rdx*8 + {LNB} + 8*{NB}], xmm3",
+            "mov qword ptr [rsi + rdx*8 + {LAT} + 8*{NB}], rdi",
+            "lea rdi, [rdi + rax + 1]",
+            "add rdx, 1",
+            "jz 7f",
+            "3:",
+            "cmp rdi, r8",
+            "jbe 2b",
+            "xor eax, eax",
+            "jmp 6f",
+            "7:",
+            "mov eax, 2",
+            "jmp 6f",
+            "8:",
+            "mov eax, 1",
+            "6:",
+            "add rdx, {NB}",
+            "vzeroupper",
+            inout("rdi") p => np,
+            in("rsi") lb,
+            inout("rdx") n => nn,
+            in("r8") lim,
+            out("rax") code,
+            out("rcx") _, out("r9") _, out("r10") _, out("r11") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm14") _, out("ymm15") _,
+            LKP = sym LKP, NB = const NB,
+            LA = const std::mem::offset_of!(LkBatch, a), LBB = const std::mem::offset_of!(LkBatch, b),
+            LNA = const std::mem::offset_of!(LkBatch, na), LNB = const std::mem::offset_of!(LkBatch, nb),
+            LAT = const std::mem::offset_of!(LkBatch, at),
+            options(nostack),
+        );
+    }
+    (code, np, nn)
+}
+
 fn links_chunk(c: &mut Ctx, buf: &[u8]) {
-    use std::arch::x86_64::*;
-    const LB: usize = 8192;
     let len = buf.len();
     let base = buf.as_ptr();
-    let mut ends = [0u32; LB + 64];
     let mut lb: LkBatch = unsafe { std::mem::zeroed() };
     let mut nb = 0usize;
     let mut pos = 0usize;
-    let mut off = 0usize;
-    while off < len {
-        let stop = (off + LB).min(len);
-        let mut k = 0usize;
-        let mut o = off;
-        while o < stop {
-            let mut m = unsafe { eq64(base.add(o), b'\n') };
-            if stop - o < 64 {
-                m = unsafe { _bzhi_u64(m, (stop - o) as u32) };
+    if len >= LK_REACH {
+        let lim = unsafe { base.add(len - LK_REACH) };
+        loop {
+            let (code, np, n2) = unsafe { lk_loop(base.add(pos), lim, &mut lb, nb) };
+            pos = np as usize - base as usize;
+            nb = n2;
+            if code == 2 {
+                lk_batch(c, buf, &mut lb, NB);
+                nb = 0;
+            } else if code == 1 {
+                let Some(i) = buf[pos..].iter().position(|&b| b == b'\n') else { break };
+                link_slow(c, buf, pos, pos + i);
+                pos += i + 1;
+            } else {
+                break;
             }
-            while m != 0 {
-                ends[k] = (o + m.trailing_zeros() as usize) as u32;
-                k += 1;
-                m &= m - 1;
-            }
-            o += 64;
         }
-        for &e in &ends[..k] {
-            let e = e as usize;
-            if pos + 64 <= len {
-                if let Some((wa, na, wb, nbb)) = unsafe { link_pre(base.add(pos), e - pos) } {
-                    lb.a[nb] = wa;
-                    lb.b[nb] = wb;
-                    lb.na[nb] = na as u64;
-                    lb.nb[nb] = nbb as u64;
-                    lb.at[nb] = (pos as u32, e as u32);
-                    pos = e + 1;
-                    nb += 1;
-                    if nb == NB {
-                        lk_batch(c, buf, &mut lb, nb);
-                        nb = 0;
-                    }
-                    continue;
-                }
-            }
-            link_slow(c, buf, pos, e);
-            pos = e + 1;
-        }
-        off = stop;
     }
     lk_batch(c, buf, &mut lb, nb);
-    if pos < len {
-        link_slow(c, buf, pos, len);
+    while pos < len {
+        match buf[pos..].iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                link_slow(c, buf, pos, pos + i);
+                pos += i + 1;
+            }
+            None => {
+                link_slow(c, buf, pos, len);
+                break;
+            }
+        }
     }
 }
 
@@ -985,7 +1122,7 @@ struct LkBatch {
     b: [u64; NB],
     na: [u64; NB],
     nb: [u64; NB],
-    at: [(u32, u32); NB],
+    at: [u64; NB],
 }
 
 #[inline(never)]
@@ -996,9 +1133,9 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
     }
     let g = c.g;
     let out = &mut *c.out;
-    let mut mk = [[0u8; 16]; 3];
+    let mut mk = [[0u8; 8]; 3];
     unsafe {
-        let s = |v: u64| _mm256_set1_epi64x(v as i64);
+        let s = |v: u64| _mm512_set1_epi64(v as i64);
         let m40 = s(crate::keyrec::MASK);
         let binv = s(crate::keyrec::BINV);
         let ainv = s(crate::keyrec::AINV);
@@ -1009,55 +1146,50 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
         let ulo = s(UBSIZE as u64 - 1);
         let lines = s(c.t.us.lines_ptr() as u64);
         let link = s(1 << 63);
-        let zero = _mm256_setzero_si256();
-        let ix_lo = _mm256_setr_epi64x(0, 4, 1, 5);
-        let ix_hi = _mm256_setr_epi64x(2, 6, 3, 7);
-        const OB: usize = std::mem::offset_of!(Out, ob);
-        const LP: usize = std::mem::offset_of!(Out, lp);
-        const RC: usize = std::mem::offset_of!(Out, rec);
-        const LA: usize = std::mem::offset_of!(LkBatch, a);
-        const LBB: usize = std::mem::offset_of!(LkBatch, b);
-        let outp = out as *mut Out as *mut u8;
-        let lbp = lb as *mut LkBatch as *mut u8;
-        let dec = |y: __m256i| {
-            let x = _mm256_and_si256(mul4(y, binv), m40);
-            let x = _mm256_xor_si256(x, _mm256_xor_si256(_mm256_srli_epi64::<17>(x), _mm256_srli_epi64::<34>(x)));
-            let w = _mm256_and_si256(mul4(_mm256_xor_si256(x, ukey), ainv), m40);
-            (_mm256_srli_epi64::<9>(w), _mm256_and_si256(w, m511))
+        let zero = _mm512_setzero_si512();
+        let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+        let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
+        let dec = |y: __m512i| {
+            let x = _mm512_and_si512(mul8(y, binv), m40);
+            let x = _mm512_xor_si512(x, _mm512_xor_si512(_mm512_srli_epi64::<17>(x), _mm512_srli_epi64::<34>(x)));
+            let w = _mm512_and_si512(mul8(_mm512_xor_si512(x, ukey), ainv), m40);
+            (_mm512_srli_epi64::<9>(w), _mm512_and_si512(w, m511))
         };
         let mut j = 0;
         while j < n {
-            let (ia, oka) = b36_vec4(_mm256_load_si256(lb.a.as_ptr().add(j) as *const __m256i), _mm256_load_si256(lb.na.as_ptr().add(j) as *const __m256i));
-            let (ib, okb2) = b36_vec4(_mm256_load_si256(lb.b.as_ptr().add(j) as *const __m256i), _mm256_load_si256(lb.nb.as_ptr().add(j) as *const __m256i));
+            let (ia, oka) = b36_vec8(_mm512_load_si512(lb.a.as_ptr().add(j) as *const __m512i), _mm512_load_si512(lb.na.as_ptr().add(j) as *const __m512i));
+            let (ib, okb2) = b36_vec8(_mm512_load_si512(lb.b.as_ptr().add(j) as *const __m512i), _mm512_load_si512(lb.nb.as_ptr().add(j) as *const __m512i));
             let dok = oka & okb2;
-            st4::<LA>(lbp, j, ia);
-            st4::<LBB>(lbp, j, ib);
+            _mm512_store_si512(lb.a.as_mut_ptr().add(j) as *mut __m512i, ia);
+            _mm512_store_si512(lb.b.as_mut_ptr().add(j) as *mut __m512i, ib);
             let (ua, aa) = dec(ia);
             let (ub, ab) = dec(ib);
-            let normal = _mm256_cmplt_epu64_mask(ua, ucap) & _mm256_cmplt_epu64_mask(aa, nal) & _mm256_cmplt_epu64_mask(ub, ucap) & _mm256_cmplt_epu64_mask(ab, nal);
-            let ne = dok & _mm256_cmpneq_epi64_mask(ia, ib);
-            let ok = ne & normal & _mm256_cmpeq_epi64_mask(ua, ub);
-            let o0 = _mm256_or_si256(_mm256_or_si256(link, _mm256_slli_epi64::<43>(_mm256_and_si256(ua, ulo))), _mm256_or_si256(_mm256_slli_epi64::<4>(aa), ab));
-            let bv = _mm256_srli_epi64::<{ UB as i32 }>(ua);
-            st4::<RC>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_lo, zero));
-            st4::<{ RC + 32 }>(outp, 2 * j, _mm256_permutex2var_epi64(o0, ix_hi, zero));
-            st4::<OB>(outp, j, bv);
-            st4::<LP>(outp, j, _mm256_add_epi64(_mm256_slli_epi64::<6>(bv), lines));
-            kst(mk[0].as_mut_ptr(), j / 4, ok);
-            kst(mk[1].as_mut_ptr(), j / 4, kandn(ok, ne));
-            kst(mk[2].as_mut_ptr(), j / 4, dok);
-            j += 4;
+            let normal = _mm512_cmplt_epu64_mask(ua, ucap) & _mm512_cmplt_epu64_mask(aa, nal) & _mm512_cmplt_epu64_mask(ub, ucap) & _mm512_cmplt_epu64_mask(ab, nal);
+            let ne = dok & _mm512_cmpneq_epi64_mask(ia, ib);
+            let ok = ne & normal & _mm512_cmpeq_epi64_mask(ua, ub);
+            let o0 = _mm512_or_si512(_mm512_or_si512(link, _mm512_slli_epi64::<43>(_mm512_and_si512(ua, ulo))), _mm512_or_si512(_mm512_slli_epi64::<4>(aa), ab));
+            let bv = _mm512_srli_epi64::<UB>(ua);
+            _mm512_store_si512(out.rec.as_mut_ptr().add(j) as *mut __m512i, _mm512_permutex2var_epi64(o0, ix_lo, zero));
+            _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4) as *mut __m512i, _mm512_permutex2var_epi64(o0, ix_hi, zero));
+            _mm512_store_si512(out.ob.as_mut_ptr().add(j) as *mut __m512i, bv);
+            _mm512_store_si512(out.lp.as_mut_ptr().add(j) as *mut __m512i, _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
+            kst(mk[0].as_mut_ptr(), j / 8, ok);
+            kst(mk[1].as_mut_ptr(), j / 8, kandn(ok, ne));
+            kst(mk[2].as_mut_ptr(), j / 8, dok);
+            j += 8;
         }
     }
     let nm = if n >= 64 { !0 } else { (1u64 << n) - 1 };
-    let (okb, mut genb, decb) = unsafe { (mask64(&mk[0]) & nm, mask64(&mk[1]) & nm, mask64(&mk[2]) & nm) };
+    let (okb, mut genb, decb) = (u64::from_le_bytes(mk[0]) & nm, u64::from_le_bytes(mk[1]) & nm, u64::from_le_bytes(mk[2]) & nm);
     unsafe { c.t.us.push_many(okb, n, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
     c.t.n_lk_rows += decb.count_ones() as u64;
     let mut slow = !decb & nm;
     while slow != 0 {
         let i = slow.trailing_zeros() as usize;
         slow &= slow - 1;
-        link_slow(c, buf, lb.at[i].0 as usize, lb.at[i].1 as usize);
+        let s = lb.at[i] as usize - buf.as_ptr() as usize;
+        let e = s + buf[s..].iter().position(|&b| b == b'\n').unwrap();
+        link_slow(c, buf, s, e);
     }
     while genb != 0 {
         let i = genb.trailing_zeros() as usize;
@@ -1070,7 +1202,7 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
 mod tests {
     use super::*;
     #[test]
-    fn b36_vec4_matches_scalar() {
+    fn b36_vec8_matches_scalar() {
         use std::arch::x86_64::*;
         let mut r = Rng(0x1234_5678_9ABC_DEF1);
         let alpha = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -1093,13 +1225,9 @@ mod tests {
                 w[i] = u64::from_le_bytes(b);
                 n[i] = len;
             }
+            let (v, ok) = unsafe { b36_vec8(_mm512_loadu_si512(w.as_ptr() as *const __m512i), _mm512_loadu_si512(n.as_ptr() as *const __m512i)) };
             let mut vv = [0u64; 8];
-            let mut ok = 0u8;
-            for h in 0..2 {
-                let (v, o) = unsafe { b36_vec4(_mm256_loadu_si256(w.as_ptr().add(4 * h) as *const __m256i), _mm256_loadu_si256(n.as_ptr().add(4 * h) as *const __m256i)) };
-                unsafe { _mm256_storeu_si256(vv.as_mut_ptr().add(4 * h) as *mut __m256i, v) };
-                ok |= (o & 15) << (4 * h);
-            }
+            unsafe { _mm512_storeu_si512(vv.as_mut_ptr() as *mut __m512i, v) };
             for i in 0..8 {
                 let (sv, sok) = crate::keyrec::base36_word(w[i], n[i] as u32);
                 assert_eq!(sok, ok >> i & 1 == 1, "ok differs: word {:x} len {}", w[i], n[i]);
@@ -1166,6 +1294,109 @@ mod tests {
             }
         }
         assert!(fast > 100_000, "{fast}");
+    }
+
+    #[test]
+    fn lk_loop_matches_link_pre() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let alpha = b"0123456789abcdefghijklmnopqrstuvwxyzU\"\", u_\r0\n";
+        let (mut fast, mut total) = (0usize, 0usize);
+        for _round in 0..3000 {
+            let mut buf = Vec::new();
+            let nlines = 1 + rnd(400) as usize;
+            for _ in 0..nlines {
+                for side in 0..2 {
+                    if side == 1 && rnd(60) != 0 {
+                        buf.push(b',');
+                    }
+                    let q = rnd(4) == 0;
+                    if q {
+                        buf.push(b'"');
+                    }
+                    if rnd(30) != 0 {
+                        buf.push(b'u');
+                    }
+                    let k = if rnd(8) == 0 { rnd(14) } else { 6 + rnd(3) };
+                    for _ in 0..k {
+                        let c = if rnd(25) == 0 { alpha[rnd(alpha.len() as u64) as usize] } else { alpha[rnd(36) as usize] };
+                        buf.push(c);
+                    }
+                    if q && rnd(15) != 0 {
+                        buf.push(b'"');
+                    }
+                }
+                if rnd(80) == 0 {
+                    buf.push(b',');
+                }
+                if rnd(100) == 0 {
+                    for _ in 0..rnd(40) {
+                        buf.push(b'a' + rnd(26) as u8);
+                    }
+                }
+                buf.push(b'\n');
+            }
+            let len = buf.len();
+            let mut starts = vec![0usize];
+            for (i, &c) in buf.iter().enumerate() {
+                if c == b'\n' && i + 1 < len {
+                    starts.push(i + 1);
+                }
+            }
+            if len < LK_REACH {
+                continue;
+            }
+            let base = buf.as_ptr();
+            let lim = unsafe { base.add(len - LK_REACH) };
+            let mut lb: LkBatch = unsafe { std::mem::zeroed() };
+            let mut pos = 0usize;
+            let mut k = 0usize;
+            let mut nb = 0usize;
+            loop {
+                let n0 = nb;
+                let (code, np, n2) = unsafe { lk_loop(base.add(pos), lim, &mut lb, nb) };
+                for i in n0..n2 {
+                    let s = lb.at[i] as usize - base as usize;
+                    assert_eq!(s, starts[k], "line start");
+                    let e = s + buf[s..].iter().position(|&b| b == b'\n').unwrap();
+                    let want = unsafe { link_pre(base.add(s), e - s) };
+                    let both = crate::keyrec::base36_word(lb.a[i], lb.na[i] as u32).1 && crate::keyrec::base36_word(lb.b[i], lb.nb[i] as u32).1;
+                    assert!((1..=8).contains(&lb.na[i]) && (1..=8).contains(&lb.nb[i]));
+                    if both || want.is_some() {
+                        assert_eq!(want, Some((lb.a[i], lb.na[i] as u32, lb.b[i], lb.nb[i] as u32)), "{:?}", String::from_utf8_lossy(&buf[s..e]));
+                    }
+                    assert!(s + LK_REACH <= len);
+                    k += 1;
+                    fast += 1;
+                }
+                pos = np as usize - base as usize;
+                nb = n2;
+                if k < starts.len() {
+                    assert_eq!(pos, starts[k], "next line");
+                } else {
+                    assert_eq!(pos, len);
+                }
+                if code == 2 {
+                    assert_eq!(nb, NB);
+                    nb = 0;
+                } else if code == 1 {
+                    assert!(pos + LK_REACH <= len);
+                    let i = buf[pos..].iter().position(|&b| b == b'\n').unwrap();
+                    pos += i + 1;
+                    k += 1;
+                } else {
+                    assert!(pos + LK_REACH > len);
+                    break;
+                }
+            }
+            total += starts.len();
+        }
+        assert!(fast * 2 > total, "{fast} of {total}");
     }
 
     #[test]
@@ -1805,8 +2036,13 @@ pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 6);
     let t = g.t(tid);
-    t.ev = Part::new(&g.ev_arena, g.nb);
-    t.us = Part::new(&g.us_arena, g.nub);
+    if PARTS_READY.load(Ordering::Relaxed) {
+        t.ev.set_arena(&g.ev_arena);
+        t.us.set_arena(&g.us_arena);
+    } else {
+        t.ev = Part::new(&g.ev_arena, g.nb);
+        t.us = Part::new(&g.us_arena, g.nub);
+    }
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 7);
     if !CORE_READY.load(Ordering::Relaxed) {

@@ -711,7 +711,10 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     crate::sys::WORKERS.store(true, Ordering::SeqCst);
     let nd = ((we - ws + ws.rem_euclid(DAY_MS) + DAY_MS - 1) / DAY_MS) as usize;
     let (ws_mod, day0) = (ws.rem_euclid(DAY_MS) as u64, ws.div_euclid(DAY_MS) as i32);
-    let kp = nt.clamp(2, 8);
+    let kp = match crate::sys::SETUP_KP.load(Ordering::Relaxed) {
+        0 => (2 * nt).clamp(2, 16),
+        k => k.clamp(1, 64),
+    };
     let ks = nt.clamp(2, 8);
     let camps: Slot<(Vec<u8>, Vec<Vec<u8>>, usize)> = Slot::new();
     let ptxt: Slot<(usize, usize)> = Slot::new();
@@ -747,8 +750,13 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             crate::sys::tl::TASK[48 + j.min(15)] = (t0, crate::sys::tl::now(), 0);
         }
     };
-    let (q_p, q_ord, q_core, q_merge) = (2, 2 + kp, 3 + kp, 3 + kp + nt);
-    let nq = q_merge + 1;
+    let upart = crate::sys::SETUP_PARTS.load(Ordering::Relaxed);
+    let npt = if upart { 1 } else { 0 };
+    let (q_p, q_ord, q_merge, q_part) = (2, 2 + kp, 3 + kp, 4 + kp);
+    let q_core = q_part + npt;
+    let nq = q_core + nt;
+    let nbs: Slot<(usize, usize)> = Slot::new();
+    let parts: Vec<Slot<(crate::parse::Part, crate::parse::Part)>> = (0..if upart { nt } else { 0 }).map(|_| Slot::new()).collect();
     let qnext = AtomicUsize::new(0);
     let task_inner = |i: usize| {
         if i == 1 {
@@ -768,9 +776,14 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             if crate::parse::pin_mode() != 0 {
                 crate::parse::cpu_order();
             }
-        } else if i < q_merge {
+        } else if i >= q_core {
             let nc = camps.get().2;
             cores[i - q_core].set(core::Core::new(nc, nd, *rowcap.get(), ws_mod, day0));
+        } else if i == q_part {
+            let &(nb, nub) = nbs.get();
+            for p in &parts {
+                p.set((crate::parse::Part::new_unbound(nb), crate::parse::Part::new_unbound(nub)));
+            }
         } else if i == q_merge {
             let parts: Vec<_> = pparts.iter().map(|p| p.take()).collect();
             let (prod, cats) = products_merge(&parts);
@@ -785,6 +798,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         #[cfg(feature = "tl")]
         unsafe {
             crate::sys::tl::TASK[i.min(47)] = (t0, crate::sys::tl::now(), 0);
+            crate::sys::tl::STASK[i.min(63)] = (t0, crate::sys::tl::now());
         }
     };
     let help = || {
@@ -828,6 +842,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         all.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
         let ev_bytes: usize = all.iter().filter(|f| f.0 == Kind::Ev).map(|f| f.2).sum();
         rowcap.set(ev_bytes / 40 / nt * 2 + 65536);
+        nbs.set(part_counts(ev_bytes));
         lap("s.list");
         let pg = 4096usize;
         let hpg = 2usize << 20;
@@ -925,6 +940,10 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             }
         }
         chain.set((std::ptr::NonNull::new(region).unwrap(), files, queue, bytes, 0, 0));
+        #[cfg(feature = "tl")]
+        unsafe {
+            crate::sys::tl::CHAIN_END = crate::sys::tl::now();
+        }
         while help() {}
     });
     lap("lookups");
@@ -951,6 +970,15 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         t.push(UnsafeCell::new(tstate(c.take())));
     }
     crate::parse::CORE_READY.store(true, Ordering::Relaxed);
+    if upart && *nbs.get() == (nb, nub) {
+        for (tid, p) in parts.iter().enumerate() {
+            let (ev, us) = p.take();
+            let ts = t[tid].get_mut();
+            ts.ev = ev;
+            ts.us = us;
+        }
+        crate::parse::PARTS_READY.store(true, Ordering::Relaxed);
+    }
     G {
         nt,
         check,
@@ -1001,6 +1029,12 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
         next: AtomicUsize::new(0),
         st2b_done: std::sync::atomic::AtomicBool::new(false),
     }
+}
+
+fn part_counts(ev_bytes: usize) -> (usize, usize) {
+    let ecap = (ev_bytes / 64 + 4096 + BSIZE - 1) & !(BSIZE - 1);
+    let ucap = ((ecap / 16 + 4096 + UBSIZE - 1) & !(UBSIZE - 1)).min(1 << 26);
+    (ecap >> BB, ucap >> UB)
 }
 
 fn tstate(core: core::Core) -> TState {
