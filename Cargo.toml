@@ -2,16 +2,14 @@
 name = "pipeline"
 version = "0.1.0"
 edition = "2024"
+publish = false
+
+[features]
+default = ["nok"]
+stats = []
+nok = []
 
 [dependencies]
-bytes = "1.12.2"
-foldhash = "0.2.0"
-hashbrown = "0.17.1"
-memchr = "2.8.3"
-memmap2 = "0.9.12"
-mimalloc = { version = "0.1.52", default-features = false }
-parquet = { version = "60.1.0", default-features = false }
-rayon = "1.12.0"
 
 [profile.release]
 opt-level = 3
@@ -19,3 +17,4 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+strip = true
