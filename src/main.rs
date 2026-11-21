@@ -84,6 +84,11 @@ trait EvT: Copy + Default + Ord + Send + Sync + 'static {
     fn rel(self) -> u64;
     fn cat(self) -> u32;
     fn price(self) -> u32;
+    /// Two values in one integer, ordered by `hi` first: each must be under
+    /// 2^32 for `u64` (2^64 for `u128`).
+    fn pair(hi: u64, lo: u64) -> Self;
+    fn hi(self) -> u64;
+    fn lo(self) -> u64;
 }
 
 /// `rel << 32 | price << 8 | cat`: needs `rel < 2^32` (a window under ~49
@@ -105,6 +110,18 @@ impl EvT for u64 {
     fn price(self) -> u32 {
         (self as u32) >> 8
     }
+    #[inline(always)]
+    fn pair(hi: u64, lo: u64) -> Self {
+        (hi << 32) | lo
+    }
+    #[inline(always)]
+    fn hi(self) -> u64 {
+        self >> 32
+    }
+    #[inline(always)]
+    fn lo(self) -> u64 {
+        self & 0xffff_ffff
+    }
 }
 
 /// `rel << 64 | price << 32 | cat`: the general fallback.
@@ -125,18 +142,32 @@ impl EvT for u128 {
     fn price(self) -> u32 {
         (self >> 32) as u32
     }
+    #[inline(always)]
+    fn pair(hi: u64, lo: u64) -> Self {
+        ((hi as u128) << 64) | lo as u128
+    }
+    #[inline(always)]
+    fn hi(self) -> u64 {
+        (self >> 64) as u64
+    }
+    #[inline(always)]
+    fn lo(self) -> u64 {
+        self as u64
+    }
 }
 
-/// Whether every surviving event fits the `u64` packing.
+/// Whether every surviving event and click fits the `u64` packing (a click's
+/// `ts - (window_start - 7 days)` is the larger offset).
 fn packed_fits(ctx: &Ctx) -> bool {
-    ctx.cat_names.len() <= 256 && ctx.we - ctx.ws <= u32::MAX as i64
+    ctx.cat_names.len() <= 256 && ctx.we - ctx.cws <= u32::MAX as i64
 }
 
-#[derive(Clone, Copy, Default)]
-struct Ck {
-    ts: i64,
-    cid: Key,
-    camp: u32,
+/// A person bucket's valid clicks: `keys` hold `pair(ts - cws, pos)` (sorted
+/// per person), `cid[pos]` and `camp[pos]` the rest of the click.
+struct Cks<'a, E> {
+    keys: &'a mut [E],
+    cid: &'a [Key],
+    camp: &'a [u32],
 }
 
 struct UdRow {
@@ -420,12 +451,12 @@ struct Sess {
     hi: u32,
 }
 
-struct Scratch {
+struct Scratch<E> {
     sess: Vec<Sess>,
     cats: Vec<(u32, u32)>,
     starts: Vec<i64>,
     run_end: Vec<u32>,
-    cp: Vec<(u32, i64)>,
+    cp: Vec<E>,
 }
 
 #[inline]
@@ -433,8 +464,8 @@ fn process_person<E: EvT>(
     ctx: &Ctx,
     name: Key,
     evs: &mut [E],
-    cks: &mut [Ck],
-    sc: &mut Scratch,
+    cks: Cks<E>,
+    sc: &mut Scratch<E>,
     ud: &mut Vec<UdRow>,
     cd: &mut CampAcc,
 ) {
@@ -507,6 +538,7 @@ fn process_person<E: EvT>(
         ud.push(UdRow { name, day: (ctx.day0 + day as i64) as i32, sessions, events, revenue: rev, top });
     }
     // credit
+    let Cks { keys: cks, cid, camp: ck_camp } = cks;
     if cks.is_empty() {
         for s in &sc.sess {
             let c = cd.cell(organic, s.day);
@@ -517,18 +549,36 @@ fn process_person<E: EvT>(
         return;
     }
     if cks.len() > 1 {
-        cks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(a.cid, b.cid)));
+        cks.sort_unstable();
     }
+    let cws = ctx.cws;
     let mut j = 0usize;
     let mut grp = 0usize; // first index of the run of equal ts ending at j-1
+    let mut chosen = (usize::MAX, 0u32); // (grp, its smallest click_id's campaign)
     for s in &sc.sess {
-        while j < cks.len() && cks[j].ts <= s.start {
-            if j == 0 || cks[j].ts != cks[j - 1].ts {
+        let srel = (s.start - cws) as u64; // >= 7 days: sessions start in the window
+        while j < cks.len() && cks[j].hi() <= srel {
+            if j == 0 || cks[j].hi() != cks[j - 1].hi() {
                 grp = j;
             }
             j += 1;
         }
-        let camp = if j > 0 && s.start - cks[j - 1].ts <= LOOKBACK { cks[grp].camp } else { organic };
+        let camp = if j > 0 && srel - cks[j - 1].hi() <= LOOKBACK as u64 {
+            if chosen.0 != grp {
+                // the latest clicks: on a tie in ts, the smallest click_id
+                let mut best = cks[grp].lo() as usize;
+                for c in &cks[grp + 1..j] {
+                    let q = c.lo() as usize;
+                    if key_cmp(cid[q], cid[best]).is_lt() {
+                        best = q;
+                    }
+                }
+                chosen = (grp, ck_camp[best]);
+            }
+            chosen.1
+        } else {
+            organic
+        };
         let c = cd.cell(camp, s.day);
         c[0] += 1;
         c[1] += (s.rev > 0) as u64;
@@ -548,18 +598,19 @@ fn process_person<E: EvT>(
         sc.run_end[q] = e as u32;
     }
     sc.cp.clear();
-    sc.cp.extend(cks.iter().map(|c| (c.camp, c.ts)));
+    sc.cp.extend(cks.iter().map(|c| E::pair(ck_camp[c.lo() as usize] as u64, c.hi())));
     sc.cp.sort_unstable();
+    let cp = &sc.cp;
     let mut q = 0usize;
-    while q < sc.cp.len() {
-        let camp = sc.cp[q].0;
-        let mut a = sc.cp[q].1;
+    while q < cp.len() {
+        let camp = cp[q].hi() as u32;
+        let mut a = cws + cp[q].lo() as i64;
         let mut b = a + LOOKBACK;
         q += 1;
         loop {
-            let more = q < sc.cp.len() && sc.cp[q].0 == camp;
-            if more && sc.cp[q].1 <= b.saturating_add(1) {
-                b = sc.cp[q].1 + LOOKBACK;
+            let more = q < cp.len() && cp[q].hi() as u32 == camp;
+            if more && cws + cp[q].lo() as i64 <= b.saturating_add(1) {
+                b = cws + cp[q].lo() as i64 + LOOKBACK;
                 q += 1;
                 continue;
             }
@@ -575,7 +626,7 @@ fn process_person<E: EvT>(
             if !more {
                 break;
             }
-            a = sc.cp[q].1;
+            a = cws + cp[q].lo() as i64;
             b = a + LOOKBACK;
             q += 1;
         }
@@ -997,8 +1048,10 @@ fn dedup_sessions<E: EvT>(
         evs: Vec<E>,
         ck_lids: Vec<u32>,
         ck_cnt: Vec<u32>,
-        cks: Vec<Ck>,
-        sc: Scratch,
+        cks: Vec<E>,
+        ck_cid: Vec<Key>,
+        ck_camp: Vec<u32>,
+        sc: Scratch<E>,
     }
     let dd_ref = &dd;
     let ncamp = ctx.camp_names.len();
@@ -1023,6 +1076,8 @@ fn dedup_sessions<E: EvT>(
             ck_lids: Vec::new(),
             ck_cnt: Vec::new(),
             cks: Vec::new(),
+            ck_cid: Vec::new(),
+            ck_camp: Vec::new(),
             sc: Scratch { sess: Vec::new(), cats: Vec::new(), starts: Vec::new(), run_end: Vec::new(), cp: Vec::new() },
         },
         |st: &mut AggOut<E>, task| {
@@ -1087,7 +1142,11 @@ fn dedup_sessions<E: EvT>(
                 coff[i + 1] = coff[i] + st.ck_cnt[i];
             }
             st.cks.clear();
-            st.cks.resize(nck, Ck::default());
+            st.cks.resize(nck, E::default());
+            st.ck_cid.clear();
+            st.ck_cid.resize(nck, 0);
+            st.ck_camp.clear();
+            st.ck_camp.resize(nck, 0);
             let mut cpos: Vec<u32> = coff[..np_].to_vec();
             let mut k = 0;
             for d in dd_ref {
@@ -1096,14 +1155,21 @@ fn dedup_sessions<E: EvT>(
                     k += 1;
                     if lid != u32::MAX {
                         let l = lid as usize;
-                        st.cks[cpos[l] as usize] = Ck { ts: c.ts, cid: c.cid, camp: c.camp };
+                        let q = cpos[l] as usize;
+                        st.cks[q] = E::pair((c.ts - ctx.cws) as u64, q as u64);
+                        st.ck_cid[q] = c.cid;
+                        st.ck_camp[q] = c.camp;
                         cpos[l] += 1;
                     }
                 }
             }
             for l in 0..np_ {
                 let evs = &mut st.evs[off[l] as usize..off[l + 1] as usize];
-                let cks = &mut st.cks[coff[l] as usize..coff[l + 1] as usize];
+                let cks = Cks {
+                    keys: &mut st.cks[coff[l] as usize..coff[l + 1] as usize],
+                    cid: &st.ck_cid,
+                    camp: &st.ck_camp,
+                };
                 process_person(ctx, st.names[l], evs, cks, &mut st.sc, &mut st.ud, &mut st.cd);
             }
         },
