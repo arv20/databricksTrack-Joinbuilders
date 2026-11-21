@@ -1,13 +1,15 @@
 [package]
 name = "pipeline"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 publish = false
 
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
 [features]
-default = ["nok"]
 stats = []
-nok = []
 
 [dependencies]
 
@@ -17,4 +19,3 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
-strip = true
