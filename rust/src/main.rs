@@ -1374,6 +1374,35 @@ struct LinkEnd {
     endpoint: u32,
 }
 
+#[derive(Default)]
+struct LinkName {
+    reference: std::sync::atomic::AtomicU64,
+    prefix: std::sync::atomic::AtomicU64,
+}
+
+impl LinkName {
+    #[inline]
+    fn set(&self, reference: u64) {
+        let bytes = unpack_ref(reference);
+        let mut prefix = [0; 8];
+        let len = bytes.len().min(prefix.len());
+        prefix[..len].copy_from_slice(&bytes[..len]);
+        self.reference.store(reference, Relaxed);
+        self.prefix.store(u64::from_be_bytes(prefix), Relaxed);
+    }
+
+    #[inline]
+    fn bytes(&self) -> &'static [u8] {
+        unpack_ref(self.reference.load(Relaxed))
+    }
+}
+
+enum LinkSlot {
+    Inserted(usize),
+    Duplicate,
+    Spill,
+}
+
 #[inline]
 fn link_slot(
     slots: &mut [(u64, u64)],
@@ -1381,31 +1410,31 @@ fn link_slot(
     mask: usize,
     e: LinkEnd,
     node: u32,
-    names: &[std::sync::atomic::AtomicU64],
+    names: &[LinkName],
     endpoints: &[AtomicU32],
     collision: &AtomicBool,
-) -> Option<(usize, u32)> {
+) -> LinkSlot {
     while let Some(slot) = slots.get_mut(i) {
         if slot.0 == 0 {
-            names[node as usize].store(e.name, Relaxed);
+            names[node as usize].set(e.name);
             *slot = (e.key, (u64::from(e.check) << 32) | u64::from(node));
             endpoints[node as usize].store(node, Relaxed);
-            return Some((i, node));
+            return LinkSlot::Inserted(i);
         }
         if slot.0 == e.key {
             let other = slot.1 as u32;
-            let other_name = names[other as usize].load(Relaxed);
+            let other_name = names[other as usize].reference.load(Relaxed);
             if (slot.1 >> 32) as u32 != e.check
                 || (other_name != e.name && unpack_ref(other_name) != unpack_ref(e.name))
             {
                 collision.store(true, Relaxed);
             }
             endpoints[node as usize].store(other, Relaxed);
-            return None;
+            return LinkSlot::Duplicate;
         }
         i = (i + 1) & mask;
     }
-    None
+    LinkSlot::Spill
 }
 
 #[inline]
@@ -1430,8 +1459,7 @@ fn build_links(
     estimated_users: usize,
     seed: u64,
 ) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
-    use std::sync::atomic::AtomicU64;
-    let chunks = chunks(input, 1 << 17);
+    let chunks = chunks(input, 1 << 18);
     // Physical rows give an upper bound on valid links, including a final
     // unterminated line. Size the table before hashing and bucketing.
     let rows: usize = chunks.par_iter().map(|chunk| {
@@ -1451,7 +1479,9 @@ fn build_links(
     let collision = AtomicBool::new(false);
 
     let batches: Vec<_> = chunks.par_iter().map(|chunk| {
-        let mut ends: [Vec<LinkEnd>; LINK_SHARDS] = std::array::from_fn(|_| Vec::new());
+        let estimate = (chunk.len() / (12 * LINK_SHARDS)).min(1024);
+        let mut ends: [Vec<LinkEnd>; LINK_SHARDS] =
+            std::array::from_fn(|_| Vec::with_capacity(estimate));
         let mut count = 0;
         csv_rows(chunk, |_, [a, b]| {
             if a.is_empty() || b.is_empty() {
@@ -1482,7 +1512,7 @@ fn build_links(
         nend += count;
         start
     }).collect();
-    let names: Vec<_> = (0..nend).map(|_| AtomicU64::new(0)).collect();
+    let names: Vec<_> = (0..nend).map(|_| LinkName::default()).collect();
     let endpoints: Vec<_> = (0..nend).map(|_| AtomicU32::new(u32::MAX)).collect();
     let range_mask = range_len - 1;
     let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).enumerate().map(|(shard, slots)| {
@@ -1492,20 +1522,22 @@ fn build_links(
             for &e in &ends[shard] {
                 let node = start + e.endpoint;
                 let i = e.key as usize & range_mask;
-                if let Some((local, node)) = link_slot(slots, i, usize::MAX, e, node, &names, &endpoints, &collision) {
-                    nodes.push(((shard * range_len + local) as u32, node));
-                } else if endpoints[node as usize].load(Relaxed) == u32::MAX {
-                    spill.push((e, node));
+                match link_slot(slots, i, usize::MAX, e, node, &names, &endpoints, &collision) {
+                    LinkSlot::Inserted(local) => nodes.push(((shard * range_len + local) as u32, node)),
+                    LinkSlot::Duplicate => {}
+                    LinkSlot::Spill => spill.push((e, node)),
                 }
             }
         }
         (nodes, spill)
     }).collect();
-    for (nodes, spill) in &mut ranges {
-        for (e, node) in spill.drain(..) {
+    for shard in 0..ranges.len() {
+        for (e, node) in std::mem::take(&mut ranges[shard].1) {
             let i = e.key as usize & table.mask;
-            if let Some((slot, node)) = link_slot(&mut table.slots, i, table.mask, e, node, &names, &endpoints, &collision) {
-                nodes.push((slot as u32, node));
+            if let LinkSlot::Inserted(slot) =
+                link_slot(&mut table.slots, i, table.mask, e, node, &names, &endpoints, &collision)
+            {
+                ranges[slot >> shift].0.push((slot as u32, node));
             }
         }
     }
@@ -1520,7 +1552,17 @@ fn build_links(
             let mut a = link_root(&parent, edge[0].load(Relaxed));
             let mut b = link_root(&parent, edge[1].load(Relaxed));
             while a != b {
-                let (lo, hi) = (a.min(b), a.max(b));
+                // Root order is immutable, so concurrent unions cannot form a
+                // cycle. The root itself is also the smallest ID in its component.
+                let an = &names[a as usize];
+                let bn = &names[b as usize];
+                let ap = an.prefix.load(Relaxed);
+                let bp = bn.prefix.load(Relaxed);
+                let (lo, hi) = if ap < bp || (ap == bp && an.bytes() < bn.bytes()) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
                 if parent[hi as usize].compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
                     break;
                 }
@@ -1531,8 +1573,6 @@ fn build_links(
     });
     lap("  links union-find");
 
-    let smallest: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
-    let name = |node: u32| unpack_ref(names[node as usize].load(Relaxed));
     let roots: Vec<Vec<u32>> = ranges.par_iter().map(|(nodes, _)| {
         let mut roots = Vec::new();
         for &(_, node) in nodes {
@@ -1541,15 +1581,6 @@ fn build_links(
                 roots.push(r);
             } else {
                 parent[node as usize].store(r + 1, Relaxed);
-            }
-            let best = &smallest[r as usize];
-            let me = name(node);
-            let mut other = best.load(Relaxed);
-            while other == 0 || me < name(other - 1) {
-                match best.compare_exchange_weak(other, node + 1, Relaxed, Relaxed) {
-                    Ok(_) => break,
-                    Err(actual) => other = actual,
-                }
             }
         }
         roots
@@ -1566,28 +1597,13 @@ fn build_links(
     let name_groups: Vec<Vec<_>> = roots.par_iter().zip(offsets).map(|(roots, start)| {
         roots.iter().enumerate().map(|(i, &r)| {
             person[r as usize].store(start + i as u32, Relaxed);
-            name(smallest[r as usize].load(Relaxed) - 1)
+            names[r as usize].bytes()
         }).collect()
     }).collect();
     let pname = name_groups.into_iter().flatten().collect();
     lap("  links numbered");
 
     let nids = ranges.iter().map(|(nodes, _)| nodes.len()).sum();
-    // Spilled nodes belong to the shard containing the final slot. Group the
-    // few such entries before each worker updates only its own slot range.
-    let mut misplaced = Vec::new();
-    for (shard, (nodes, _)) in ranges.iter_mut().enumerate() {
-        nodes.retain(|&(slot, node)| {
-            let owner = slot as usize >> shift;
-            if owner != shard {
-                misplaced.push((owner, slot, node));
-            }
-            owner == shard
-        });
-    }
-    for (shard, slot, node) in misplaced {
-        ranges[shard].0.push((slot, node));
-    }
     table.slots.par_chunks_mut(range_len).zip(&ranges).for_each(|(slots, (nodes, _))| {
         for &(slot, node) in nodes {
             let r = match parent[node as usize].load(Relaxed) {
