@@ -824,6 +824,10 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     };
 
     // ---- write outputs
+    // every scatter buffer is dead now: the write's buffers reuse that
+    // (already faulted) memory instead of fresh pages
+    let (s, e) = arena::used();
+    unsafe { alloc::donate(s, e) };
     let ud_dir = out_dir.join("user_daily");
     let cd_dir = out_dir.join("campaign_daily");
     std::fs::create_dir_all(&ud_dir).expect("create user_daily");
@@ -1094,6 +1098,15 @@ fn dedup_sessions<E: EvT>(
         "  events parsed {total_ev}, kept {kept}; clicks valid {total_ck}; eid buckets {ne}, person buckets {np}"
     ));
     tm.lap("dedup");
+    // the parsed clicks are dead (the caller leaks `parse_out`): their big
+    // buffers give the sessions' buffers already-faulted memory
+    for p in parse_out {
+        let bytes = p.ck.capacity() * std::mem::size_of::<CkRec>();
+        if bytes >= 1 << 20 {
+            let s = p.ck.as_ptr() as usize;
+            unsafe { alloc::donate(s, s + p.ck.len() * std::mem::size_of::<CkRec>()) };
+        }
+    }
 
     // ---- per person: sessions, credit, assists, aggregates
     struct AggOut<E> {
@@ -1124,7 +1137,9 @@ fn dedup_sessions<E: EvT>(
         nthreads,
         np,
         |_| AggOut {
-            ud: Vec::new(),
+            // sized up front (from the donated memory) for ~1 row per 6 kept
+            // events, so it rarely grows into fresh pages
+            ud: Vec::with_capacity(kept / 6 / nthreads + 1),
             cd: CampAcc::new(ncamp, ndays),
             local: KeyMap::with_capacity(1024),
             names: Vec::new(),

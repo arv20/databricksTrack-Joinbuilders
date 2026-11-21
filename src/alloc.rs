@@ -3,9 +3,77 @@
 //! mremap (no copying). Small blocks use the system allocator. Linux only;
 //! elsewhere the system allocator is used as is.
 
+/// Hands the allocator memory that is no longer read (already faulted in):
+/// later big non-zeroed allocations are carved from it before any fresh
+/// mapping, so they need no new pages faulted and zeroed by the kernel.
+/// SAFETY: nothing may access `[start, end)` afterwards.
+pub unsafe fn donate(start: usize, end: usize) {
+    #[cfg(target_os = "linux")]
+    imp::donate(start, end);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (start, end);
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// donated ranges (2 MB aligned), guarded by a spin lock: big
+    /// allocations are rare (hundreds per run)
+    const NDON: usize = 64;
+    static DON_LOCK: AtomicBool = AtomicBool::new(false);
+    static DON_S: [AtomicUsize; NDON] = [const { AtomicUsize::new(0) }; NDON];
+    static DON_E: [AtomicUsize; NDON] = [const { AtomicUsize::new(0) }; NDON];
+
+    fn lock() {
+        while DON_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+    }
+    fn unlock() {
+        DON_LOCK.store(false, Ordering::Release);
+    }
+
+    pub fn donate(start: usize, end: usize) {
+        let (s, e) = ((start + HUGE - 1) & !(HUGE - 1), end & !(HUGE - 1));
+        if e <= s {
+            return;
+        }
+        lock();
+        for i in 0..NDON {
+            if DON_S[i].load(Ordering::Relaxed) == DON_E[i].load(Ordering::Relaxed) {
+                DON_S[i].store(s, Ordering::Relaxed);
+                DON_E[i].store(e, Ordering::Relaxed);
+                break;
+            }
+        }
+        unlock();
+    }
+
+    /// `len` bytes (a multiple of 2 MB) from the donated memory, if any.
+    fn take(len: usize) -> Option<usize> {
+        lock();
+        let mut r = None;
+        for i in 0..NDON {
+            let s = DON_S[i].load(Ordering::Relaxed);
+            if DON_E[i].load(Ordering::Relaxed) - s >= len {
+                DON_S[i].store(s + len, Ordering::Relaxed);
+                r = Some(s);
+                break;
+            }
+        }
+        unlock();
+        r
+    }
+
+    /// A big block for `alloc`: donated memory first, else a fresh mapping.
+    unsafe fn get_big(size: usize) -> *mut u8 {
+        match take(round(size)) {
+            Some(p) => p as *mut u8,
+            None => unsafe { map_big(size) },
+        }
+    }
 
     const BIG: usize = 1 << 20;
     const HUGE: usize = 1 << 21;
@@ -49,7 +117,7 @@ mod imp {
     unsafe impl GlobalAlloc for Alloc {
         #[inline]
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            unsafe { if l.size() >= BIG && l.align() <= 4096 { map_big(l.size()) } else { System.alloc(l) } }
+            unsafe { if l.size() >= BIG && l.align() <= 4096 { get_big(l.size()) } else { System.alloc(l) } }
         }
         #[inline]
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {

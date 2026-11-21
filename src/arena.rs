@@ -53,6 +53,12 @@ pub fn reserve(bytes: usize) {
     RES_END.store(p + bytes, Ordering::Relaxed);
 }
 
+/// The part of the reservation handed out so far, `(start, end)`.
+pub fn used() -> (usize, usize) {
+    let base = RES_BASE.load(Ordering::Relaxed);
+    (base, RES_NEXT.load(Ordering::Relaxed).min(RES_END.load(Ordering::Relaxed)).max(base))
+}
+
 fn slab(bytes: usize) -> (usize, usize) {
     let size = bytes.div_ceil(SLAB) * SLAB;
     if RES_BASE.load(Ordering::Relaxed) != 0 {
