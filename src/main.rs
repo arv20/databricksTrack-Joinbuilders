@@ -855,6 +855,13 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     }
     let dd_ref = &dd;
     let ncamp = ctx.camp_names.len();
+    // biggest buckets first, so a whale person's bucket never runs alone at the end
+    let mut order: Vec<(usize, u32)> = (0..np)
+        .map(|p| (dd_ref.iter().map(|d| d.ev.len(p) + d.ck.len(p)).sum::<usize>(), p as u32))
+        .collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let order: Vec<usize> = order.into_iter().map(|(_, p)| p as usize).collect();
+    let order = &order;
     let agg: Vec<AggOut> = parallel(
         nthreads,
         np,
@@ -871,7 +878,8 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             cks: Vec::new(),
             sc: Scratch { sess: Vec::new(), cats: Vec::new(), starts: Vec::new(), run_end: Vec::new(), cp: Vec::new() },
         },
-        |st: &mut AggOut, p| {
+        |st: &mut AggOut, task| {
+            let p = order[task];
             let n: usize = dd_ref.iter().map(|d| d.ev.len(p)).sum();
             if n == 0 {
                 return;
