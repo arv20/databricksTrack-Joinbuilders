@@ -115,6 +115,47 @@ const fn id_shapes_raw(prefix: u8, dig: usize, chk: usize, allow_empty: bool) ->
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
+struct JidRow {
+    ctrl: [u8; 32],
+    subv: [u8; 32],
+    lz: [u8; 32],
+    orv: [u64; 4],
+}
+const JID_ROWS: usize = 64 * 64;
+
+const fn jid_rows() -> [JidRow; JID_ROWS] {
+    let e = id_shapes_raw(b'e', 0, 8, false);
+    let u = id_shapes_raw(b'u', 0, 8, true);
+    let mut bad_u = u[0];
+    bad_u.subv[8] = 1;
+    bad_u.orv = [0; 2];
+    let mut t = [JidRow { ctrl: [0; 32], subv: [0; 32], lz: [0; 32], orv: [0; 4] }; JID_ROWS];
+    let mut c0 = 0;
+    while c0 < 64 {
+        let mut d = 0;
+        while d < 64 {
+            let (a, b) = (&e[c0], if d == 0 { &bad_u } else { &u[d - 1] });
+            let r = &mut t[c0 * 64 + d];
+            let mut i = 0;
+            while i < 16 {
+                r.ctrl[i] = a.ctrl[i];
+                r.ctrl[16 + i] = b.ctrl[i];
+                r.subv[i] = a.subv[i];
+                r.subv[16 + i] = b.subv[i];
+                r.lz[i] = a.lz[i];
+                r.lz[16 + i] = b.lz[i];
+                i += 1;
+            }
+            r.orv = [a.orv[1], 0, b.orv[1], 0];
+            d += 1;
+        }
+        c0 += 1;
+    }
+    t
+}
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
 struct DecShape {
     ctrl: [u8; 16],
     subv: [u8; 16],
@@ -572,6 +613,7 @@ struct Tables {
     kid: [IdShape; 128],
     uid: [IdShape; 128],
     eid1: [IdShape; 64],
+    jid: [JidRow; JID_ROWS],
     kid1: [IdShape; 64],
     uid1: [IdShape; 64],
     prod: [DecShape; 128],
@@ -591,6 +633,7 @@ static T: Tables = Tables {
     kid: id_shapes(b'k', 0, 8, false),
     uid: id_shapes(b'u', 8, 0, true),
     eid1: id_shapes_raw(b'e', 0, 8, false),
+    jid: jid_rows(),
     kid1: id_shapes_raw(b'k', 0, 8, false),
     uid1: id_shapes_raw(b'u', 8, 0, true),
     prod: dec_shapes(b"p"),
@@ -676,6 +719,12 @@ fn tz(mut x: u64) -> u64 {
     x
 }
 #[inline(always)]
+fn tz2(x: u64) -> u64 {
+    let o: u64;
+    unsafe { core::arch::asm!("tzcnt {o}, {x}", o = lateout(reg) o, x = in(reg) x, options(pure, nomem, nostack)) };
+    o
+}
+#[inline(always)]
 fn blsr(mut x: u64) -> u64 {
     unsafe { core::arch::asm!("blsr {x}, {x}", x = inout(reg) x, options(pure, nomem, nostack)) };
     x
@@ -692,6 +741,30 @@ fn bzhi(a: u64, i: u64) -> u64 {
 fn lea3<const D: i32>(a: u64, b: u64) -> u64 {
     let o: u64;
     unsafe { core::arch::asm!("lea {o}, [{a} + {b} + {d}]", o = lateout(reg) o, a = in(reg) a, b = in(reg) b, d = const D, options(pure, nomem, nostack, preserves_flags)) };
+    o
+}
+#[inline(always)]
+unsafe fn ld_xor(a: *const u8, m: *const u8) -> __m128i {
+    let o: __m128i;
+    unsafe { core::arch::asm!("vmovdqu {o}, xmmword ptr [{a}]", "vpxor {o}, {o}, xmmword ptr [{m}]", o = out(xmm_reg) o, a = in(reg) a, m = in(reg) m, options(pure, readonly, nostack, preserves_flags)) };
+    o
+}
+#[inline(always)]
+unsafe fn and_m(v: __m128i, m: *const u8) -> __m128i {
+    let o: __m128i;
+    unsafe { core::arch::asm!("vpand {o}, {v}, xmmword ptr [{m}]", o = lateout(xmm_reg) o, v = in(xmm_reg) v, m = in(reg) m, options(pure, readonly, nostack, preserves_flags)) };
+    o
+}
+#[inline(always)]
+fn jid_off(c0: u64, c1: u64) -> u64 {
+    let o: u64;
+    unsafe { core::arch::asm!("imul {o}, {a}, 63", "add {o}, {b}", "shl {o}, 7", o = lateout(reg) o, a = in(reg) c0, b = in(reg) c1, options(pure, nomem, nostack)) };
+    o
+}
+#[inline(always)]
+fn add_sub<const D: i32>(a: u64, b: u64) -> u64 {
+    let o: u64;
+    unsafe { core::arch::asm!("lea {o}, [{a} + {d}]", "sub {o}, {b}", o = lateout(reg) o, a = in(reg) a, b = in(reg) b, d = const D, options(pure, nomem, nostack)) };
     o
 }
 #[inline(always)]
@@ -714,14 +787,27 @@ struct Masks {
 
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> Masks {
+    unsafe { Masks { c: eq64(p, b','), q: eq64(p, b'"'), n: eq64(p, b'\n') } }
+}
+
+#[inline(always)]
+unsafe fn eq64(p: *const u8, c: u8) -> u64 {
+    let m: u64;
     unsafe {
-        let v = _mm512_loadu_si512(p as *const __m512i);
-        Masks {
-            c: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
-            q: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
-            n: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
-        }
-    }
+        core::arch::asm!(
+            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
+            "vpcmpeqb {b}, {c}, ymmword ptr [{p} + 32]",
+            "kunpckdq {a}, {b}, {a}",
+            a = out(kreg) m, b = out(kreg) _, c = in(ymm_reg) _mm256_set1_epi8(c as i8), p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        )
+    };
+    m
+}
+
+#[inline(always)]
+fn hi32(v: __m256i, c: u8) -> u64 {
+    unsafe { (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64) << 32 }
 }
 
 #[inline(always)]
@@ -782,6 +868,27 @@ unsafe fn ids2v(xa: __m128i, sa: &IdShape, xb: __m128i, sb: &IdShape) -> (__m128
         let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_0510));
         let ids = _mm_add_epi64(_mm_mul_epu32(m2, _mm_set1_epi64x(1_679_616)), _mm_srli_epi64::<32>(m2));
         (_mm_or_si128(ids, ld(sb.orv.as_ptr() as *const u8)), bad)
+    }
+}
+
+#[inline(always)]
+unsafe fn ids2j(xa: __m128i, xb: __m128i, r: &JidRow) -> (__m256i, __m256i) {
+    unsafe {
+        let ld2 = |q: *const u8| _mm256_load_si256(q as *const __m256i);
+        let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(xa), xb);
+        let v = _mm256_sub_epi8(_mm256_shuffle_epi8(x, ld2(r.ctrl.as_ptr())), ld2(r.subv.as_ptr()));
+        let e = _mm256_sub_epi8(v, _mm256_set1_epi8(49));
+        let notdig = _mm256_subs_epu8(v, _mm256_set1_epi8(9));
+        let notlet = _mm256_subs_epu8(e, _mm256_set1_epi8(25));
+        let val = _mm256_min_epu8(v, _mm256_sub_epi8(v, _mm256_set1_epi8(39)));
+        let lz = _mm256_subs_epu8(ld2(r.lz.as_ptr()), val);
+        let cls = _mm256_ternarylogic_epi64::<0xF8>(_mm256_min_epu8(notdig, notlet), v, _mm256_set_epi64x(-1, 0, -1, 0));
+        let m1 = _mm256_maddubs_epi16(val, _mm256_set1_epi16(0x0124));
+        let m2 = _mm256_madd_epi16(m1, _mm256_set1_epi32(0x0001_0510));
+        let hi: __m256i;
+        core::arch::asm!("vpmuludq {o:y}, {a:y}, {b:y}", o = lateout(zmm_reg) hi, a = in(zmm_reg) m2, b = in(zmm_reg) _mm256_set1_epi64x(1_679_616), options(pure, nomem, nostack, preserves_flags));
+        let ids = _mm256_add_epi64(hi, _mm256_srli_epi64::<32>(m2));
+        (_mm256_or_si256(ids, ld2(r.orv.as_ptr() as *const u8)), _mm256_or_si256(cls, lz))
     }
 }
 
@@ -1007,34 +1114,50 @@ struct Cx<B, S> {
     sink: *mut S,
 }
 
+const FB: usize = 32;
+
 #[derive(Clone, Copy)]
 struct EvMasks {
     w1c: u64,
     wbc: u64,
-    wbn: u64,
+    wn: u64,
 }
 
 #[inline(always)]
 unsafe fn ev_masks(p: *const u8) -> EvMasks {
     unsafe {
-        let z1 = _mm512_loadu_si512(p as *const __m512i);
-        let zb = _mm512_loadu_si512(p.wrapping_add(OB) as *const __m512i);
-        let (comma, newline) = (_mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'\n' as i8));
-        EvMasks { w1c: _mm512_cmpeq_epi8_mask(z1, comma), wbc: _mm512_cmpeq_epi8_mask(zb, comma), wbn: _mm512_cmpeq_epi8_mask(zb, newline) }
+        let (w1c, wbc, wn): (u64, u64, u64);
+        const _: () = assert!(FB == 32);
+        core::arch::asm!(
+            "vmovdqu {v1}, ymmword ptr [{p} + 32]",
+            "vmovdqu {v2}, ymmword ptr [{p} + 64]",
+            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
+            "vpcmpeqb {b}, {c}, {v1}",
+            "vpcmpeqb {y}, {c}, {v2}",
+            "kunpckdq {a}, {b}, {a}",
+            "kunpckdq {y}, {y}, {b}",
+            "vpcmpeqb {x}, {n}, {v1}",
+            "vpcmpeqb {b}, {n}, {v2}",
+            "kunpckdq {x}, {b}, {x}",
+            a = out(kreg) w1c, b = out(kreg) _, x = out(kreg) wn, y = out(kreg) wbc, v1 = out(ymm_reg) _, v2 = out(ymm_reg) _,
+            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        );
+        EvMasks { w1c, wbc, wn }
     }
 }
 impl EvMasks {
     #[inline(always)]
     fn m(&self) -> u64 {
-        tz(self.wbn)
+        tz(self.wn)
     }
     #[inline(always)]
     fn next(&self, p: *const u8) -> *const u8 {
-        lea3::<{ OB as i32 + 1 }>(p as u64, self.m()) as *const u8
+        lea3::<{ FB as i32 + 1 }>(p as u64, self.m()) as *const u8
     }
     #[inline(always)]
     fn here(self) -> EvMasks {
-        EvMasks { w1c: here_k(self.w1c), wbc: here_k(self.wbc), wbn: here_k(self.wbn) }
+        EvMasks { w1c: here_k(self.w1c), wbc: here_k(self.wbc), wn: here_k(self.wn) }
     }
 }
 
@@ -1150,20 +1273,20 @@ struct EvSt {
     jo: usize,
     x: __m256i,
     days: __m256i,
-    bad_k2: __m128i,
-    bad: __m128i,
+    bad2: __m256i,
+    bad: __m256i,
 }
 
 #[inline(always)]
 unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8, k: EvMasks, s: *mut i64) -> Option<EvSt> {
     unsafe {
         const PP: usize = core::mem::offset_of!(EvBatch, pp);
-        let EvMasks { w1c, wbc, wbn } = k;
-        let m = tz(wbn);
-        let pb = p.wrapping_add(OB);
-        let c0 = tz(w1c);
+        let EvMasks { w1c, wbc, wn } = k;
+        let m = tz(wn);
+        let pb = p.wrapping_add(FB);
+        let c0 = tz2(w1c);
         let t = blsr(w1c);
-        let c1 = tz(t);
+        let c1 = tz2(t);
         let c2 = tz(blsr(t));
         let tb = bzhi(wbc, m);
         let z = _lzcnt_u64(tb);
@@ -1174,7 +1297,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let r4 = _lzcnt_u64(t);
         let zr = z.wrapping_add(r5);
         let i4 = lea3::<1>(zr, r4) ^ 63;
-        let u3 = i4.wrapping_add(OB as u64 - 22).wrapping_sub(c2);
+        let u3 = add_sub::<{ FB as i32 - 22 }>(i4, c2);
         if (m > 63) | (TAIL && pb.wrapping_add(m as usize) >= cx.end) | (c2 > 62) | (r4 > 63) | (u3 & !2 != 0) {
             return None;
         }
@@ -1190,10 +1313,11 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let kr = &*((T.kind2.as_ptr() as *const u8).add((here((r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize) as u64) as usize) << 6) as *const KindRow2);
         let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.maskv.as_ptr()));
         *(s.byte_add(PP) as *mut u64) = *tr.pp.get_unchecked(qi) | kr.pp;
-        let su = &*((T.uid1.as_ptr() as *const u8).add(here(((c1 - c0) << 6) as u64) as usize).sub(64) as *const IdShape);
-        let (ids, bad_i) = ids2v(ld(p.wrapping_add(c0).wrapping_sub(16)), T.eid1.get_unchecked(c0), ld(p.wrapping_add(c1).wrapping_sub(16)), su);
-        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, eid)) as *mut __m128i, ids);
-        store_hi::<{ core::mem::offset_of!(EvBatch, uid) }>(s, ids);
+        let ro = jid_off(c0 as u64, c1 as u64) as usize;
+        let jr = &*((T.jid.as_ptr() as *const u8).add(ro) as *const JidRow);
+        let (ids, bad_i) = ids2j(ld(p.wrapping_add(c0).wrapping_sub(16)), ld(p.wrapping_add(c1).wrapping_sub(16)), jr);
+        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, eid)) as *mut __m128i, _mm256_castsi256_si128(ids));
+        _mm_storel_epi64(s.byte_add(core::mem::offset_of!(EvBatch, uid)) as *mut __m128i, _mm256_extracti128_si256::<1>(ids));
         let q3 = (u3 >> 1) as usize;
         let jo = (here((q3 + 2 * (c2 - c1)) as u64) as usize) << 9;
         let tj = &*((T.tj.as_ptr() as *const u8).add(jo).sub(2 * 512) as *const TjRow);
@@ -1207,7 +1331,8 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
         let y3 = ld2(cache.add(_pext_u64(rd16(e2.wrapping_add(q3).wrapping_add(9)) as u64, jf.pmask3) as usize) as *const u8);
         let bad_k3 = _mm_and_si128(xor_lo(y3, e2, q3), ld(jd.kmask3.as_ptr()));
         let x = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(ld(e2.wrapping_sub(16))), ld(rs4.wrapping_sub(17)));
-        Some(EvSt { jo, x, days: _mm256_permute2x128_si256::<0x31>(y2, y3), bad_k2, bad: _mm_or_si128(bad_i, _mm_or_si128(bad_k3, bad_kind)) })
+        let bad = _mm256_or_si256(bad_i, _mm256_zextsi128_si256(_mm_or_si128(bad_k3, bad_kind)));
+        Some(EvSt { jo, x, days: _mm256_permute2x128_si256::<0x31>(y2, y3), bad2: _mm256_or_si256(bad, _mm256_zextsi128_si256(bad_k2)), bad })
     }
 }
 
@@ -1215,7 +1340,7 @@ unsafe fn ev_s<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const u8
 #[inline(never)]
 unsafe extern "C" fn ev_fix<S: EventSink>(cx: *const Cx<EvBatch, S>, p: *const u8, s: *mut i64) -> u64 {
     unsafe {
-        let t = _blsr_u64(masks(p).c);
+        let t = _blsr_u64(eq64(p, b','));
         fix_slot(&*cx, p, t.trailing_zeros() as usize + 1, _blsr_u64(t).trailing_zeros() as usize, s) as u64
     }
 }
@@ -1249,10 +1374,11 @@ unsafe fn ev_d<S: EventSink>(cx: &Cx<EvBatch, S>, p: *const u8, st: EvSt, np: *c
         let r = _mm256_add_epi64(r, st.days);
         store_hi::<0>(s, _mm256_castsi256_si128(r));
         _mm_storeu_si128(s.byte_add(core::mem::offset_of!(EvBatch, ing)) as *mut __m128i, _mm256_extracti128_si256::<1>(r));
-        let all = _mm256_ternarylogic_epi64::<0xFE>(bad_ta, bad_tb, _mm256_zextsi128_si256(_mm_or_si128(st.bad, st.bad_k2)));
+        let all = _mm256_ternarylogic_epi64::<0xFE>(bad_ta, bad_tb, st.bad2);
         if _mm256_testz_si256(all, all) == 0 {
             let bad_tt = _mm256_or_si256(bad_ta, bad_tb);
-            if nz(_mm_or_si128(st.bad, _mm256_extracti128_si256::<1>(bad_tt))) {
+            let other = _mm256_or_si256(st.bad, _mm256_and_si256(bad_tt, _mm256_set_epi64x(-1, -1, 0, 0)));
+            if _mm256_testz_si256(other, other) == 0 {
                 cold!();
             }
             if kcall!(ev_fix::<S> as unsafe extern "C" fn(_, _, _) -> u64, cx as *const Cx<EvBatch, S> as u64, p as u64, s as u64, 0u64).0 as u8 == 0 {
@@ -1292,21 +1418,21 @@ unsafe fn ev_fast<S: EventSink, const TAIL: bool>(cx: &Cx<EvBatch, S>, p: *const
 #[inline(never)]
 unsafe extern "C" fn ev_purchase(p: *const u8, np: *const u8, s: *mut i64) -> u64 {
     unsafe {
-        let pb = p.wrapping_add(OB);
-        let w = masks(pb);
-        let m = (np.offset_from(pb) - 1) as u64;
-        let pe = pb.wrapping_add(m as usize);
-        let tb = _bzhi_u64(w.c, m as u32);
-        let z = _lzcnt_u64(tb);
-        let r6 = m.wrapping_add(z).wrapping_sub(64);
-        let r5 = _lzcnt_u64(tb.wrapping_shl(z as u32) << 1);
-        let i6 = m.wrapping_sub(r6);
+        let _ = p;
+        let pe = np.wrapping_sub(1);
+        let pt = pe.wrapping_sub(32);
+        let tw = _mm256_loadu_si256(pt as *const __m256i);
+        let q = hi32(tw, b'"') >> 32;
+        let tb = hi32(tw, b',');
+        let r6 = _lzcnt_u64(tb);
+        let r5 = _lzcnt_u64(tb.wrapping_shl(r6 as u32) << 1);
+        let i6 = 32 - r6;
         let i5 = i6.wrapping_sub(r5).wrapping_sub(1);
-        let qb = (w.q.wrapping_shr(i6 as u32) & 1) as usize;
-        let qb5 = (w.q.wrapping_shr(i5 as u32) & 1) as usize;
+        let qb = (q.wrapping_shr(i6 as u32) & 1) as usize;
+        let qb5 = (q.wrapping_shr(i5 as u32) & 1) as usize;
         let (r5, r6) = (r5 as usize, r6 as usize);
         let Some(pr) = price(pe.wrapping_sub(qb), r6 - 2 * qb) else { return 0 };
-        let (prod, bad_p) = dec(ld(pb.wrapping_add(i6 as usize).wrapping_sub(17)), T.prod.get_unchecked(r5 * 2 + qb5));
+        let (prod, bad_p) = dec(ld(pt.wrapping_add(i6 as usize).wrapping_sub(17)), T.prod.get_unchecked(r5 * 2 + qb5));
         if nz(bad_p) {
             return 0;
         }
@@ -1391,8 +1517,19 @@ struct CkMasks {
 #[inline(always)]
 unsafe fn ck_masks(p: *const u8) -> CkMasks {
     unsafe {
-        let v = _mm512_loadu_si512(p as *const __m512i);
-        CkMasks { c: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)), n: _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)) }
+        let (c, n): (u64, u64);
+        core::arch::asm!(
+            "vpcmpeqb {a}, {c}, ymmword ptr [{p}]",
+            "vpcmpeqb {b}, {c}, ymmword ptr [{p} + 32]",
+            "kunpckdq {a}, {b}, {a}",
+            "vpcmpeqb {x}, {n}, ymmword ptr [{p}]",
+            "vpcmpeqb {b}, {n}, ymmword ptr [{p} + 32]",
+            "kunpckdq {x}, {b}, {x}",
+            a = out(kreg) c, b = out(kreg) _, x = out(kreg) n,
+            c = in(ymm_reg) _mm256_set1_epi8(b',' as i8), n = in(ymm_reg) _mm256_set1_epi8(b'\n' as i8), p = in(reg) p,
+            options(pure, readonly, nostack, preserves_flags)
+        );
+        CkMasks { c, n }
     }
 }
 impl CkMasks {
@@ -1581,7 +1718,7 @@ fn scan_click<S: ClickSink>(buf: &[u8], pos: usize, sink: &mut S) -> usize {
 }
 
 macro_rules! pipe_stages {
-    ($S:ident, $cx:ident, $p:ident, $w:ident, $end:ident, $len:ident, $masks:ident, $adv:expr, $line:ident, $s:ident, $d:ident, $cold:ident) => {
+    ($S:ident, $cx:ident, $p:ident, $w:ident, $end:ident, $len:ident, $masks:ident, $adv:expr, $line:ident, $s:ident, $d:ident, $cold:ident, $limrd:ident) => {
         const REACH: usize = 3 * ($adv + 64) + 2;
         if $len >= REACH {
             let lim = $end.sub(REACH);
@@ -1604,7 +1741,7 @@ macro_rules! pipe_stages {
                     if r != p1 {
                         continue 'outer;
                     }
-                    if $p > core::ptr::read_volatile(&lim) {
+                    if $p > $limrd(&lim) {
                         break 'outer;
                     }
                     let Some(stn) = $s::<$S, false>($cx, $p, k1, $w) else {
@@ -1623,7 +1760,7 @@ macro_rules! pipe_stages {
 }
 
 macro_rules! runner {
-    ($name:ident, $sink:ident, $get:ident, $line:ident, $masks:ident, $adv:expr, $scan:ident, $pipe:ident, $s:ident, $d:ident, $cold:ident) => {
+    ($name:ident, $sink:ident, $get:ident, $line:ident, $masks:ident, $adv:expr, $scan:ident, $pipe:ident, $s:ident, $d:ident, $cold:ident, $limrd:ident) => {
         #[inline(never)]
         unsafe fn $name<S: $sink, const MODE: u8>(buf: &[u8], sink: &mut S) {
             unsafe {
@@ -1636,7 +1773,7 @@ macro_rules! runner {
                 let mut w = (*b).ts.as_mut_ptr().add((*b).n);
                 let mut p = base;
                 if MODE == PIPE {
-                    $pipe!(S, cx, p, w, end, len, $masks, $adv, $line, $s, $d, $cold);
+                    $pipe!(S, cx, p, w, end, len, $masks, $adv, $line, $s, $d, $cold, $limrd);
                 }
                 if MODE == CHAIN {
                     const REACH: usize = 2 * ($adv + 64) + 1;
@@ -1664,8 +1801,17 @@ macro_rules! runner {
         }
     };
 }
-runner!(run_events, EventSink, ev, ev_fast, ev_masks, OB, scan_event, pipe_stages, ev_s, ev_d, ev_cold);
-runner!(run_clicks, ClickSink, ck, cl_fast, ck_masks, 0, scan_click, pipe_stages, cl_s, cl_d, cl_cold);
+runner!(run_events, EventSink, ev, ev_fast, ev_masks, OB, scan_event, pipe_stages, ev_s, ev_d, ev_cold, lim_ev);
+runner!(run_clicks, ClickSink, ck, cl_fast, ck_masks, 0, scan_click, pipe_stages, cl_s, cl_d, cl_cold, lim_ck);
+
+#[inline(always)]
+unsafe fn lim_ev(l: &*const u8) -> *const u8 {
+    unsafe { core::ptr::read_volatile(l) }
+}
+#[inline(always)]
+unsafe fn lim_ck(l: &*const u8) -> *const u8 {
+    unsafe { core::ptr::read_volatile(l) }
+}
 
 mod slow {
     use crate::iface::*;

@@ -639,6 +639,8 @@ const GEN_MAX: u64 = {
     }
 };
 const PF_CHUNK: bool = true;
+const RC_NOALL: bool = option_env!("XL_RCNOALL").is_some();
+const GB_MAX: usize = crate::env_u32(option_env!("XL_GBMAX"), 1 << 31) as usize;
 const XRC: usize = crate::env_u32(option_env!("XL_XRC"), 4) as usize;
 const M31: u32 = 0x7FFF_FFFF;
 const FLAG: u32 = 0x8000_0000;
@@ -1017,6 +1019,50 @@ fn name_selftest(g: &G) {
     }
 }
 
+const FN_: usize = BSIZE + GUARD + 64;
+const fn r64c(x: usize) -> usize {
+    (x + 63) & !63
+}
+const OQ_SIDX: usize = r64c(8 * FN_);
+const OQ_STS: usize = OQ_SIDX + r64c(4 * FN_);
+const OQ_SDAY: usize = OQ_STS + r64c(4 * FN_) + 4 * GUARD;
+const OQ_SCAMP: usize = OQ_STS + 2 * r64c(4 * FN_);
+const OQ_SLOTS: usize = r64c(16 * (BSIZE + 16)) - 16 * 8;
+const OQ_ROWDAY: usize = OQ_STS + 3 * r64c(4 * FN_);
+const OQ_ROWS0: usize = OQ_STS + 4 * r64c(4 * FN_);
+const OQ_ROWR0: usize = OQ_STS + 5 * r64c(4 * FN_);
+const OQ_ROWREV: usize = OQ_STS + 6 * r64c(4 * FN_);
+const OP_RUNS0: usize = 3 * r64c(4 * FN_);
+const OP_RUNROW0: usize = 2 * r64c(4 * FN_);
+const OP_RUNPIDX: usize = r64c(4 * FN_);
+const OP_NMV: usize = OP_W + r64c(4 * BSIZE);
+const OP_NMK: usize = OP_NMV + r64c(8 * (8 * FN_ + 16));
+const OP_NMR: usize = OP_NMK + r64c(8 * (8 * FN_ + 16));
+const OP_NMBEST: usize = OP_NMR + r64c(4 * (8 * FN_ + 16));
+const OR_WLS: usize = r64c(256 * RC_N);
+const OR_WLR: usize = OR_WLS + r64c(4 * (WL_CAP + WL_RUN + 64));
+const OP_ROWCAT: usize = r64c(FN_) + 3 * r64c(4 * FN_);
+const OB_KEEPM: usize = r64c(2 * (BSIZE / 8 + 2));
+const OB_PKM: usize = OB_KEEPM + r64c(BSIZE / 8 + 8);
+const OB_BLKNS: usize = OB_PKM + r64c(BSIZE / 8 + 8);
+const OB_SSB: usize = OB_BLKNS + r64c(4 * (BSIZE / 16 + 2));
+const OB_BLKNROW: usize = OB_SSB + r64c(2 * (BSIZE / 16 + 2));
+const OB_RWB: usize = OB_BLKNROW + r64c(4 * (BSIZE / 16 + 2));
+const OP_CELL: usize = r64c(2 * (BSIZE + 64));
+const OP_SID: usize = OP_CELL + r64c(4 * BSIZE);
+const OP_ROW: usize = OP_SID + r64c(4 * BSIZE);
+const OP_W: usize = OP_ROW + r64c(4 * BSIZE);
+#[inline(always)]
+unsafe fn at<T>(base: *const u8, off: usize) -> *mut T {
+    base.add(off) as *mut T
+}
+#[inline(always)]
+fn opaque(p: *const u8) -> *const u8 {
+    let mut p = p;
+    unsafe { std::arch::asm!("/* {0} */", inout(reg) p, options(pure, nomem, nostack, preserves_flags)) };
+    p
+}
+
 struct Fast {
     slots: *mut Rec,
     q: *mut u64,
@@ -1051,7 +1097,7 @@ struct Fast {
     mix: Vec<u32>,
     f: Vec<V16>,
     last: *mut u64,
-    serial: u32,
+    gbase: u32,
     asst: *mut V16,
     cred: *mut u32,
     rc: *mut Rc,
@@ -1078,32 +1124,34 @@ const AL_CAP: usize = 4096;
 
 #[inline(never)]
 unsafe fn light_flush(fx: &mut Fast, nw: usize, org: u32) {
-    let (sts, sday, scamp, rc, wl_s, wl_r, list) = (fx.sts, fx.sday, fx.scamp, fx.rc, fx.wl_s, fx.wl_r, fx.alist);
+    let (wl_s, wl_r, list) = (fx.wl_s, fx.wl_r, fx.alist);
+    let qb = fx.q as *const u8;
+    let rcb = fx.rc as *const u8;
     let af = fx.asst as *mut u32;
+    let weekv = _mm512_set1_epi32(WEEK_MS as i32);
     let mut nl = 0usize;
     for i in 0..nw {
+        let x = *wl_s.add(i) as usize;
+        let rcp = opaque(rcb.add(*wl_r.add(i) as usize)) as *const Rc;
+        let xq = opaque(qb.add(4 * x));
+        let vm = (*rcp).vm;
+        let sv = _mm512_set1_epi32(*(xq.add(OQ_STS) as *const u32) as i32);
+        let dv = _mm512_set1_epi32(*(xq.add(OQ_SDAY) as *const u32) as i32);
+        let ts = _mm512_load_si512((*rcp).ts.as_ptr() as *const _);
+        let win = cmp_mask::<2>(_mm512_sub_epi32(ts, sv), weekv) & vm;
+        let cv = *(*rcp).camp.as_ptr().add((win | 1).ilog2() as usize) >> 4;
+        *(xq.add(OQ_SCAMP) as *mut u32) = std::hint::select_unpredictable(win != 0, cv, org);
+        let lo = win & win.wrapping_neg();
+        let am = win & _mm512_cmplt_epu32_mask(_mm512_load_si512((*rcp).conf.as_ptr() as *const _), _mm512_set1_epi32(lo as i32)) as u32;
+        let cells = _mm512_add_epi32(_mm512_load_si512((*rcp).camp.as_ptr() as *const _), dv);
+        _mm512_storeu_si512(list.add(nl) as *mut _, _mm512_maskz_compress_epi32(am as u16, cells));
+        nl += am.count_ones() as usize;
         if nl > AL_CAP {
             for j in 0..nl {
                 *af.add(*list.add(j) as usize) += 1;
             }
             nl = 0;
         }
-        let x = *wl_s.add(i) as usize;
-        let rcp = rc.add(*wl_r.add(i) as usize);
-        let s = *sts.add(x);
-        let d = *sday.add(x);
-        let vm = (*rcp).vm;
-        let ts = _mm512_load_si512((*rcp).ts.as_ptr() as *const _);
-        let him = _mm512_cmple_epu32_mask(ts, _mm512_set1_epi32((s + WEEK_MS as u32) as i32)) as u32 & vm;
-        let lom = _mm512_cmplt_epu32_mask(ts, _mm512_set1_epi32(s as i32)) as u32 & vm;
-        let win = him & !lom;
-        let cv = *(*rcp).camp.as_ptr().add((31u32.wrapping_sub(win.leading_zeros()) & 15) as usize);
-        let sel = ((win != 0) as u32).wrapping_neg();
-        *scamp.add(x) = org ^ ((org ^ cv) & sel);
-        let am = win & _mm512_cmplt_epu32_mask(_mm512_load_si512((*rcp).conf.as_ptr() as *const _), _mm512_set1_epi32((lom + 1) as i32)) as u32;
-        let cells = _mm512_add_epi32(_mm512_slli_epi32(_mm512_load_si512((*rcp).camp.as_ptr() as *const _), 4), _mm512_set1_epi32(d as i32));
-        _mm512_storeu_si512(list.add(nl) as *mut _, _mm512_maskz_compress_epi32(am as u16, cells));
-        nl += am.count_ones() as usize;
     }
     for i in 0..nl {
         *af.add(*list.add(i) as usize) += 1;
@@ -1152,7 +1200,7 @@ impl Fast {
                 mix: Vec::new(),
                 f: vec![V16([0; 16]); 64],
                 last: take(ht, &mut q, 8 * (CBOUND + 2)) as *mut u64,
-                serial: 0,
+                gbase: 0,
                 asst: take(ht, &mut q, 64 * (nc + 2)) as *mut V16,
                 cred: take(ht, &mut q, 4 * (nc + 2) * nd) as *mut u32,
                 rc: take(ht, &mut q, 256 * RC_N) as *mut Rc,
@@ -1176,6 +1224,18 @@ impl Fast {
             };
             if h > dense || q > hot || c > cold {
                 fallback("scratch layout");
+            }
+            {
+                let (bq, bb, bp) = (fx.q as *const u8, fx.blkk as *const u8, fx.plist as *const u8);
+                let ok = fx.sidx == at(bq, OQ_SIDX) && fx.sts == at(bq, OQ_STS) && fx.sday == at(bq, OQ_SDAY) && fx.scamp == at(bq, OQ_SCAMP) && fx.slots as *const u8 == bq.wrapping_sub(OQ_SLOTS)
+                    && fx.keepm == at(bb, OB_KEEPM) && fx.pkm == at(bb, OB_PKM) && fx.blk_ns == at(bb, OB_BLKNS) && fx.ssb == at(bb, OB_SSB) && fx.blk_nrow == at(bb, OB_BLKNROW) && fx.rwb == at(bb, OB_RWB)
+                    && fx.row_rev == at(bq, OQ_ROWREV) && fx.row_day == at(bq, OQ_ROWDAY) && fx.row_s0 == at(bq, OQ_ROWS0) && fx.row_r0 == at(bq, OQ_ROWR0)
+                    && fx.run_s0 as *const u8 == bp.wrapping_sub(OP_RUNS0) && fx.run_row0 as *const u8 == bp.wrapping_sub(OP_RUNROW0) && fx.run_pidx as *const u8 == bp.wrapping_sub(OP_RUNPIDX)
+                    && fx.nm_v == at(bp, OP_NMV) && fx.nm_k == at(bp, OP_NMK) && fx.nm_r == at(bp, OP_NMR) && fx.nm_best == at(bp, OP_NMBEST)
+                    && fx.wl_s == at(fx.rc as *const u8, OR_WLS) && fx.wl_r == at(fx.rc as *const u8, OR_WLR) && fx.row_cat as *const u8 == bp.wrapping_sub(OP_ROWCAT) && fx.p_cell == at(bp, OP_CELL) && fx.p_sid == at(bp, OP_SID) && fx.p_row == at(bp, OP_ROW) && fx.p_w == at(bp, OP_W);
+                if !ok {
+                    fallback("scratch layout");
+                }
             }
             if !sh.hot.is_null() {
                 std::ptr::write_bytes(fx.last as *mut u8, 0, r64(8 * (CBOUND + 2)));
@@ -1207,8 +1267,10 @@ unsafe fn flush_names(fx: &Fast, core: &mut crate::core::Core, ukey: u64, row_ca
     let mut nl = core.names.len();
     core.names.reserve_total(nl + 9 * *na + 32);
     core.names_off.reserve_total(core.names_off.len() + *na + 1);
-    let ncap = core.names.cap().min(row_cap * 10);
+    let ncap = core.names.cap().min(row_cap * 10).min(u32::MAX as usize);
     let names = core.names.as_mut_ptr();
+    let no0 = core.names_off.len();
+    let offs = core.names_off.as_mut_ptr().add(no0);
     for a in 0..*na {
         if nl + 16 > ncap {
             fallback("avec full");
@@ -1219,109 +1281,154 @@ unsafe fn flush_names(fx: &Fast, core: &mut crate::core::Core, ukey: u64, row_ca
         *q = b'u';
         (q.add(1) as *mut u64).write_unaligned(ch);
         nl += 1 + len;
-        if nl > u32::MAX as usize {
-            fallback("names over 4 GB");
-        }
-        core.names_off.push(nl as u32);
+        *offs.add(a) = nl as u32;
     }
+    core.names_off.truncate(no0 + *na);
     core.names.truncate(nl);
     *np = 0;
     *na = 0;
 }
 
+#[inline(always)]
+unsafe fn bcast_hi(p: *const u64) -> __m512i {
+    let v: __m512i;
+    std::arch::asm!("vpbroadcastd {v}, dword ptr [{p} + 4]", v = lateout(zmm_reg) v, p = in(reg) p, options(pure, readonly, nostack, preserves_flags));
+    v
+}
+
+#[inline(always)]
+unsafe fn cmp_mask<const P: i32>(a: __m512i, b: __m512i) -> u32 {
+    let r: u32;
+    std::arch::asm!("vpcmpud {k}, {a}, {b}, {p}", "kmovw {r:e}, {k}", k = out(kreg) _, a = in(zmm_reg) a, b = in(zmm_reg) b, p = const P, r = lateout(reg) r, options(pure, nomem, nostack, preserves_flags));
+    r
+}
+
 #[inline(never)]
 unsafe fn run_clicks(fx: &mut Fast, cks: &[[u64; 2]], class: u32, s0: usize, nsr: usize, org: u32) {
-    let sts = fx.sts.add(s0);
+    let n = cks.len();
+    let p = cks.as_ptr() as *const u64;
+    let classv = _mm512_setr_epi64(class as i64, -1, class as i64, -1, class as i64, -1, class as i64, -1);
+    let am = _mm512_setr_epi64(15, 0, 15, 0, 15, 0, 15, 0);
+    let one = _mm512_set1_epi64(1);
+    let mut out = _mm512_setzero_si512();
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let a = _mm512_and_si512(_mm512_loadu_si512(p.add(2 * i) as *const _), am);
+        out = _mm512_ternarylogic_epi64(out, _mm512_sllv_epi64(one, a), classv, 0xF4);
+        i += 4;
+    }
+    if i < n {
+        let lm = ((1u32 << (2 * (n - i))) - 1) as u8;
+        let a = _mm512_and_si512(_mm512_maskz_loadu_epi64(lm, p.add(2 * i) as *const _), am);
+        out = _mm512_ternarylogic_epi64(out, _mm512_maskz_mov_epi64(lm, _mm512_sllv_epi64(one, a)), classv, 0xF4);
+    }
+    if _mm512_test_epi64_mask(out, out) == 0 && !RC_NOALL {
+        run_clicks_k::<true>(fx, cks, class, s0, nsr, org)
+    } else {
+        run_clicks_k::<false>(fx, cks, class, s0, nsr, org)
+    }
+}
+
+#[inline(always)]
+unsafe fn run_clicks_k<const ALL: bool>(fx: &mut Fast, cks: &[[u64; 2]], class: u32, s0: usize, nsr: usize, org: u32) {
+    let last = fx.last as *mut u32;
+    if fx.gbase as usize + nsr + 1 >= GB_MAX {
+        std::ptr::write_bytes(last, 0, CBOUND + 2);
+        fx.gbase = 0;
+    }
+    let g0 = fx.gbase as usize;
+    fx.gbase = (g0 + nsr + 1) as u32;
+    let sts0 = fx.sts.add(s0);
     let sday = fx.sday.add(s0);
-    let sc = fx.scamp.add(s0);
     if fx.f.len() < nsr + 1 {
         fx.f.resize(nsr + 1, V16([0; 16]));
     }
-    let f = fx.f.as_mut_ptr();
+    let f0 = fx.f.as_mut_ptr();
     let mut acc = _mm512_setzero_si512();
-    _mm512_store_si512(f as *mut _, acc);
+    _mm512_store_si512(f0 as *mut _, acc);
     for x in 0..nsr {
         acc = _mm512_add_epi32(acc, _mm512_load_si512(ONEHOT.as_ptr().add(*sday.add(x) as usize) as *const _));
-        _mm512_store_si512(f.add(x + 1) as *mut _, acc);
+        _mm512_store_si512(f0.add(x + 1) as *mut _, acc);
     }
-    fx.serial = fx.serial.wrapping_add(1);
-    if fx.serial == 0 {
-        std::ptr::write_bytes(fx.last, 0, CBOUND + 2);
-        fx.serial = 1;
-    }
-    let sbase = (fx.serial as u64) << 32;
-    let last = fx.last;
+    let sts = sts0.wrapping_sub(g0);
+    let sc = fx.scamp.add(s0).wrapping_sub(g0);
+    let f = f0.wrapping_sub(g0);
     let asst = fx.asst;
-    let saved = _mm512_loadu_si512(sts.add(nsr) as *const _);
-    _mm512_storeu_si512(sts.add(nsr) as *mut _, _mm512_set1_epi32(-1));
+    let saved = _mm512_loadu_si512(sts0.add(nsr) as *const _);
+    _mm512_storeu_si512(sts0.add(nsr) as *mut _, _mm512_set1_epi32(-1));
     let orgv = _mm512_set1_epi32(org as i32);
-    let (mut lo_p, mut hi_p) = (0usize, 0usize);
+    let weekv = _mm512_set1_epi32(WEEK_MS as i32);
+    let lo_load = |v: __m512i| _mm512_max_epu32(v, _mm512_add_epi32(v, weekv));
+    let (mut lo_p, mut hi_p) = (g0, g0);
     let mut cpv = orgv;
-    let (mut lob, mut hib) = (0usize, 0usize);
-    let mut lov = _mm512_loadu_si512(sts as *const _);
-    let mut hiv = lov;
+    let (mut lob, mut hib) = (g0, g0);
+    let mut hiv = _mm512_loadu_si512(sts0 as *const _);
+    let mut lov = lo_load(hiv);
+    let class2 = class | class << 16;
     let mut kp = cks.as_ptr();
     let kend = kp.add(cks.len());
     while kp != kend {
         let k0 = (*kp)[0];
+        let tp = kp as *const u64;
         kp = kp.add(1);
-        if (class >> (k0 & 15)) & 1 == 0 {
+        if !ALL && (class2 >> (k0 as u32 & 31)) & 1 == 0 {
             continue;
         }
-        let t = (k0 >> 32) as u32;
         let c = ((k0 >> 4) & (CBOUND as u64 - 1)) as usize;
         if XRC != 0 {
             let cn = (((*kp.add(XRC - 1))[0] >> 4) & (CBOUND as u64 - 1)) as usize;
             _mm_prefetch::<_MM_HINT_T0>(asst.add(cn) as *const i8);
         }
-        let tv = _mm512_set1_epi32(t as i32);
-        let mut n = _mm512_cmple_epu32_mask(hiv, tv).count_ones() as usize;
-        while n == 16 {
+        let tv = bcast_hi(tp);
+        let mut m = cmp_mask::<2>(hiv, tv);
+        while m == 0xFFFF {
+            std::hint::cold_path();
             hib += 16;
-            hiv = _mm512_loadu_si512(sts.add(hib) as *const _);
-            n = _mm512_cmple_epu32_mask(hiv, tv).count_ones() as usize;
+            hiv = _mm512_loadu_si512(sts.wrapping_add(hib) as *const _);
+            m = cmp_mask::<2>(hiv, tv);
         }
-        let hi = hib + n;
-        let tlv = _mm512_set1_epi32(t.saturating_sub(WEEK_MS as u32) as i32);
-        let mut n = _mm512_cmplt_epu32_mask(lov, tlv).count_ones() as usize;
-        while n == 16 {
+        let hi = hib + m.count_ones() as usize;
+        let mut m = cmp_mask::<1>(lov, tv);
+        while m == 0xFFFF {
+            std::hint::cold_path();
             lob += 16;
-            lov = _mm512_loadu_si512(sts.add(lob) as *const _);
-            n = _mm512_cmplt_epu32_mask(lov, tlv).count_ones() as usize;
+            lov = lo_load(_mm512_loadu_si512(sts.wrapping_add(lob) as *const _));
+            m = cmp_mask::<1>(lov, tv);
         }
-        let lo = lob + n;
+        let lo = lob + m.count_ones() as usize;
         let to = lo.min(hi_p);
-        let mut x = lo_p;
-        loop {
-            _mm512_storeu_si512(sc.add(x) as *mut _, cpv);
-            x += 16;
-            if x >= to {
-                break;
+        _mm512_storeu_si512(sc.wrapping_add(lo_p) as *mut _, cpv);
+        if to > lo_p + 16 {
+            let mut x = lo_p + 16;
+            loop {
+                _mm512_storeu_si512(sc.wrapping_add(x) as *mut _, cpv);
+                x += 16;
+                if x >= to {
+                    break;
+                }
             }
         }
-        _mm512_storeu_si512(sc.add(to) as *mut _, orgv);
+        _mm512_storeu_si512(sc.wrapping_add(to) as *mut _, orgv);
         lo_p = lo;
         hi_p = hi;
         cpv = _mm512_set1_epi32(c as i32);
-        let e = *last.add(c) ^ sbase;
-        let prevhi = if e >> 32 == 0 { e as usize } else { 0 };
-        *last.add(c) = sbase | hi as u64;
-        let from = lo.max(prevhi);
+        let from = lo.max(*last.add(c) as usize);
+        *last.add(c) = hi as u32;
         let row = asst.add(c) as *mut __m512i;
-        let d = _mm512_sub_epi32(_mm512_load_si512(f.add(hi) as *const _), _mm512_load_si512(f.add(from) as *const _));
+        let d = _mm512_sub_epi32(_mm512_load_si512(f.wrapping_add(hi) as *const _), _mm512_load_si512(f.wrapping_add(from) as *const _));
         _mm512_store_si512(row, _mm512_add_epi32(_mm512_load_si512(row), d));
     }
-    let to = nsr.min(hi_p);
+    let to = (g0 + nsr).min(hi_p);
     let mut x = lo_p;
     loop {
-        _mm512_storeu_si512(sc.add(x) as *mut _, cpv);
+        _mm512_storeu_si512(sc.wrapping_add(x) as *mut _, cpv);
         x += 16;
         if x >= to {
             break;
         }
     }
-    _mm512_storeu_si512(sc.add(to) as *mut _, orgv);
-    _mm512_storeu_si512(sts.add(nsr) as *mut _, saved);
+    _mm512_storeu_si512(sc.wrapping_add(to) as *mut _, orgv);
+    _mm512_storeu_si512(sts0.add(nsr) as *mut _, saved);
 }
 
 #[inline(always)]
@@ -1332,72 +1439,298 @@ unsafe fn mul32_256(a: __m256i, b: __m256i) -> __m256i {
 }
 
 #[inline(never)]
-unsafe fn pass_b(q: *const u64, k: usize, utab: *const u16, sidx: *mut u32, sts: *mut u32, blk_ns: *mut u32, ssb: *mut u16, mix: &mut Vec<u32>) -> usize {
+unsafe fn pass_b(q: *const u64, k: usize, utab: *const u16, blkk: *const u16, mix: &mut Vec<u32>) -> usize {
+    let mut st = PassB { tlast: _mm512_setzero_si512(), ulast: _mm512_set1_epi32(0x4000_0000), carry: 0, cur: 0, ns: 0, nmix: 0 };
+    mix.clear();
+    mix.reserve(k + 1);
+    let mp = mix.as_mut_ptr();
+    let mut i = 0usize;
+    while i + 16 <= k {
+        pass_b_step(&mut st, q, i, 0xFFFF, utab, blkk as *const u8, mp);
+        i += 16;
+    }
+    if i < k {
+        pass_b_step(&mut st, q, i, (1u32 << (k - i)) - 1, utab, blkk as *const u8, mp);
+    }
+    *mp.add(st.nmix) = u32::MAX;
+    mix.set_len(st.nmix + 1);
+    st.ns
+}
+
+struct PassB {
+    tlast: __m512i,
+    ulast: __m512i,
+    carry: u32,
+    cur: u32,
+    ns: usize,
+    nmix: usize,
+}
+
+#[inline(always)]
+unsafe fn pass_b_step(st: &mut PassB, q: *const u64, i: usize, tail: u32, utab: *const u16, bb: *const u8, mix: *mut u32) {
     let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     let even32 = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
     let odd32 = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
-    let mut ns = 0usize;
-        let gapv = _mm512_set1_epi32(GAP_MS as i32);
-        let c15 = _mm512_set1_epi32(15);
-        let userm = _mm512_set1_epi32(0x7FFF_FFF0);
-        let one = _mm512_set1_epi32(1);
-        let maskc = _mm512_set1_epi32(MASK as i32);
-        let flagv = _mm512_set1_epi32(FLAG as i32);
-        let mut tlast = _mm512_setzero_si512();
-        let mut ulast = _mm512_set1_epi32(0x4000_0000);
-        let mut carry = 0u32;
-        let mut cur = 0u32;
-        mix.clear();
-        let mut i = 0usize;
-        while i < k {
-            let rem = k - i;
-            let tail: u32 = if rem >= 16 { 0xFFFF } else { (1u32 << rem) - 1 };
-            let q0 = _mm512_loadu_si512(q.add(i) as *const _);
-            let q1 = _mm512_loadu_si512(q.add(i + 8) as *const _);
-            let tv = _mm512_permutex2var_epi32(q0, even32, q1);
-            let uv = _mm512_permutex2var_epi32(q0, odd32, q1);
-            let tpv = _mm512_alignr_epi32::<15>(tv, tlast);
-            let upv = _mm512_alignr_epi32::<15>(uv, ulast);
-            tlast = tv;
-            ulast = uv;
-            let x = _mm512_xor_si512(uv, upv);
-            let rs = _mm512_test_epi32_mask(x, userm) as u32 & tail;
-            let acm = _mm512_test_epi32_mask(x, c15) as u32;
-            let gap = _mm512_cmpgt_epu32_mask(_mm512_sub_epi32(tv, tpv), gapv) as u32;
-            let ss = (rs | gap) & tail;
-            let un = _mm512_cmplt_epu32_mask(tv, tpv) as u32 & !rs;
-            let mut ut = _mm512_set1_epi32(cur as i32);
-            let mut m = rs;
-            while m != 0 {
-                let p = m.trailing_zeros();
-                m &= m - 1;
-                cur = *utab.add((*q.add(i + p as usize) >> 36) as usize) as u32;
-                ut = _mm512_mask_mov_epi32(ut, (0xFFFFu32 << p) as u16, _mm512_set1_epi32(cur as i32));
-            }
-            let abit = _mm512_sllv_epi32(one, _mm512_and_si512(uv, c15));
-            let bad = _mm512_test_epi32_mask(abit, _mm512_andnot_si512(ut, maskc)) as u32;
-            let ac = acm & !rs;
-            let badp = ((bad << 1) | carry) & 0xFFFF;
-            carry = (bad >> 15) & 1;
-            let special = (un | (ac & (bad | badp))) & tail;
-            if special != 0 {
-                let mut m = special;
-                while m != 0 {
-                    mix.push((i + m.trailing_zeros() as usize) as u32);
-                    m &= m - 1;
-                }
-            }
-            let base = _mm512_add_epi32(_mm512_set1_epi32(i as i32), iota16);
-            let idxf = _mm512_mask_or_epi32(base, rs as u16, base, flagv);
-            _mm512_storeu_si512(sidx.add(ns) as *mut _, _mm512_maskz_compress_epi32(ss as u16, idxf));
-            _mm512_storeu_si512(sts.add(ns) as *mut _, _mm512_maskz_compress_epi32(ss as u16, tv));
-            *blk_ns.add(i >> 4) = ns as u32;
-            *ssb.add(i >> 4) = ss as u16;
-            ns += ss.count_ones() as usize;
-            i += 16;
+    let gapv = _mm512_set1_epi32(GAP_MS as i32);
+    let c15 = _mm512_set1_epi32(15);
+    let userm = _mm512_set1_epi32(0x7FFF_FFF0);
+    let one = _mm512_set1_epi32(1);
+    let maskc = _mm512_set1_epi32(MASK as i32);
+    let flagv = _mm512_set1_epi32(FLAG as i32);
+    let qb = q as *const u8;
+    let sidx: *mut u32 = at(qb, OQ_SIDX);
+    let sts: *mut u32 = at(qb, OQ_STS);
+    let blk_ns: *mut u32 = at(bb, OB_BLKNS);
+    let ssb: *mut u16 = at(bb, OB_SSB);
+    let ns = st.ns;
+    let q0 = _mm512_loadu_si512(q.add(i) as *const _);
+    let q1 = _mm512_loadu_si512(q.add(i + 8) as *const _);
+    let tv = _mm512_permutex2var_epi32(q0, even32, q1);
+    let uv = _mm512_permutex2var_epi32(q0, odd32, q1);
+    let tpv = _mm512_alignr_epi32::<15>(tv, st.tlast);
+    let upv = _mm512_alignr_epi32::<15>(uv, st.ulast);
+    st.tlast = tv;
+    st.ulast = uv;
+    let x = _mm512_xor_si512(uv, upv);
+    let rs = _mm512_test_epi32_mask(x, userm) as u32 & tail;
+    let acm = _mm512_test_epi32_mask(x, c15) as u32;
+    let gap = _mm512_cmpgt_epu32_mask(_mm512_sub_epi32(tv, tpv), gapv) as u32;
+    let ss = (rs | gap) & tail;
+    let un = _mm512_cmplt_epu32_mask(tv, tpv) as u32 & !rs;
+    let mut ut = _mm512_set1_epi32(st.cur as i32);
+    let mut m = rs;
+    while m != 0 {
+        let p = m.trailing_zeros();
+        m &= m - 1;
+        st.cur = *utab.add((*q.add(i + p as usize) >> 36) as usize) as u32;
+        ut = _mm512_mask_mov_epi32(ut, (0xFFFFu32 << p) as u16, _mm512_set1_epi32(st.cur as i32));
+    }
+    let abit = _mm512_sllv_epi32(one, _mm512_and_si512(uv, c15));
+    let bad = _mm512_test_epi32_mask(abit, _mm512_andnot_si512(ut, maskc)) as u32;
+    let ac = acm & !rs;
+    let badp = ((bad << 1) | st.carry) & 0xFFFF;
+    st.carry = (bad >> 15) & 1;
+    let special = (un | (ac & (bad | badp))) & tail;
+    if special != 0 {
+        let mut m = special;
+        while m != 0 {
+            *mix.add(st.nmix) = (i + m.trailing_zeros() as usize) as u32;
+            st.nmix += 1;
+            m &= m - 1;
         }
-        mix.push(u32::MAX);
-    ns
+    }
+    let base = _mm512_add_epi32(_mm512_set1_epi32(i as i32), iota16);
+    let idxf = _mm512_mask_or_epi32(base, rs as u16, base, flagv);
+    _mm512_storeu_si512(sidx.add(ns) as *mut _, _mm512_maskz_compress_epi32(ss as u16, idxf));
+    _mm512_storeu_si512(sts.add(ns) as *mut _, _mm512_maskz_compress_epi32(ss as u16, tv));
+    *blk_ns.add(i >> 4) = ns as u32;
+    *ssb.add(i >> 4) = ss as u16;
+    st.ns = ns + ss.count_ones() as usize;
+}
+
+#[inline(never)]
+unsafe fn purch_scan(q: *const u64, blkk: *const u16, pl: *const u16, aggp: *const [u64; 2], nd: usize, np: usize) {
+    let (qb, bb, pb) = (q as *const u8, blkk as *const u8, pl as *const u8);
+    let slots = qb.wrapping_sub(OQ_SLOTS) as *const Rec;
+    let (scamp, sday): (*const u32, *const u32) = (at(qb, OQ_SCAMP), at(qb, OQ_SDAY));
+    let keepm: *const u8 = at(bb, OB_KEEPM);
+    let (blk_ns, ssb, blk_nrow, rwb): (*const u32, *const u16, *const u32, *const u16) = (at(bb, OB_BLKNS), at(bb, OB_SSB), at(bb, OB_BLKNROW), at(bb, OB_RWB));
+    let (pc, ps, pr, pw): (*mut u32, *mut u32, *mut u32, *mut u32) = (at(pb, OP_CELL), at(pb, OP_SID), at(pb, OP_ROW), at(pb, OP_W));
+    for j in 0..np {
+        let sl = *pl.add(j) as usize;
+        let wv = (*slots.add(sl)).w0;
+        let i = *blkk.add(sl >> 3) as usize + _bzhi_u32(*keepm.add(sl >> 3) as u32, sl as u32 & 7).count_ones() as usize;
+        let sid = (*blk_ns.add(i >> 4) + _bzhi_u32(*ssb.add(i >> 4) as u32, (i as u32 & 15) + 1).count_ones() - 1) as usize;
+        let cell = *scamp.add(sid) as usize * nd + *sday.add(sid) as usize;
+        let row = *blk_nrow.add(sid >> 4) + _bzhi_u32(*rwb.add(sid >> 4) as u32, (sid as u32 & 15) + 1).count_ones() - 1;
+        _mm_prefetch::<_MM_HINT_T0>(aggp.add(cell) as *const i8);
+        *pc.add(j) = cell as u32;
+        *ps.add(j) = sid as u32;
+        *pr.add(j) = row;
+        *pw.add(j) = ((wv >> 4) & 0x1FFF_FFFF) as u32;
+    }
+}
+
+#[inline(never)]
+unsafe fn purch_add(q: *const u64, pl: *const u16, aggp: *mut [u64; 2], np: usize) {
+    let (qb, pb) = (q as *const u8, pl as *const u8);
+    let row_rev: *mut u32 = at(qb, OQ_ROWREV);
+    let row_cat = pb.wrapping_sub(OP_ROWCAT) as *mut u8;
+    let (pc, ps, pr, pw): (*const u32, *const u32, *const u32, *const u32) = (at(pb, OP_CELL), at(pb, OP_SID), at(pb, OP_ROW), at(pb, OP_W));
+    let mut csum = [0u64; 32];
+    let mut crow = [u32::MAX; 32];
+    let (mut prev_sid, mut cur_row, mut best) = (u32::MAX, u32::MAX, 0u64);
+    for j in 0..np {
+        let w = *pw.add(j);
+        let price = (w >> 5) as u64;
+        let cat = w & 31;
+        let sid = *ps.add(j);
+        let cell = *pc.add(j) as usize;
+        let row = *pr.add(j);
+        (*aggp.add(cell))[0] += (sid != prev_sid) as u64;
+        (*aggp.add(cell))[1] += price;
+        prev_sid = sid;
+        let v = std::hint::select_unpredictable(crow[cat as usize] == row, csum[cat as usize], 0) + price;
+        csum[cat as usize] = v;
+        crow[cat as usize] = row;
+        best = std::hint::select_unpredictable(row != cur_row, 0, best);
+        cur_row = row;
+        best = best.max(v << 5 | (31 - cat) as u64);
+        let rv = *row_rev.add(row as usize) as u64 + price;
+        *row_rev.add(row as usize) = rv.min(0x8000_0000) as u32;
+        *row_cat.add(row as usize) = (31 - (best & 31)) as u8;
+    }
+}
+
+struct Walk {
+    cw: usize,
+    cb: u64,
+    nw: usize,
+    nrc: usize,
+    nm_np: usize,
+    nm_na: usize,
+    mixp: usize,
+    c_runs: u64,
+    c_simple: u64,
+    c_sess: u64,
+}
+
+#[inline(never)]
+unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize, nrun: usize, pidx0: u32, org: u32) -> usize {
+    let (qb, pb, rcb) = (fx.q as *const u8, fx.plist as *const u8, fx.rc as *const u8);
+    let q = fx.q as *const u64;
+    let (sidx, scamp): (*const u32, *mut u32) = (at(qb, OQ_SIDX), at(qb, OQ_SCAMP));
+    let (run_s0, run_pidx) = (pb.wrapping_sub(OP_RUNS0) as *const u32, pb.wrapping_sub(OP_RUNPIDX) as *mut u32);
+    let (nm_v, nm_r, nm_best): (*mut u64, *mut u32, *mut u64) = (at(pb, OP_NMV), at(pb, OP_NMR), at(pb, OP_NMBEST));
+    let (wl_s0, wl_r0): (*mut u32, *mut u32) = (at(rcb, OR_WLS), at(rcb, OR_WLR));
+    let mixv = fx.mix.as_ptr();
+    let ev_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let orgv = _mm512_set1_epi32(org as i32);
+    let (mut cw, mut cb) = (wk.cw, wk.cb);
+    let (mut nw, mut nrc) = (wk.nw, wk.nrc);
+    let (mut nm_np, mut nm_na) = (wk.nm_np, wk.nm_na);
+    let mut mixp = wk.mixp;
+    let (mut c_runs, mut c_simple, mut c_sess) = (0u64, 0u64, 0u64);
+    let mut r = r0;
+    while r < nrun {
+        let s0 = *run_s0.add(r) as usize;
+        let s1 = *run_s0.add(r + 1) as usize;
+        let a = (*sidx.add(s0) & M31) as usize;
+        let e = (*sidx.add(s1) & M31) as usize;
+        let qa = *q.add(a);
+        let u = (qa >> 36) as u32;
+        let tv = *g.utab.add(u as usize);
+        while (*mixv.add(mixp) as usize) < a {
+            mixp += 1;
+        }
+        let special = (*mixv.add(mixp) as usize) < e;
+        let edge = r == 0 || r + 1 == nrun;
+        if edge || special || tv & (COMPLEX | EXTRA) != 0 {
+            break;
+        }
+        if XD { xp.ph(4); xp.ph(14); }
+        c_runs += 1;
+        c_simple += (e - a) as u64;
+        if u as usize >> 6 != cw {
+            claim_word(g, cw, cb);
+            cw = u as usize >> 6;
+            cb = 0;
+        }
+        if cb >> (u & 63) & 1 != 0 {
+            fallback("a user has two runs");
+        }
+        cb |= 1u64 << (u & 63);
+        let mask = (tv & MASK) as u32;
+        let bit = 1u32 << ((qa >> 32) & 15);
+        let class = if bit & mask != 0 { mask } else { bit };
+        if XD { xp.ph(10); }
+        let ncl = class.count_ones() as usize;
+        *nm_best.add(nm_na) = u64::MAX;
+        *run_pidx.add(r) = pidx0 + nm_na as u32;
+        if ncl.wrapping_sub(1) >= 8 {
+            *nm_best.add(nm_na) = name_key_scalar(g.ukey, u, class);
+        } else {
+            let al = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(_mm512_maskz_compress_epi32(class as u16, iota16)));
+            _mm512_storeu_si512(nm_v.add(nm_np) as *mut _, _mm512_or_si512(_mm512_set1_epi64(((u as u64) << 9) as i64), al));
+            _mm256_storeu_si256(nm_r.add(nm_np) as *mut _, _mm256_set1_epi32(nm_na as i32));
+            nm_np += ncl;
+        }
+        nm_na += 1;
+        c_sess += (s1 - s0) as u64;
+        if XD { xp.ph(11); }
+        let mut x = s0;
+        while x < s1 {
+            _mm512_storeu_si512(scamp.add(x) as *mut _, orgv);
+            x += 16;
+        }
+        let cks = g.csr_range(u);
+        let n = cks.len();
+        let nsr = s1 - s0;
+        let mut light = n == 0;
+        if n != 0 && n <= 16 && nsr <= WL_RUN {
+            if nrc == RC_N || nw + nsr > WL_CAP {
+                xp.ph(4);
+                light_flush(fx, nw, org);
+                xp.ph(5);
+                nw = 0;
+                nrc = 0;
+            }
+            let p = cks.as_ptr() as *const __m512i;
+            let ka = _mm512_permutex2var_epi64(_mm512_loadu_si512(p), ev_idx, _mm512_loadu_si512(p.add(1)));
+            let kb = _mm512_permutex2var_epi64(_mm512_loadu_si512(p.add(2)), ev_idx, _mm512_loadu_si512(p.add(3)));
+            let lo32 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(ka)), _mm512_cvtepi64_epi32(kb));
+            let ts = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(_mm512_srli_epi64(ka, 32))), _mm512_cvtepi64_epi32(_mm512_srli_epi64(kb, 32)));
+            let vm = (1u32 << n) - 1;
+            let inc = _mm512_test_epi32_mask(_mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_and_si512(lo32, _mm512_set1_epi32(15))), _mm512_set1_epi32(class as i32)) as u32;
+            if inc & vm == vm {
+                light = true;
+                let camp = _mm512_and_si512(lo32, _mm512_set1_epi32((CBOUND as i32 - 1) << 4));
+                let ri = nrc;
+                nrc += 1;
+                let rcp = (rcb as *mut Rc).add(ri);
+                _mm512_store_si512((*rcp).ts.as_mut_ptr() as *mut _, ts);
+                _mm512_store_si512((*rcp).camp.as_mut_ptr() as *mut _, camp);
+                _mm512_store_si512((*rcp).conf.as_mut_ptr() as *mut _, _mm512_conflict_epi32(camp));
+                (*rcp).vm = vm;
+                let wl_s = wl_s0.add(nw);
+                let wl_r = wl_r0.add(nw);
+                let rv = _mm512_set1_epi32((ri * std::mem::size_of::<Rc>()) as i32);
+                let mut x = 0usize;
+                loop {
+                    _mm512_storeu_si512(wl_s.add(x) as *mut _, _mm512_add_epi32(_mm512_set1_epi32((s0 + x) as i32), iota16));
+                    _mm512_storeu_si512(wl_r.add(x) as *mut _, rv);
+                    x += 16;
+                    if x >= nsr {
+                        break;
+                    }
+                }
+                nw += nsr;
+            }
+        }
+        if XD { xp.ph(12); }
+        xc(if light { if n == 0 { 0 } else { 1 } } else { 2 }, 1);
+        xc(if light { 3 } else { 4 }, n as u64);
+        xc(if light { if n == 0 { 5 } else { 6 } } else { 7 }, nsr as u64);
+        if XD && n <= 16 { xc(8 + n, 1); }
+        if XD && !light { let bin = if n <= 16 { 0 } else if n <= 32 { 1 } else if n <= 64 { 2 } else if n <= 128 { 3 } else if n <= 512 { 4 } else { 5 }; XH[bin].fetch_add(1, Ordering::Relaxed); XH[6 + bin].fetch_add(n as u64, Ordering::Relaxed); XH[12 + bin].fetch_add(nsr as u64, Ordering::Relaxed); XH[18 + bin].fetch_add((n * nsr) as u64, Ordering::Relaxed); }
+        if !light {
+            run_clicks(fx, cks, class, s0, nsr, org);
+            if XD { xp.ph(13); }
+        }
+        r += 1;
+    }
+    wk.cw = cw;
+    wk.cb = cb;
+    wk.nw = nw;
+    wk.nrc = nrc;
+    wk.nm_np = nm_np;
+    wk.nm_na = nm_na;
+    wk.mixp = mixp;
+    wk.c_runs += c_runs;
+    wk.c_simple += c_simple;
+    wk.c_sess += c_sess;
+    r
 }
 
 fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
@@ -1423,12 +1756,15 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
     let trash = g.nc as u32 + 1;
     let row_cap = g.row_cap;
     unsafe {
-        let slots = fx.slots;
-        let (q, blkk, keepm, pkm) = (fx.q, fx.blkk, fx.keepm, fx.pkm);
-        let (sidx, sts, sday, scamp, blk_ns, ssb) = (fx.sidx, fx.sts, fx.sday, fx.scamp, fx.blk_ns, fx.ssb);
-        let (row_day, row_s0, row_r0, row_rev, row_cat, blk_nrow, rwb) = (fx.row_day, fx.row_s0, fx.row_r0, fx.row_rev, fx.row_cat, fx.blk_nrow, fx.rwb);
-        let (run_s0, run_row0, run_pidx) = (fx.run_s0, fx.run_row0, fx.run_pidx);
-        let (nm_v, nm_r, nm_best) = (fx.nm_v, fx.nm_r, fx.nm_best);
+        let (q, blkk, pl) = (fx.q, fx.blkk, fx.plist);
+        let (qb, bb, pb) = (q as *const u8, blkk as *const u8, pl as *const u8);
+        let slots = qb.wrapping_sub(OQ_SLOTS) as *mut Rec;
+        let (keepm, pkm): (*mut u8, *mut u8) = (at(bb, OB_KEEPM), at(bb, OB_PKM));
+        let (sidx, sts, sday, scamp): (*mut u32, *mut u32, *mut u32, *mut u32) = (at(qb, OQ_SIDX), at(qb, OQ_STS), at(qb, OQ_SDAY), at(qb, OQ_SCAMP));
+        let (row_day, row_s0, row_r0, row_rev): (*mut u32, *mut u32, *mut u32, *mut u32) = (at(qb, OQ_ROWDAY), at(qb, OQ_ROWS0), at(qb, OQ_ROWR0), at(qb, OQ_ROWREV));
+        let row_cat = pb.wrapping_sub(OP_ROWCAT) as *mut u8;
+        let (blk_nrow, rwb): (*mut u32, *mut u16) = (at(bb, OB_BLKNROW), at(bb, OB_RWB));
+        let (run_s0, run_row0, run_pidx) = (pb.wrapping_sub(OP_RUNS0) as *mut u32, pb.wrapping_sub(OP_RUNROW0) as *mut u32, pb.wrapping_sub(OP_RUNPIDX) as *mut u32);
         let mut gen = 0u64;
         let dig_min = DIG_MIN.load(Ordering::Relaxed);
         let ev_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
@@ -1472,13 +1808,13 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 let pmask = _mm512_set1_epi64((0xFF_FFFFu64 << 9) as i64);
                 let eight = _mm512_set1_epi64(8);
                 let mut tagv = _mm512_add_epi64(iota8q, _mm512_set1_epi64(gen as i64));
-                for blk in 0..BSIZE / 8 {
+                let mut step = |blk: usize, k: &mut usize, tagv: &mut __m512i| {
                     let r0 = _mm512_loadu_si512(slots.add(8 * blk) as *const _);
                     let r1 = _mm512_loadu_si512(slots.add(8 * blk + 4) as *const _);
                     let w0 = _mm512_permutex2var_epi64(r0, ev_idx, r1);
                     let w1 = _mm512_permutex2var_epi64(r0, od_idx, r1);
-                    let occ = _mm512_testn_epi64_mask(_mm512_sub_epi64(w1, tagv), m16);
-                    tagv = _mm512_add_epi64(tagv, eight);
+                    let occ = _mm512_testn_epi64_mask(_mm512_sub_epi64(w1, *tagv), m16);
+                    *tagv = _mm512_add_epi64(*tagv, eight);
                     let tsq = _mm512_srli_epi64(w0, 33);
                     let valid = _mm512_mask_cmpneq_epu64_mask(occ, tsq, inv);
                     let odd = valid & _mm512_movepi64_mask(w1);
@@ -1488,11 +1824,18 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                     let keep = valid & !odd;
                     let ua = _mm512_ternarylogic_epi64(_mm512_srli_epi64(w1, 33), w0, m15, 0xD8);
                     let qv = _mm512_or_si512(_mm512_slli_epi64(ua, 32), tsq);
-                    _mm512_storeu_si512(q.add(k) as *mut _, _mm512_maskz_compress_epi64(keep, qv));
-                    *blkk.add(blk) = k as u16;
+                    _mm512_storeu_si512(q.add(*k) as *mut _, _mm512_maskz_compress_epi64(keep, qv));
+                    *blkk.add(blk) = *k as u16;
                     *keepm.add(blk) = keep;
                     *pkm.add(blk) = keep & _mm512_test_epi64_mask(w0, pmask);
-                    k += keep.count_ones() as usize;
+                    *k += keep.count_ones() as usize;
+                };
+                const _: () = assert!((BSIZE / 8) % 2 == 0);
+                let mut blk = 0usize;
+                while blk < BSIZE / 8 {
+                    step(blk, &mut k, &mut tagv);
+                    step(blk + 1, &mut k, &mut tagv);
+                    blk += 2;
                 }
                 *blkk.add(BSIZE / 8) = k as u16;
             }
@@ -1503,7 +1846,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 t.prof[1] += (tc - tb).as_nanos() as u64;
                 continue;
             }
-            let ns = pass_b(q, k, g.utab, sidx, sts, blk_ns, ssb, &mut fx.mix);
+            let ns = pass_b(q, k, g.utab, blkk, &mut fx.mix);
             *sidx.add(ns) = k as u32 | FLAG;
             xp.ph(2);
             let mut nrow = 0usize;
@@ -1560,158 +1903,68 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
             std::ptr::write_bytes(row_rev, 0, nrow);
             std::ptr::write_bytes(row_cat, 255, nrow);
             xp.ph(3);
-            let (mut cw, mut cb) = (0usize, 0u64);
-            let (mut nw, mut nrc) = (0usize, 0usize);
+            let mut wk = Walk { cw: 0, cb: 0, nw: 0, nrc: 0, nm_np: 0, nm_na: 0, mixp: 0, c_runs: 0, c_simple: 0, c_sess: 0 };
             let mut digs = [DigRun { first: false, user: 0, a: 0, e: 0, s0: 0, s1: 0 }; 2];
             let mut ndig = 0usize;
-            let (mut nm_np, mut nm_na) = (0usize, 0usize);
-            let mut mixp = 0usize;
-            let orgv = _mm512_set1_epi32(org as i32);
+            let mixv = fx.mix.as_ptr();
             let trashv = _mm512_set1_epi32(trash as i32);
-            for r in 0..nrun {
+            let mut r = 0usize;
+            loop {
+                xp.ph(4);
+                r = walk_runs(&mut fx, g, &mut wk, &mut xp, r, nrun, (t.core.names_off.len() - 1) as u32, org);
+                if r >= nrun {
+                    break;
+                }
                 let s0 = *run_s0.add(r) as usize;
                 let s1 = *run_s0.add(r + 1) as usize;
                 let a = (*sidx.add(s0) & M31) as usize;
                 let e = (*sidx.add(s1) & M31) as usize;
-                let qa = *q.add(a);
-                let u = (qa >> 36) as u32;
+                let u = (*q.add(a) >> 36) as u32;
                 let tv = *g.utab.add(u as usize);
-                while (*fx.mix.get_unchecked(mixp) as usize) < a {
-                    mixp += 1;
-                }
-                let special = (*fx.mix.get_unchecked(mixp) as usize) < e;
+                let special = (*mixv.add(wk.mixp) as usize) < e;
                 let edge = r == 0 || r + 1 == nrun;
-                if edge || special || tv & (COMPLEX | EXTRA) != 0 {
-                    xc(25, 1);
-                    xc(26, (e - a) as u64);
-                    xp.ph(4);
-                    *run_pidx.add(r) = NONE;
-                    let mut x = s0;
-                    while x < s1 {
-                        _mm512_storeu_si512(scamp.add(x) as *mut _, trashv);
-                        x += 16;
-                    }
-                    let dig = edge && !special && tv & COMPLEX == 0 && e - a >= dig_min && 3 + 2 * (s1 - s0) + (e - a) <= EP_WORDS;
-                    if dig {
-                        digs[ndig] = DigRun { first: r == 0, user: u, a, e, s0, s1 };
-                        ndig += 1;
-                        if r == 0 {
-                            info.n = 1;
-                        } else {
-                            info.n = 2;
-                        }
-                    } else if r == 0 {
-                        info.first = edge_copy_k(tid, u, &mut fx, a, e - a);
-                        info.n = 1;
-                    } else if r + 1 == nrun {
-                        info.last = edge_copy_k(tid, u, &mut fx, a, e - a);
-                        info.n = 2;
-                    } else {
-                        flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut nm_np, &mut nm_na);
-                        let mut buf = std::mem::take(&mut t.runbuf);
-                        buf.clear();
-                        for_kept(slots, blkk, keepm, a, e - a, |w0| buf.push(Rec { w0, w1: (u as u64) << 37 }));
-                        process_run(g, t, u, &mut buf);
-                        t.runbuf = buf;
-                    }
-                    xp.ph(15);
-                    continue;
-                }
-                if XD { xp.ph(4); xp.ph(14); }
-                t.n_runs += 1;
-                t.n_simple += (e - a) as u64;
-                if u as usize >> 6 != cw {
-                    claim_word(g, cw, cb);
-                    cw = u as usize >> 6;
-                    cb = 0;
-                }
-                if cb >> (u & 63) & 1 != 0 {
-                    fallback("a user has two runs");
-                }
-                cb |= 1u64 << (u & 63);
-                let mask = (tv & MASK) as u32;
-                let bit = 1u32 << ((qa >> 32) & 15);
-                let class = if bit & mask != 0 { mask } else { bit };
-                if XD { xp.ph(10); }
-                let core = &mut t.core;
-                let ncl = class.count_ones() as usize;
-                *nm_best.add(nm_na) = u64::MAX;
-                *run_pidx.add(r) = (core.names_off.len() - 1 + nm_na) as u32;
-                if ncl == 0 || ncl > 8 {
-                    *nm_best.add(nm_na) = name_key_scalar(g.ukey, u, class);
-                } else {
-                    let al = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(_mm512_maskz_compress_epi32(class as u16, iota16)));
-                    _mm512_storeu_si512(nm_v.add(nm_np) as *mut _, _mm512_or_si512(_mm512_set1_epi64(((u as u64) << 9) as i64), al));
-                    _mm256_storeu_si256(nm_r.add(nm_np) as *mut _, _mm256_set1_epi32(nm_na as i32));
-                    nm_np += ncl;
-                }
-                nm_na += 1;
-                core.n_sess += (s1 - s0) as u64;
-                if XD { xp.ph(11); }
+                xc(25, 1);
+                xc(26, (e - a) as u64);
+                xp.ph(4);
+                *run_pidx.add(r) = NONE;
                 let mut x = s0;
                 while x < s1 {
-                    _mm512_storeu_si512(scamp.add(x) as *mut _, orgv);
+                    _mm512_storeu_si512(scamp.add(x) as *mut _, trashv);
                     x += 16;
                 }
-                let cks = g.csr_range(u);
-                let n = cks.len();
-                let nsr = s1 - s0;
-                let mut light = n == 0;
-                if n != 0 && n <= 16 && nsr <= WL_RUN {
-                    if nrc == RC_N || nw + nsr > WL_CAP {
-                        xp.ph(4);
-                        light_flush(&mut fx, nw, org);
-                        xp.ph(5);
-                        nw = 0;
-                        nrc = 0;
+                let dig = edge && !special && tv & COMPLEX == 0 && e - a >= dig_min && 3 + 2 * (s1 - s0) + (e - a) <= EP_WORDS;
+                if dig {
+                    digs[ndig] = DigRun { first: r == 0, user: u, a, e, s0, s1 };
+                    ndig += 1;
+                    if r == 0 {
+                        info.n = 1;
+                    } else {
+                        info.n = 2;
                     }
-                    let p = cks.as_ptr() as *const __m512i;
-                    let ka = _mm512_permutex2var_epi64(_mm512_loadu_si512(p), ev_idx, _mm512_loadu_si512(p.add(1)));
-                    let kb = _mm512_permutex2var_epi64(_mm512_loadu_si512(p.add(2)), ev_idx, _mm512_loadu_si512(p.add(3)));
-                    let lo32 = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(ka)), _mm512_cvtepi64_epi32(kb));
-                    let ts = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(_mm512_srli_epi64(ka, 32))), _mm512_cvtepi64_epi32(_mm512_srli_epi64(kb, 32)));
-                    let vm = (1u32 << n) - 1;
-                    let inc = _mm512_test_epi32_mask(_mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_and_si512(lo32, _mm512_set1_epi32(15))), _mm512_set1_epi32(class as i32)) as u32;
-                    if inc & vm == vm {
-                        light = true;
-                        let camp = _mm512_and_si512(_mm512_srli_epi32(lo32, 4), _mm512_set1_epi32(CBOUND as i32 - 1));
-                        let ri = nrc;
-                        nrc += 1;
-                        let rcp = fx.rc.add(ri);
-                        _mm512_store_si512((*rcp).ts.as_mut_ptr() as *mut _, ts);
-                        _mm512_store_si512((*rcp).camp.as_mut_ptr() as *mut _, camp);
-                        _mm512_store_si512((*rcp).conf.as_mut_ptr() as *mut _, _mm512_conflict_epi32(camp));
-                        (*rcp).vm = vm;
-                        let wl_s = fx.wl_s.add(nw);
-                        let wl_r = fx.wl_r.add(nw);
-                        let rv = _mm512_set1_epi32(ri as i32);
-                        let mut x = 0usize;
-                        loop {
-                            _mm512_storeu_si512(wl_s.add(x) as *mut _, _mm512_add_epi32(_mm512_set1_epi32((s0 + x) as i32), iota16));
-                            _mm512_storeu_si512(wl_r.add(x) as *mut _, rv);
-                            x += 16;
-                            if x >= nsr {
-                                break;
-                            }
-                        }
-                        nw += nsr;
-                    }
+                } else if r == 0 {
+                    info.first = edge_copy_k(tid, u, &mut fx, a, e - a);
+                    info.n = 1;
+                } else if r + 1 == nrun {
+                    info.last = edge_copy_k(tid, u, &mut fx, a, e - a);
+                    info.n = 2;
+                } else {
+                    flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut wk.nm_np, &mut wk.nm_na);
+                    let mut buf = std::mem::take(&mut t.runbuf);
+                    buf.clear();
+                    for_kept(slots, blkk, keepm, a, e - a, |w0| buf.push(Rec { w0, w1: (u as u64) << 37 }));
+                    process_run(g, t, u, &mut buf);
+                    t.runbuf = buf;
                 }
-                if XD { xp.ph(12); }
-                xc(if light { if n == 0 { 0 } else { 1 } } else { 2 }, 1);
-                xc(if light { 3 } else { 4 }, n as u64);
-                xc(if light { if n == 0 { 5 } else { 6 } } else { 7 }, nsr as u64);
-                if XD && n <= 16 { xc(8 + n, 1); }
-                if XD && !light { let bin = if n <= 16 { 0 } else if n <= 32 { 1 } else if n <= 64 { 2 } else if n <= 128 { 3 } else if n <= 512 { 4 } else { 5 }; XH[bin].fetch_add(1, Ordering::Relaxed); XH[6 + bin].fetch_add(n as u64, Ordering::Relaxed); XH[12 + bin].fetch_add(nsr as u64, Ordering::Relaxed); XH[18 + bin].fetch_add((n * nsr) as u64, Ordering::Relaxed); }
-                if !light {
-                    run_clicks(&mut fx, cks, class, s0, nsr, org);
-                    if XD { xp.ph(13); }
-                }
+                xp.ph(15);
+                r += 1;
             }
-            flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut nm_np, &mut nm_na);
+            flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut wk.nm_np, &mut wk.nm_na);
+            t.n_runs += wk.c_runs;
+            t.n_simple += wk.c_simple;
+            t.core.n_sess += wk.c_sess;
             xp.ph(4);
-            light_flush(&mut fx, nw, org);
-            claim_word(g, cw, cb);
+            light_flush(&mut fx, wk.nw, org);
+            claim_word(g, wk.cw, wk.cb);
             xp.ph(5);
             {
                 let cred = fx.cred;
@@ -1723,9 +1976,6 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
             xp.ph(6);
             {
                 let aggp = t.core.aggp.as_mut_ptr();
-                let mut csum = [0u64; 32];
-                let mut crow = [u32::MAX; 32];
-                let pl = fx.plist;
                 let mut np = 0usize;
                 for wd in 0..BSIZE / 64 {
                     let mut pm = (pkm.add(8 * wd) as *const u64).read_unaligned();
@@ -1750,20 +2000,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                     _mm_prefetch::<_MM_HINT_T0>(slots.add(*pl.add(np) as usize) as *const i8);
                     np += n;
                 }
-                let (pc, ps, pr, pw) = (fx.p_cell, fx.p_sid, fx.p_row, fx.p_w);
-                for j in 0..np {
-                    let sl = *pl.add(j) as usize;
-                    let wv = (*slots.add(sl)).w0;
-                    let i = *blkk.add(sl >> 3) as usize + (*keepm.add(sl >> 3) as u32 & ((1u32 << (sl & 7)) - 1)).count_ones() as usize;
-                    let sid = *blk_ns.add(i >> 4) + (*ssb.add(i >> 4) as u32 & ((2u32 << (i & 15)) - 1)).count_ones() - 1;
-                    let cell = *scamp.add(sid as usize) as usize * nd + *sday.add(sid as usize) as usize;
-                    let row = *blk_nrow.add(sid as usize >> 4) + (*rwb.add(sid as usize >> 4) as u32 & ((2u32 << (sid & 15)) - 1)).count_ones() - 1;
-                    _mm_prefetch::<_MM_HINT_T0>(aggp.add(cell) as *const i8);
-                    *pc.add(j) = cell as u32;
-                    *ps.add(j) = sid;
-                    *pr.add(j) = row;
-                    *pw.add(j) = ((wv >> 4) & 0x1FFF_FFFF) as u32;
-                }
+                purch_scan(q, blkk, pl, aggp, nd, np);
                 for d in &digs[..ndig] {
                     let seg = digest_put(tid, &mut fx, d, q, sidx, sts, np);
                     if d.first {
@@ -1772,27 +2009,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                         info.last = seg;
                     }
                 }
-                let (mut prev_sid, mut cur_row, mut best) = (u32::MAX, u32::MAX, 0u64);
-                for j in 0..np {
-                    let w = *pw.add(j);
-                    let price = (w >> 5) as u64;
-                    let cat = w & 31;
-                    let sid = *ps.add(j);
-                    let cell = *pc.add(j) as usize;
-                    let row = *pr.add(j);
-                    (*aggp.add(cell))[0] += (sid != prev_sid) as u64;
-                    (*aggp.add(cell))[1] += price;
-                    prev_sid = sid;
-                    let v = std::hint::select_unpredictable(crow[cat as usize] == row, csum[cat as usize], 0) + price;
-                    csum[cat as usize] = v;
-                    crow[cat as usize] = row;
-                    best = std::hint::select_unpredictable(row != cur_row, 0, best);
-                    cur_row = row;
-                    best = best.max(v << 5 | (31 - cat) as u64);
-                    let rv = *row_rev.add(row as usize) as u64 + price;
-                    *row_rev.add(row as usize) = rv.min(0x8000_0000) as u32;
-                    *row_cat.add(row as usize) = (31 - (best & 31)) as u8;
-                }
+                purch_add(q, pl, aggp, np);
             }
             xp.ph(7);
             {
@@ -1878,10 +2095,29 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
         }
         xp.done();
         slab_settle(&mut t.core);
-        for c in 0..=g.nc {
-            for d in 0..nd {
-                t.core.agg[c * nd + d][0] += *fx.cred.add(c * nd + d);
-                t.core.agg[c * nd + d][1] += (*fx.asst.add(c)).0[d];
+        if nd <= 16 && t.core.agg.len() >= (g.nc + 1) * nd {
+            let agg = t.core.agg.as_mut_ptr() as *mut u32;
+            let lo_i = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+            let hi_i = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+            let m_lo = ((1u64 << (2 * nd).min(16)) - 1) as u16;
+            let m_hi = ((1u64 << (2 * nd).max(16).min(32) - 16) - 1) as u16;
+            let m_cr = ((1u32 << nd) - 1) as u16;
+            for c in 0..=g.nc {
+                let cr = _mm512_maskz_loadu_epi32(m_cr, fx.cred.add(c * nd) as *const _);
+                let a = _mm512_load_si512(fx.asst.add(c) as *const _);
+                let p = agg.add(2 * c * nd);
+                _mm512_mask_storeu_epi32(p as *mut _, m_lo, _mm512_add_epi32(_mm512_maskz_loadu_epi32(m_lo, p as *const _), _mm512_permutex2var_epi32(cr, lo_i, a)));
+                if m_hi != 0 {
+                    let p = p.add(16);
+                    _mm512_mask_storeu_epi32(p as *mut _, m_hi, _mm512_add_epi32(_mm512_maskz_loadu_epi32(m_hi, p as *const _), _mm512_permutex2var_epi32(cr, hi_i, a)));
+                }
+            }
+        } else {
+            for c in 0..=g.nc {
+                for d in 0..nd {
+                    t.core.agg[c * nd + d][0] += *fx.cred.add(c * nd + d);
+                    t.core.agg[c * nd + d][1] += (*fx.asst.add(c)).0[d];
+                }
             }
         }
     }

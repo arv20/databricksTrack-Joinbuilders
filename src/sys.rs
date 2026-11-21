@@ -921,10 +921,12 @@ pub unsafe extern "C" fn memset(d: *mut std::ffi::c_void, c: i32, n: usize) -> *
     d as *mut std::ffi::c_void
 }
 
+#[inline(never)]
 pub fn mem_test() -> bool {
+    use z::nvq;
     let mut src = vec![0u8; 4096];
     for (i, b) in src.iter_mut().enumerate() {
-        *b = (i * 131 % 251) as u8 + 1;
+        *b = (nvq(i as u64) as usize * 131 % 251) as u8 + 1;
     }
     let mut ok = true;
     for n in 0..1100usize {
@@ -932,12 +934,14 @@ pub fn mem_test() -> bool {
             let mut d = vec![0u8; 1200 + 16];
             unsafe { memcpy(d.as_mut_ptr().add(off) as *mut _, src.as_ptr().add(3) as *const _, std::hint::black_box(n)) };
             for i in 0..d.len() {
+                let i = nvq(i as u64) as usize;
                 let want = if i >= off && i < off + n { src[3 + i - off] } else { 0 };
                 ok &= d[i] == want;
             }
             let mut d = vec![7u8; 1200 + 16];
             unsafe { memset(d.as_mut_ptr().add(off) as *mut _, 0x5A, std::hint::black_box(n)) };
             for i in 0..d.len() {
+                let i = nvq(i as u64) as usize;
                 ok &= d[i] == if i >= off && i < off + n { 0x5A } else { 7 };
             }
             for dir in 0..2 {
@@ -947,6 +951,7 @@ pub fn mem_test() -> bool {
                 unsafe { memmove(a.as_mut_ptr().add(d0) as *mut _, a.as_ptr().add(s0) as *const _, std::hint::black_box(n)) };
                 let mut e = r.clone();
                 for i in 0..n {
+                    let i = nvq(i as u64) as usize;
                     e[d0 + i] = r[s0 + i];
                 }
                 ok &= a == e;
@@ -954,4 +959,303 @@ pub fn mem_test() -> bool {
         }
     }
     ok
+}
+
+pub mod z {
+    use std::arch::x86_64::*;
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    pub struct Z(pub __m256i, pub __m256i);
+
+    #[inline(always)]
+    pub unsafe fn loadu<T>(p: *const T) -> Z {
+        let p = p as *const __m256i;
+        Z(yb(_mm256_loadu_si256(p)), yb(_mm256_loadu_si256(p.add(1))))
+    }
+    #[inline(always)]
+    pub unsafe fn load<T>(p: *const T) -> Z {
+        let p = p as *const __m256i;
+        Z(yb(_mm256_load_si256(p)), yb(_mm256_load_si256(p.add(1))))
+    }
+    #[inline(always)]
+    pub unsafe fn storeu<T>(p: *mut T, v: Z) {
+        let p = p as *mut __m256i;
+        _mm256_storeu_si256(p, yb(v.0));
+        _mm256_storeu_si256(p.add(1), yb(v.1));
+    }
+    #[inline(always)]
+    pub unsafe fn store<T>(p: *mut T, v: Z) {
+        let p = p as *mut __m256i;
+        _mm256_store_si256(p, yb(v.0));
+        _mm256_store_si256(p.add(1), yb(v.1));
+    }
+    #[inline(always)]
+    pub unsafe fn maskz_loadu_epi64<T>(m: u8, p: *const T) -> Z {
+        let p = p as *const i64;
+        Z(_mm256_maskz_loadu_epi64(m, p), _mm256_maskz_loadu_epi64(m >> 4, p.add(4)))
+    }
+    #[inline(always)]
+    pub unsafe fn maskz_loadu_epi32<T>(m: u16, p: *const T) -> Z {
+        let p = p as *const i32;
+        Z(_mm256_maskz_loadu_epi32(m as u8, p), _mm256_maskz_loadu_epi32((m >> 8) as u8, p.add(8)))
+    }
+    #[inline(always)]
+    pub unsafe fn mask_storeu_epi64<T>(p: *mut T, m: u8, v: Z) {
+        let p = p as *mut i64;
+        _mm256_mask_storeu_epi64(p, m, v.0);
+        _mm256_mask_storeu_epi64(p.add(4), m >> 4, v.1);
+    }
+    #[inline(always)]
+    pub unsafe fn compress_store_epi32(p: *mut u32, m: u16, v: Z) -> usize {
+        let n0 = (m as u8).count_ones() as usize;
+        _mm256_storeu_si256(p as *mut __m256i, _mm256_maskz_compress_epi32(m as u8, v.0));
+        _mm256_storeu_si256(p.add(n0) as *mut __m256i, _mm256_maskz_compress_epi32((m >> 8) as u8, v.1));
+        m.count_ones() as usize
+    }
+    #[inline(always)]
+    pub unsafe fn compress_store_epi64(p: *mut u64, m: u8, v: Z) -> usize {
+        let n0 = (m & 15).count_ones() as usize;
+        _mm256_storeu_si256(p as *mut __m256i, _mm256_maskz_compress_epi64(m, v.0));
+        _mm256_storeu_si256(p.add(n0) as *mut __m256i, _mm256_maskz_compress_epi64(m >> 4, v.1));
+        m.count_ones() as usize
+    }
+
+    #[inline(always)]
+    pub unsafe fn setzero() -> Z {
+        Z(_mm256_setzero_si256(), _mm256_setzero_si256())
+    }
+    #[inline(always)]
+    pub unsafe fn set1_epi32(x: i32) -> Z {
+        let v = _mm256_set1_epi32(x);
+        Z(v, v)
+    }
+    #[inline(always)]
+    pub unsafe fn set1_epi64(x: i64) -> Z {
+        let v = _mm256_set1_epi64x(x);
+        Z(v, v)
+    }
+    #[inline(always)]
+    pub unsafe fn setr_epi64(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64, h: i64) -> Z {
+        Z(_mm256_setr_epi64x(a, b, c, d), _mm256_setr_epi64x(e, f, g, h))
+    }
+    #[inline(always)]
+    pub unsafe fn iota_epi32() -> Z {
+        Z(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15))
+    }
+    #[inline(always)]
+    pub unsafe fn iota_epi64() -> Z {
+        setr_epi64(0, 1, 2, 3, 4, 5, 6, 7)
+    }
+
+    macro_rules! bin {
+        ($($name:ident = $f:ident;)*) => {$(
+            #[inline(always)]
+            pub unsafe fn $name(a: Z, b: Z) -> Z {
+                Z($f(a.0, b.0), $f(a.1, b.1))
+            }
+        )*};
+    }
+    bin! {
+        and = _mm256_and_si256;
+        or = _mm256_or_si256;
+        xor = _mm256_xor_si256;
+        andnot = _mm256_andnot_si256;
+        add_epi32 = _mm256_add_epi32;
+        sub_epi32 = _mm256_sub_epi32;
+        add_epi64 = _mm256_add_epi64;
+        sub_epi64 = _mm256_sub_epi64;
+        sllv_epi32 = _mm256_sllv_epi32;
+        sllv_epi64 = _mm256_sllv_epi64;
+        mullo_epi64 = _mm256_mullo_epi64;
+        mul_epu32 = _mm256_mul_epu32;
+        min_epu64 = _mm256_min_epu64;
+        max_epu64 = _mm256_max_epu64;
+    }
+    #[inline(always)]
+    pub unsafe fn srli_epi64<const N: i32>(a: Z) -> Z {
+        Z(_mm256_srli_epi64::<N>(a.0), _mm256_srli_epi64::<N>(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn slli_epi64<const N: i32>(a: Z) -> Z {
+        Z(_mm256_slli_epi64::<N>(a.0), _mm256_slli_epi64::<N>(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn srli_epi32<const N: i32>(a: Z) -> Z {
+        Z(_mm256_srli_epi32::<N>(a.0), _mm256_srli_epi32::<N>(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn slli_epi32<const N: i32>(a: Z) -> Z {
+        Z(_mm256_slli_epi32::<N>(a.0), _mm256_slli_epi32::<N>(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn lzcnt_epi64(a: Z) -> Z {
+        Z(_mm256_lzcnt_epi64(a.0), _mm256_lzcnt_epi64(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn ternarylogic_epi64<const I: i32>(a: Z, b: Z, c: Z) -> Z {
+        Z(_mm256_ternarylogic_epi64::<I>(a.0, b.0, c.0), _mm256_ternarylogic_epi64::<I>(a.1, b.1, c.1))
+    }
+
+    #[inline(always)]
+    pub fn kb(mut m: u8) -> u8 {
+        unsafe { std::arch::asm!("/* {0} */", inout(kreg) m, options(pure, nomem, nostack, preserves_flags)) };
+        m
+    }
+    #[inline(always)]
+    pub fn nv<T>(x: T) -> T {
+        let mut v = std::mem::MaybeUninit::<T>::new(x);
+        unsafe { std::arch::asm!("/* {0} */", in(reg) v.as_mut_ptr(), options(nostack, preserves_flags)) };
+        unsafe { v.assume_init() }
+    }
+    #[inline(always)]
+    pub fn nvq(mut x: u64) -> u64 {
+        unsafe { std::arch::asm!("/* {0} */", inout(reg) x, options(pure, nomem, nostack, preserves_flags)) };
+        x
+    }
+    #[inline(always)]
+    pub fn yb(mut v: __m256i) -> __m256i {
+        unsafe { std::arch::asm!("/* {0} */", inout(ymm_reg) v, options(pure, nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn m64(lo: u8, hi: u8) -> u8 {
+        let o: u8;
+        unsafe { std::arch::asm!("kshiftlb {t}, {h}, 4", "korb {o}, {t}, {l}", h = in(kreg) hi, l = in(kreg) lo, t = out(kreg) _, o = lateout(kreg) o, options(pure, nomem, nostack, preserves_flags)) };
+        o
+    }
+    #[inline(always)]
+    pub fn m32(lo: u8, hi: u8) -> u16 {
+        let o: u16;
+        unsafe { std::arch::asm!("kunpckbw {o}, {h}, {l}", h = in(kreg) hi, l = in(kreg) lo, o = lateout(kreg) o, options(pure, nomem, nostack, preserves_flags)) };
+        o
+    }
+    macro_rules! cmp64 {
+        ($($name:ident = $f:ident;)*) => {$(
+            #[inline(always)]
+            pub unsafe fn $name(a: Z, b: Z) -> u8 {
+                m64($f(a.0, b.0), $f(a.1, b.1))
+            }
+        )*};
+    }
+    macro_rules! cmp32 {
+        ($($name:ident = $f:ident;)*) => {$(
+            #[inline(always)]
+            pub unsafe fn $name(a: Z, b: Z) -> u16 {
+                m32($f(a.0, b.0), $f(a.1, b.1))
+            }
+        )*};
+    }
+    cmp64! {
+        test_epi64_mask = _mm256_test_epi64_mask;
+        testn_epi64_mask = _mm256_testn_epi64_mask;
+        cmpgt_epu64_mask = _mm256_cmpgt_epu64_mask;
+        cmplt_epu64_mask = _mm256_cmplt_epu64_mask;
+        cmpge_epu64_mask = _mm256_cmpge_epu64_mask;
+        cmpneq_epu64_mask = _mm256_cmpneq_epu64_mask;
+    }
+    cmp32! {
+        test_epi32_mask = _mm256_test_epi32_mask;
+        cmpgt_epu32_mask = _mm256_cmpgt_epu32_mask;
+        cmplt_epu32_mask = _mm256_cmplt_epu32_mask;
+        cmple_epu32_mask = _mm256_cmple_epu32_mask;
+        cmpge_epu32_mask = _mm256_cmpge_epu32_mask;
+        cmpeq_epi32_mask = _mm256_cmpeq_epi32_mask;
+        cmpneq_epi32_mask = _mm256_cmpneq_epi32_mask;
+    }
+    #[inline(always)]
+    pub unsafe fn mask_cmpneq_epu64_mask(k: u8, a: Z, b: Z) -> u8 {
+        m64(_mm256_mask_cmpneq_epu64_mask(k, a.0, b.0), _mm256_mask_cmpneq_epu64_mask(k >> 4, a.1, b.1))
+    }
+    #[inline(always)]
+    pub unsafe fn movepi64_mask(a: Z) -> u8 {
+        m64(_mm256_movepi64_mask(a.0), _mm256_movepi64_mask(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn movepi32_mask(a: Z) -> u16 {
+        m32(_mm256_movepi32_mask(a.0), _mm256_movepi32_mask(a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn mask_mov_epi64(src: Z, k: u8, a: Z) -> Z {
+        Z(_mm256_mask_mov_epi64(src.0, k, a.0), _mm256_mask_mov_epi64(src.1, k >> 4, a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn mask_mov_epi32(src: Z, k: u16, a: Z) -> Z {
+        Z(_mm256_mask_mov_epi32(src.0, k as u8, a.0), _mm256_mask_mov_epi32(src.1, (k >> 8) as u8, a.1))
+    }
+    #[inline(always)]
+    pub unsafe fn mask_or_epi64(src: Z, k: u8, a: Z, b: Z) -> Z {
+        Z(_mm256_mask_or_epi64(src.0, k, a.0, b.0), _mm256_mask_or_epi64(src.1, k >> 4, a.1, b.1))
+    }
+    #[inline(always)]
+    pub unsafe fn mask_or_epi32(src: Z, k: u16, a: Z, b: Z) -> Z {
+        Z(_mm256_mask_or_epi32(src.0, k as u8, a.0, b.0), _mm256_mask_or_epi32(src.1, (k >> 8) as u8, a.1, b.1))
+    }
+    #[inline(always)]
+    pub unsafe fn mask_add_epi64(src: Z, k: u8, a: Z, b: Z) -> Z {
+        Z(_mm256_mask_add_epi64(src.0, k, a.0, b.0), _mm256_mask_add_epi64(src.1, k >> 4, a.1, b.1))
+    }
+
+    #[inline(always)]
+    pub unsafe fn permutexvar_epi64(idx: Z, a: Z) -> Z {
+        Z(_mm256_permutex2var_epi64(a.0, idx.0, a.1), _mm256_permutex2var_epi64(a.0, idx.1, a.1))
+    }
+    #[inline(always)]
+    unsafe fn p2v64(a: Z, x: __m256i, b: Z) -> __m256i {
+        let ta = _mm256_permutex2var_epi64(a.0, x, a.1);
+        let tb = _mm256_permutex2var_epi64(b.0, x, b.1);
+        _mm256_mask_blend_epi64(_mm256_test_epi64_mask(x, _mm256_set1_epi64x(8)), ta, tb)
+    }
+    #[inline(always)]
+    pub unsafe fn permutex2var_epi64(a: Z, idx: Z, b: Z) -> Z {
+        Z(p2v64(a, idx.0, b), p2v64(a, idx.1, b))
+    }
+    #[inline(always)]
+    pub unsafe fn even_epi64(a: Z, b: Z) -> Z {
+        Z(ev4(a.0, a.1), ev4(b.0, b.1))
+    }
+    #[inline(always)]
+    pub unsafe fn odd_epi64(a: Z, b: Z) -> Z {
+        Z(od4(a.0, a.1), od4(b.0, b.1))
+    }
+    #[inline(always)]
+    pub unsafe fn ev4(x: __m256i, y: __m256i) -> __m256i {
+        _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_unpacklo_epi64(x, y))
+    }
+    #[inline(always)]
+    pub unsafe fn od4(x: __m256i, y: __m256i) -> __m256i {
+        _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_unpackhi_epi64(x, y))
+    }
+    #[inline(always)]
+    pub unsafe fn prev_epi64(a: Z, b: Z) -> Z {
+        Z(_mm256_alignr_epi64::<3>(a.0, b.1), _mm256_alignr_epi64::<3>(a.1, a.0))
+    }
+    #[inline(always)]
+    pub unsafe fn prev_epi32(a: Z, b: Z) -> Z {
+        Z(_mm256_alignr_epi32::<7>(a.0, b.1), _mm256_alignr_epi32::<7>(a.1, a.0))
+    }
+    #[inline(always)]
+    pub unsafe fn cvtepi64_epi32(a: Z) -> __m256i {
+        _mm256_set_m128i(_mm256_cvtepi64_epi32(a.1), _mm256_cvtepi64_epi32(a.0))
+    }
+    #[inline(always)]
+    pub unsafe fn reduce_or_epi64(a: Z) -> u64 {
+        let v = _mm256_or_si256(a.0, a.1);
+        let x = _mm_or_si128(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        (_mm_cvtsi128_si64(x) | _mm_extract_epi64::<1>(x)) as u64
+    }
+    #[inline(always)]
+    pub unsafe fn mask_reduce_min_epu64(k: u8, a: Z) -> u64 {
+        let ones = _mm256_set1_epi64x(-1);
+        let v = _mm256_min_epu64(_mm256_mask_mov_epi64(ones, k, a.0), _mm256_mask_mov_epi64(ones, k >> 4, a.1));
+        let v = _mm256_min_epu64(v, _mm256_permute4x64_epi64::<0b01_00_11_10>(v));
+        let v = _mm256_min_epu64(v, _mm256_permute4x64_epi64::<0b00_00_00_01>(v));
+        _mm256_extract_epi64::<0>(v) as u64
+    }
+    #[inline(always)]
+    pub fn bit_positions(m: u32) -> u64 {
+        unsafe {
+            let sel = _pdep_u64(m as u64, 0x1111_1111_1111_1111) * 15;
+            _pext_u64(0xFEDC_BA98_7654_3210, sel)
+        }
+    }
 }
