@@ -120,6 +120,11 @@ impl<'a> LazyChunks<'a> {
             None => b.len(),
         }
     }
+    /// The raw byte range of chunk i (its lines start inside it).
+    fn raw(&self, i: usize) -> &'a [u8] {
+        let (f, s, e) = self.raw[i];
+        &self.bufs[f as usize][s..e]
+    }
     fn get(&self, i: usize) -> &'a [u8] {
         let (f, s, e) = self.raw[i];
         let b = self.bufs[f as usize];
@@ -148,25 +153,85 @@ fn pt_ordered<T: Send>(n: usize, init: impl Fn() -> T + Sync, f: impl Fn(T, usiz
     })
 }
 
-/// Read every input range into the page cache from its own threads, in the order the parse
-/// consumes them, with many requests in flight (cold-cache scorer). Returns the joiners.
-fn read_ahead(ranges: Vec<(&'static memmap2::Mmap, usize, usize)>) -> Vec<std::thread::JoinHandle<()>> {
-    let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
-    if threads == 0 || ranges.is_empty() {
-        return vec![];
-    }
-    let ranges: &'static [(&'static memmap2::Mmap, usize, usize)] = Box::leak(ranges.into_boxed_slice());
-    let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
-    (0..threads).map(|_| std::thread::spawn(move || loop {
-        let i = next.fetch_add(1, Relaxed);
-        let Some(&(m, off, len)) = ranges.get(i) else { break };
-        #[cfg(target_os = "linux")]
-        if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
-            let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+/// Cold-cache read-ahead: threads populate the page cache for 16 MiB ranges of the input
+/// mappings in the order the parse consumes them (links, events, clicks). Each range has a
+/// ready flag, so a parse worker that gets ahead waits for its range instead of faulting
+/// pages in one small read at a time. Flags only order work; correctness never depends on them.
+struct ReadAhead {
+    // per mapping (by address): start address, length, index of its first range
+    maps: Vec<(usize, usize, usize)>,
+    ready: Vec<std::sync::atomic::AtomicBool>,
+}
+
+const RA_PIECE: usize = 16 << 20;
+
+impl ReadAhead {
+    fn start(maps: Vec<&'static memmap2::Mmap>) -> &'static ReadAhead {
+        let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let mut table = vec![];
+        let mut ranges = vec![];
+        for m in &maps {
+            table.push((m.as_ptr() as usize, m.len(), ranges.len()));
+            let mut off = 0;
+            while off < m.len() {
+                ranges.push((*m, off, RA_PIECE.min(m.len() - off)));
+                off += RA_PIECE;
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
-    })).collect()
+        table.sort_unstable();
+        let on = threads > 0;
+        let ra: &'static ReadAhead = Box::leak(Box::new(ReadAhead {
+            maps: table,
+            ready: (0..ranges.len()).map(|_| std::sync::atomic::AtomicBool::new(!on)).collect(),
+        }));
+        if on {
+            let ranges: &'static [(&'static memmap2::Mmap, usize, usize)] = Box::leak(ranges.into_boxed_slice());
+            let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+            for _ in 0..threads {
+                std::thread::spawn(move || loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some(&(m, off, len)) = ranges.get(i) else { break };
+                    #[cfg(target_os = "linux")]
+                    if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
+                        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                    ra.ready[i].store(true, std::sync::atomic::Ordering::Release);
+                });
+            }
+        }
+        ra
+    }
+
+    /// Wait (briefly yielding) until the ranges under `b` have been read.
+    fn wait(&self, b: &[u8]) {
+        if b.is_empty() {
+            return;
+        }
+        let p = b.as_ptr() as usize;
+        let k = self.maps.partition_point(|m| m.0 <= p);
+        if k == 0 {
+            return;
+        }
+        let (start, len, first) = self.maps[k - 1];
+        if p >= start + len {
+            return;
+        }
+        let lo = (p - start) / RA_PIECE;
+        let hi = (p + b.len() - 1 - start).min(len - 1) / RA_PIECE;
+        for r in first + lo..=first + hi {
+            let mut spins = 0u32;
+            while !self.ready[r].load(std::sync::atomic::Ordering::Acquire) {
+                spins += 1;
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_micros(20));
+                }
+            }
+        }
+    }
 }
 
 /// Iterate lines of a chunk ('\n' only; a trailing '\n' does not start a new line).
@@ -1765,19 +1830,8 @@ fn fast(seed: u64) -> bool {
     let evm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&evf).into_boxed_slice());
     let ckm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&ckf).into_boxed_slice());
     let lkm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&lkf).into_boxed_slice());
-    let _io = {
-        const PIECE: usize = 4 << 20;
-        let mut ranges = vec![];
-        for m in lkm.iter().chain(evm.iter()).chain(ckm.iter()).flatten() {
-            let mut off = 0;
-            while off < m.len() {
-                let len = PIECE.min(m.len() - off);
-                ranges.push((m, off, len));
-                off += len;
-            }
-        }
-        read_ahead(ranges)
-    };
+    // Start the cold-cache read-ahead before anything else touches the inputs.
+    let ra = ReadAhead::start(lkm.iter().chain(evm.iter()).chain(ckm.iter()).flatten().collect());
     let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
     let evb = as_slices(evm);
     if evb.iter().any(|file| file.len() > u32::MAX as usize) {
@@ -1827,6 +1881,10 @@ fn fast(seed: u64) -> bool {
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1) / 12
     });
+    for b in &lkb {
+        ra.wait(b);
+    }
+    lap("  links read");
     let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed) else {
         return false;
     };
@@ -1849,6 +1907,7 @@ fn fast(seed: u64) -> bool {
     let folds: Vec<EventFold> = pt_ordered(ech.len(),
             || EventFold::new(shard_capacity),
             |mut acc, ci| {
+                ra.wait(ech.raw(ci));
                 let c = ech.get(ci);
                 let mut dates = Dates::default();
                 let mut batch = Vec::<ParsedEvent>::with_capacity(16);
@@ -1972,6 +2031,7 @@ fn fast(seed: u64) -> bool {
         cch.len(),
         || (0..P).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
         |mut acc, ci| {
+            ra.wait(cch.raw(ci));
             let chunk = cch.get(ci);
             let mut dates = Dates::default();
             let mut batch = Vec::with_capacity(16);
