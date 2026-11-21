@@ -65,9 +65,6 @@ fn populate_flag() -> i32 {
 pub fn populate(data: &[u8], s: usize, e: usize) {
     #[cfg(target_os = "linux")]
     unsafe {
-        if std::env::var_os("SS_NOPOP").is_some() {
-            return;
-        }
         let page = 4096usize;
         let a = (data.as_ptr() as usize + s) & !(page - 1);
         let b = data.as_ptr() as usize + e.min(data.len());
