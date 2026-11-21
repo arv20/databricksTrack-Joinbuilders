@@ -16,3 +16,6 @@ starter-duckdb/
 starter-polars/
 starter-pyspark/
 rust/target/
+
+# Local benchmark data, images logs and results
+work/
