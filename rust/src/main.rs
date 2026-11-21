@@ -133,6 +133,20 @@ fn fields<'a, const N: usize>(line: &'a [u8]) -> Option<[&'a [u8]; N]> {
     if k == N && !line.is_empty() { Some(out) } else { None }
 }
 
+// These rows already passed the full CSV validator. Only scan as far
+// as the field needed for attribution or for the output person name.
+#[inline]
+fn first_field(line: &[u8]) -> (&[u8], &[u8]) {
+    let end = memchr::memchr(b',', line).expect("validated row has a separator");
+    let field = &line[..end];
+    let value = if field.first() == Some(&b'"') {
+        &field[1..field.len() - 1]
+    } else {
+        field
+    };
+    (value, &line[end + 1..])
+}
+
 // A row ends at a newline regardless of quoting. Track separators with SIMD,
 // then check the endpoints of each field and account for every quote in the row.
 #[inline]
@@ -1447,7 +1461,8 @@ fn fast(seed: u64) -> bool {
     // user id hashes to the person's key, that id is the name (it is unlinked, or it is the
     // smallest id of its person), so the link table is only probed for other linked ids.
     let name_of = |person: PersonData, pk: u64, pc: u32| -> &[u8] {
-        let u = fields::<7>(person.line(&evb)).unwrap()[1];
+        let (_, rest) = first_field(person.line(&evb));
+        let (u, _) = first_field(rest);
         let (k, c) = hs(u, seed);
         if k == pk && c == pc {
             return u;
@@ -1636,7 +1651,7 @@ fn fast(seed: u64) -> bool {
         rc: RadixScratch<CkB>,
     }
     let ncat = cat_names.len();
-    let cid_of = |line: u64| -> &[u8] { fields::<4>(ck_lines.line(line)).unwrap()[0] };
+    let cid_of = |line: u64| -> &[u8] { first_field(ck_lines.line(line)).0 };
     let states: Vec<St> = pt((0..P).into_par_iter(),
             || St {
                 cd: vec![[0; 4]; ncs * ndays],
