@@ -29,14 +29,13 @@ pub enum Keys<'a> {
     U8(&'a [u8]),
     U16(&'a [u16]),
     U32(&'a [u32]),
-    U32Off(&'a [u32], u32),
 }
 impl<'a> Keys<'a> {
     pub fn len(&self) -> usize {
-        match self { Keys::U8(k) => k.len(), Keys::U16(k) => k.len(), Keys::U32(k) => k.len(), Keys::U32Off(k, _) => k.len() }
+        match self { Keys::U8(k) => k.len(), Keys::U16(k) => k.len(), Keys::U32(k) => k.len() }
     }
     fn slice(&self, a: usize, b: usize) -> Keys<'a> {
-        match self { Keys::U8(k) => Keys::U8(&k[a..b]), Keys::U16(k) => Keys::U16(&k[a..b]), Keys::U32(k) => Keys::U32(&k[a..b]), Keys::U32Off(k, o) => Keys::U32Off(&k[a..b], *o) }
+        match self { Keys::U8(k) => Keys::U8(&k[a..b]), Keys::U16(k) => Keys::U16(&k[a..b]), Keys::U32(k) => Keys::U32(&k[a..b]) }
     }
 }
 
@@ -88,11 +87,7 @@ impl Out {
     fn flush(&mut self) -> io::Result<()> {
         if let Some(f) = self.file.as_mut() {
             if !self.buf.is_empty() {
-                #[cfg(feature = "tl")]
-                let t0 = crate::sys::tl::now();
                 f.write_all(&self.buf)?;
-                #[cfg(feature = "tl")]
-                crate::sys::tl::WR_IO.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
                 self.flushed += self.buf.len() as u64;
                 self.buf.clear();
             }
@@ -406,10 +401,6 @@ fn plan(d: &Data) -> Plan {
             Keys::U8(k) => plan_dict_t(&dict, k, nullable, plain),
             Keys::U16(k) => plan_dict_t(&dict, k, nullable, plain),
             Keys::U32(k) => plan_dict_t(&dict, k, nullable, plain),
-            Keys::U32Off(k, _) => {
-                assert!(!nullable && !plain, "U32Off keys are required dictionary keys");
-                Plan::Dict { m: k.len(), vbytes: 0, w: bits_for(dict.len().saturating_sub(1) as u64) }
-            }
         },
     }
 }
@@ -425,21 +416,6 @@ fn slice_data<'a>(d: &Data<'a>, a: usize, b: usize) -> Data<'a> {
         Data::Str(s) => Data::Str(s.slice(a, b)),
         Data::Dict { dict, keys, nullable, plain } => Data::Dict { dict, keys: keys.slice(a, b), nullable, plain },
     }
-}
-fn narrow<'a>(d: Data<'a>) -> Data<'a> {
-    if let Data::Dict { dict, keys: Keys::U32Off(k, base), nullable, plain } = d {
-        if k.is_empty() {
-            return Data::Dict { dict: StrCol { offsets: &[], data: dict.data }, keys: Keys::U32Off(k, base), nullable, plain };
-        }
-        let (mut lo, mut hi) = (u32::MAX, 0u32);
-        for &x in k {
-            lo = lo.min(x);
-            hi = hi.max(x);
-        }
-        let (l, h) = ((lo - base) as usize, (hi - base) as usize);
-        return Data::Dict { dict: StrCol { offsets: &dict.offsets[l..h + 2], data: dict.data }, keys: Keys::U32Off(k, lo), nullable, plain };
-    }
-    d
 }
 fn ptype(d: &Data) -> i32 {
     match d { Data::I32(..) | Data::Date(..) => T_INT32, Data::I64(..) => T_INT64, _ => T_BYTE_ARRAY }
@@ -617,27 +593,6 @@ unsafe fn emit_dict_t<K: Key + PartialEq>(o: &mut Out, dict: &StrCol, keys: &[K]
     Ok(if use_dict { Some(data_off) } else { None })
 }
 
-unsafe fn emit_dict_off(o: &mut Out, dict: &StrCol, keys: &[u32], base: u32, m: usize, w: u32) -> io::Result<Option<u64>> {
-    let n = keys.len();
-    if m == 0 {
-        let data_off = o.pos();
-        let mut h = Vec::with_capacity(32);
-        page_header(&mut h, P_DATA, 0, n, E_PLAIN);
-        o.put(&h);
-        let _ = data_off;
-        return Ok(None);
-    }
-    emit_dict_page_strs(o, dict)?;
-    let data_off = o.pos();
-    let vals = 1 + hybrid_len(m, w);
-    let mut h = Vec::with_capacity(32);
-    page_header(&mut h, P_DATA, vals, n, E_RLE_DICT);
-    o.put(&h);
-    o.put(&[w as u8]);
-    emit_packed(o, n, w, |i| keys.get_unchecked(i).wrapping_sub(base))?;
-    Ok(Some(data_off))
-}
-
 fn int_dict_page(o: &mut Out, es: usize, card: usize, val: impl Fn(usize) -> i64) {
     let mut h = Vec::with_capacity(32);
     page_header(&mut h, P_DICT, card * es, card, E_PLAIN);
@@ -677,7 +632,6 @@ fn emit_chunk(o: &mut Out, d: &Data, p: &Plan) -> io::Result<Meta> {
                     Keys::U8(k) => emit_dict_t(o, dict, k, *nullable, *plain, *m, *vbytes, *w)?,
                     Keys::U16(k) => emit_dict_t(o, dict, k, *nullable, *plain, *m, *vbytes, *w)?,
                     Keys::U32(k) => emit_dict_t(o, dict, k, *nullable, *plain, *m, *vbytes, *w)?,
-                    Keys::U32Off(k, b) => emit_dict_off(o, dict, k, *b, *m, *w)?,
                 };
                 if let Some(off) = r { meta.dict = true; meta.dict_off = start; meta.data_off = off; }
             }
@@ -782,24 +736,14 @@ fn encode_into(o: &mut Out, cols: &[Column], opts: &Opts) -> io::Result<()> {
     let mut a = 0;
     while a < n {
         let b = if n - a > rpg { a + rpg } else { n };
-        let ds: Vec<Data> = cols.iter().map(|c| narrow(slice_data(&c.data, a, b))).collect();
-        #[cfg(feature = "tl")]
-        let tp = crate::sys::tl::now();
+        let ds: Vec<Data> = cols.iter().map(|c| slice_data(&c.data, a, b)).collect();
         let plans: Vec<Plan> = ds.iter().map(plan).collect();
-        #[cfg(feature = "tl")]
-        crate::sys::tl::WR_COL[7].fetch_add(crate::sys::tl::now() - tp, std::sync::atomic::Ordering::Relaxed);
         if o.file.is_none() {
             let bound: usize = ds.iter().zip(&plans).map(|(d, p)| chunk_bound(d, p)).sum();
             o.buf.reserve(bound + 512 + 160 * cols.len());
         }
         let mut metas = Vec::with_capacity(cols.len());
-        for (_j, (d, p)) in ds.iter().zip(&plans).enumerate() {
-            #[cfg(feature = "tl")]
-            let tp = crate::sys::tl::now();
-            metas.push(emit_chunk(o, d, p)?);
-            #[cfg(feature = "tl")]
-            crate::sys::tl::WR_COL[_j.min(6)].fetch_add(crate::sys::tl::now() - tp, std::sync::atomic::Ordering::Relaxed);
-        }
+        for (d, p) in ds.iter().zip(&plans) { metas.push(emit_chunk(o, d, p)?); }
         groups.push((b - a, metas));
         a = b;
     }
@@ -826,33 +770,14 @@ pub fn write_file(path: &Path, cols: &[Column], opts: &Opts, method: Method) -> 
     match method {
         Method::Whole => {
             let v = encode(cols, opts);
-            #[cfg(feature = "tl")]
-            let t0 = crate::sys::tl::now();
             let mut f = File::create(path)?;
-            #[cfg(feature = "tl")]
-            let t1 = crate::sys::tl::now();
             f.write_all(&v)?;
-            #[cfg(feature = "tl")]
-            {
-                crate::sys::tl::WR_OPEN.fetch_add(t1 - t0, std::sync::atomic::Ordering::Relaxed);
-                crate::sys::tl::WR_IO.fetch_add(crate::sys::tl::now() - t1, std::sync::atomic::Ordering::Relaxed);
-            }
             Ok(v.len() as u64)
         }
         Method::Stream(limit) => {
-            #[cfg(feature = "tl")]
-            let t0 = crate::sys::tl::now();
             let f = File::create(path)?;
-            #[cfg(feature = "tl")]
-            crate::sys::tl::WR_OPEN.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
             let mut o = Out { buf: Vec::with_capacity(limit + BLOCK * 64), flushed: 0, file: Some(f), limit };
             encode_into(&mut o, cols, opts)?;
-            #[cfg(feature = "tl")]
-            {
-                let t0 = crate::sys::tl::now();
-                drop(o.file.take());
-                crate::sys::tl::WR_CLOSE.fetch_add(crate::sys::tl::now() - t0, std::sync::atomic::Ordering::Relaxed);
-            }
             Ok(o.flushed)
         }
         Method::Mmap { populate } => {
