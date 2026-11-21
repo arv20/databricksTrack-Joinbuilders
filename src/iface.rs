@@ -55,14 +55,16 @@ pub fn ev_pp(kind: u8, product: u32, price: u32) -> u64 {
 pub const BATCH_ALIGN: usize = NB * 8;
 pub const SCRATCH: usize = 256;
 pub const SCRATCH_INIT: u64 = 0x2C2C_2C2C_2C2C_2C2C;
+pub const SCRATCH_ZERO: core::ops::Range<usize> = 2..4;
 
 #[repr(C, align(512))]
 pub struct EvBatch {
     pub ts: [i64; NB],
-    pub ing: [i64; NB],
     pub pp: [u64; NB],
     pub eid: [u64; NB],
     pub uid: [u64; NB],
+    pub ing: [i64; NB],
+    pub _pad: [u64; 8],
     pub scratch: [u64; SCRATCH],
     pub n: usize,
 }
@@ -80,6 +82,7 @@ impl EvBatch {
     pub fn new() -> Box<EvBatch> {
         let mut b: Box<EvBatch> = unsafe { Box::new(core::mem::zeroed()) };
         b.scratch = [SCRATCH_INIT; SCRATCH];
+        b.scratch[SCRATCH_ZERO].fill(0);
         b
     }
     #[inline(always)]
@@ -92,6 +95,7 @@ impl CkBatch {
     pub fn new() -> Box<CkBatch> {
         let mut b: Box<CkBatch> = unsafe { Box::new(core::mem::zeroed()) };
         b.scratch = [SCRATCH_INIT; SCRATCH];
+        b.scratch[SCRATCH_ZERO].fill(0);
         b
     }
     #[inline(always)]

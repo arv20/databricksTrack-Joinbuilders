@@ -457,6 +457,9 @@ pub fn recover_event_key(s: &Sample, user_key: u64, window_start: Option<i64>, s
 }
 
 pub fn recover_click_key(s: &Sample, user_key: u64, st: &mut Stats) -> Option<u64> {
+    recover_click_key_lim(s, user_key, 1 << 27, st)
+}
+pub fn recover_click_key_lim(s: &Sample, user_key: u64, limit: u64, st: &mut Stats) -> Option<u64> {
     let distinct = sorted_unique(s.clicks.iter().map(|r| r.id_x).collect());
     if distinct.len() < MIN_DISTINCT {
         return None;
@@ -464,7 +467,7 @@ pub fn recover_click_key(s: &Sample, user_key: u64, st: &mut Stats) -> Option<u6
     let rows = user_zero_rows(s.clicks.iter().map(|r| (r.id_x, r.user_x)), user_key);
     for &x1 in rows.iter().take(2) {
         let (x2, x3) = probes(&distinct, x1)?;
-        if let Some(k) = search_key(x1, 1 << 27, x2, x3, &distinct, &mut st.click_steps) {
+        if let Some(k) = search_key(x1, limit.min(1 << 27), x2, x3, &distinct, &mut st.click_steps) {
             return Some(k);
         }
     }

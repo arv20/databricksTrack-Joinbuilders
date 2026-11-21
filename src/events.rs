@@ -3,6 +3,8 @@ use crate::sys::*;
 use crate::*;
 use std::sync::atomic::Ordering;
 
+pub const UF_TAIL_IN_STAGE3: () = ();
+
 #[inline(always)]
 fn user_of(r: &Rec) -> u32 {
     ((r.w1 >> 37) & (ODDU - 1)) as u32
@@ -127,7 +129,6 @@ struct Pool {
     end: usize,
 }
 use std::sync::atomic::AtomicUsize;
-const RCH: usize = 256 << 10;
 impl Pool {
     fn new(g: &G) -> Pool {
         let used = g.us_arena.used() & !((2usize << 20) - 1);
@@ -135,57 +136,97 @@ impl Pool {
         let base = g.us_arena.alloc(0) as usize - g.us_arena.used();
         Pool { next: AtomicUsize::new(base), end: if on { base + used } else { base } }
     }
-    unsafe fn move_to(&self, dst: *mut u8, len: usize) -> bool {
-        if self.next.load(Ordering::Relaxed) + len > self.end {
-            return false;
-        }
-        let a = self.next.fetch_add(len, Ordering::Relaxed);
-        if a + len > self.end {
-            return false;
-        }
-        syscall(25, a as *mut u8, len, len, 3i32, dst) == dst as i64
-    }
-}
-struct Warm {
-    p: *mut u8,
-    got: usize,
-    dry: bool,
-    live: usize,
-}
-impl Warm {
-    fn new<T>(p: *mut T, live: usize) -> Warm {
-        Warm { p: p as *mut u8, got: 0, dry: false, live }
-    }
-    #[inline(always)]
-    unsafe fn need(&mut self, pool: &Pool, bytes: usize) {
-        if bytes > self.got && !self.dry {
-            self.grow(pool, bytes);
-        }
-    }
-    #[cold]
-    #[inline(never)]
-    unsafe fn grow(&mut self, pool: &Pool, bytes: usize) {
-        if self.got == 0 && self.live > RCH {
-            self.dry = true;
-            return;
-        }
-        while self.got < bytes {
-            let keep = if self.got == 0 { std::slice::from_raw_parts(self.p, self.live).to_vec() } else { Vec::new() };
-            if !pool.move_to(self.p.add(self.got), RCH) {
-                self.dry = true;
-                return;
+    fn take(&self, len: usize, align: usize) -> *mut u8 {
+        let mut a = self.next.load(Ordering::Relaxed);
+        loop {
+            let s = (a + align - 1) & !(align - 1);
+            if s + len > self.end {
+                return std::ptr::null_mut();
             }
-            std::ptr::copy_nonoverlapping(keep.as_ptr(), self.p, keep.len());
-            self.got += RCH;
+            match self.next.compare_exchange_weak(a, s + len, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return s as *mut u8,
+                Err(x) => a = x,
+            }
         }
     }
+    fn left(&self) -> usize {
+        self.end.saturating_sub(self.next.load(Ordering::Relaxed))
+    }
 }
-
-unsafe fn warm_zeroed(pool: &Pool, p: *mut u8, bytes: usize) {
-    let mut got = 0usize;
-    while got < bytes && pool.move_to(p.add(got), RCH) {
-        std::ptr::write_bytes(p.add(got), 0, RCH.min(bytes - got));
-        got += RCH;
+#[inline(always)]
+fn r4k(x: usize) -> usize {
+    (x + 4095) & !4095
+}
+#[derive(Clone, Copy)]
+struct Share {
+    dense: *mut u8,
+    hot: *mut u8,
+    agg: *mut u8,
+    aggp: *mut u8,
+    slab: *mut u8,
+    slab_len: usize,
+}
+unsafe impl Sync for Share {}
+fn fast_sizes(nc: usize, nd: usize) -> (usize, usize) {
+    let n = BSIZE + GUARD + 64;
+    let r64 = |x: usize| (x + 63) & !63;
+    let dense = r64(16 * (BSIZE + 16)) + r64(8 * n) + 8 * r64(4 * n);
+    let hot = r64(2 * (BSIZE / 8 + 2)) + 2 * r64(BSIZE / 8 + 8) + r64(4 * (BSIZE / 16 + 2)) + r64(2 * (BSIZE / 16 + 2)) + r64(4 * (BSIZE / 16 + 2)) + r64(2 * (BSIZE / 16 + 2)) + r64(8 * (CBOUND + 2)) + r64(64 * (nc + 2)) + r64(4 * (nc + 2) * nd) + r64(256 * RC_N) + 2 * r64(4 * (WL_CAP + WL_RUN + 64)) + r64(4 * (AL_CAP + 64));
+    (dense, hot)
+}
+fn slab_rows(len: usize) -> (usize, usize) {
+    let r = len.saturating_sub(8 * 4096 + 4096) * 5 / 131;
+    (r, r * 2 / 5)
+}
+unsafe fn slab_cols(core: &mut crate::core::Core, slab: *mut u8, len: usize) {
+    let (r, p) = slab_rows(len);
+    if slab.is_null() || r < 4096 {
+        return;
+    }
+    let mut at = slab;
+    let mut part = |bytes: usize| -> *mut u8 {
+        let q = at;
+        at = at.add(r4k(bytes));
+        q
+    };
+    core.keys.set_slab(part(4 * r) as *mut u32, r);
+    core.day.set_slab(part(4 * r) as *mut i32, r);
+    core.ses.set_slab(part(4 * r) as *mut i32, r);
+    core.evs.set_slab(part(4 * r) as *mut i32, r);
+    core.rev.set_slab(part(4 * r) as *mut i32, r);
+    core.cat.set_slab(part(r), r);
+    core.names.set_slab(part(9 * p + 64), 9 * p + 64);
+    core.names_off.set_slab(part(4 * (p + 1)) as *mut u32, p + 1);
+    if at as usize > slab as usize + len {
+        fallback("slab layout");
+    }
+}
+fn slab_full(core: &mut crate::core::Core) {
+    core.keys.slab_full();
+    core.day.slab_full();
+    core.ses.slab_full();
+    core.evs.slab_full();
+    core.rev.slab_full();
+    core.cat.slab_full();
+    core.names.slab_full();
+    core.names_off.slab_full();
+}
+fn slab_settle(core: &mut crate::core::Core) {
+    let tight = |len: usize, cap: usize| cap - len.min(cap) < len / 64 + 4096;
+    if core.day.in_slab() && tight(core.day.len(), core.day.cap()) {
+        let n = core.day.len();
+        core.keys.grow(n);
+        core.day.grow(n);
+        core.ses.grow(n);
+        core.evs.grow(n);
+        core.rev.grow(n);
+        core.cat.grow(n);
+    }
+    if core.names.in_slab() && tight(core.names.len(), core.names.cap()) {
+        core.names.grow(core.names.len());
+    }
+    if core.names_off.in_slab() && tight(core.names_off.len(), core.names_off.cap()) {
+        core.names_off.grow(core.names_off.len());
     }
 }
 
@@ -200,6 +241,9 @@ unsafe fn scatter_chunk(p: *const Rec, n: usize, slots: *mut Rec, gen: u64, next
             _mm_storeu_si128(s as *mut __m128i, _mm_add_epi64(_mm_loadu_si128(r as *const __m128i), gv));
         }
     };
+    if PF_CHUNK {
+        _mm_prefetch::<_MM_HINT_T0>(nextc.wrapping_add(crate::parse::LINK_OFF));
+    }
     let mut i = 0usize;
     while i + 4 <= n {
         if PF_CHUNK {
@@ -257,7 +301,6 @@ unsafe fn for_kept(slots: *const Rec, blkk: *const u16, keepm: *const u8, a: usi
 #[inline(never)]
 unsafe fn edge_copy_k(tid: usize, u: u32, fx: &mut Fast, a: usize, n: usize) -> Seg {
     let ed = &mut *fx.edge;
-    fx.w_edge.need(&*fx.pool, (ed.len + n).min(ed.cap) * 8 + 64);
     let (dst, seg) = ed.seg(tid, u, n);
     if n == 0 {
         return seg;
@@ -321,44 +364,145 @@ unsafe fn odd_records(t: &mut TState, slots: *const Rec, blk: usize, odd: u8) {
     }
 }
 
+const DIG: u32 = 1 << 31;
+static DIG_MIN: AtomicUsize = AtomicUsize::new(4096);
 #[derive(Clone, Copy)]
-struct Edge {
-    p: *mut u64,
-    len: usize,
-    cap: usize,
+struct DigRun {
+    first: bool,
+    user: u32,
+    a: usize,
+    e: usize,
+    s0: usize,
+    s1: usize,
 }
-static mut EDGE: [Edge; 64] = [Edge { p: std::ptr::null_mut(), len: 0, cap: 0 }; 64];
+
+struct Edge {
+    pieces: Vec<*mut u64>,
+    used: usize,
+    spare: usize,
+    pool: *const Pool,
+}
+const EP_BYTES: usize = 8 * EP_WORDS + 4096;
+const EP_WORDS: usize = 1 << 16;
+const _: () = assert!(BSIZE <= EP_WORDS);
+const EDGE0: Edge = Edge { pieces: Vec::new(), used: EP_WORDS, spare: 0, pool: std::ptr::null() };
+static mut EDGE: [Edge; 64] = [EDGE0; 64];
 impl Edge {
-    unsafe fn start(g: &G, tid: usize) -> *mut Edge {
+    unsafe fn start(tid: usize, pool: *const Pool) -> *mut Edge {
         if tid >= 64 {
             fallback("more than 64 threads");
         }
-        let cap = g.ev_bytes / 28 / g.nt * 2 + 65536;
         let e = std::ptr::addr_of_mut!(EDGE[tid]);
-        *e = Edge { p: anon(cap * 8 + 64) as *mut u64, len: 0, cap };
+        (*e).pool = pool;
         e
     }
     #[inline(always)]
     unsafe fn seg(&mut self, tid: usize, u: u32, n: usize) -> (*mut u64, Seg) {
-        if self.len + n > u32::MAX as usize {
+        if self.used + n > EP_WORDS {
+            self.piece(n);
+        }
+        let pi = self.pieces.len() - 1;
+        let seg = Seg { tid: tid as u32, off: (pi * EP_WORDS + self.used) as u32, len: n as u32, user: u };
+        let p = (*self.pieces.get_unchecked(pi)).add(self.used);
+        self.used += n;
+        (p, seg)
+    }
+    #[cold]
+    #[inline(never)]
+    unsafe fn piece(&mut self, n: usize) {
+        if n > EP_WORDS {
+            fallback("edge run over a piece");
+        }
+        if (self.pieces.len() + 1) * EP_WORDS > u32::MAX as usize {
             fallback("edge store over 4G records");
         }
-        if self.len + n > self.cap {
-            fallback("avec full");
+        if self.spare != 0 {
+            self.spare -= 1;
+            let p = (*self.pieces.last().unwrap() as *mut u8).add(8 * EP_WORDS);
+            self.pieces.push(p as *mut u64);
+        } else {
+            let mut p = if self.pool.is_null() { std::ptr::null_mut() } else { (*self.pool).take(EP_BYTES, 4096) };
+            if p.is_null() {
+                p = anon(2 << 20);
+                self.spare = ((2 << 20) - 4096) / (8 * EP_WORDS) - 1;
+            }
+            self.pieces.push(p as *mut u64);
         }
-        let seg = Seg { tid: tid as u32, off: self.len as u32, len: n as u32, user: u };
-        let p = self.p.add(self.len);
-        self.len += n;
-        (p, seg)
+        self.used = 0;
     }
 }
 #[inline(always)]
-unsafe fn seg_w0(s: &Seg) -> &'static [u64] {
-    let e = &*std::ptr::addr_of!(EDGE[s.tid as usize]);
-    if s.off as usize + s.len as usize > e.len {
+unsafe fn seg_words(s: &Seg, n: usize) -> &'static [u64] {
+    if s.tid >= 64 {
         fallback("edge segment");
     }
-    std::slice::from_raw_parts(e.p.add(s.off as usize), s.len as usize)
+    let e = &*std::ptr::addr_of!(EDGE[s.tid as usize]);
+    let (pi, at) = (s.off as usize / EP_WORDS, s.off as usize % EP_WORDS);
+    if pi >= e.pieces.len() || at + n > EP_WORDS || (pi + 1 == e.pieces.len() && at + n > e.used) {
+        fallback("edge segment");
+    }
+    std::slice::from_raw_parts(e.pieces[pi].add(at), n)
+}
+#[inline(always)]
+unsafe fn seg_w0(s: &Seg) -> &'static [u64] {
+    if s.len & DIG != 0 {
+        fallback("edge segment");
+    }
+    seg_words(s, s.len as usize)
+}
+
+#[inline(never)]
+unsafe fn digest_put(tid: usize, fx: &mut Fast, d: &DigRun, q: *const u64, sidx: *const u32, sts: *const u32, np: usize) -> Seg {
+    let ns = d.s1 - d.s0;
+    let (ps, pw) = (fx.p_sid as *const u32, fx.p_w as *const u32);
+    let mut pa = 0usize;
+    while pa < np && (*ps.add(pa) as usize) < d.s0 {
+        pa += 1;
+    }
+    let mut pb = pa;
+    while pb < np && (*ps.add(pb) as usize) < d.s1 {
+        pb += 1;
+    }
+    let words = 3 + 2 * ns + (pb - pa);
+    if words > EP_WORDS || ns == 0 {
+        fallback("digest size");
+    }
+    let ed = &mut *fx.edge;
+    let (p, mut seg) = ed.seg(tid, d.user, words);
+    seg.len = words as u32 | DIG;
+    *p = ns as u64 | ((pb - pa) as u64) << 32;
+    *p.add(1) = (d.e - d.a) as u64 | (1u64 << ((*q.add(d.a) >> 32) & 15)) << 32;
+    *p.add(2) = (*q.add(d.e - 1) & 0xFFFF_FFFF) | (*q.add(d.a) & 0xFFFF_FFFF) << 32;
+    let mut total = 0usize;
+    for i in 0..ns {
+        let s = d.s0 + i;
+        let (ra, rb) = ((*sidx.add(s) & M31) as usize, (*sidx.add(s + 1) & M31) as usize);
+        if rb <= ra || rb > d.e {
+            fallback("digest sessions");
+        }
+        total += rb - ra;
+        *p.add(3 + 2 * i) = *sts.add(s) as u64 | ((rb - ra) as u64) << 32;
+        *p.add(4 + 2 * i) = *q.add(rb - 1) & 0xFFFF_FFFF;
+    }
+    if total != d.e - d.a || (*sidx.add(d.s0) & M31) as usize != d.a {
+        fallback("digest sessions");
+    }
+    for j in pa..pb {
+        *p.add(3 + 2 * ns + (j - pa)) = ((*ps.add(j) as usize - d.s0) as u64) << 32 | *pw.add(j) as u64;
+    }
+    seg
+}
+#[inline(always)]
+unsafe fn digest_get(s: &Seg) -> (&'static [u64], &'static [u64], u64, u32, u64, u64) {
+    let w = seg_words(s, (s.len & !DIG) as usize);
+    if w.len() < 3 {
+        fallback("edge segment");
+    }
+    let (ns, np) = ((w[0] & 0xFFFF_FFFF) as usize, (w[0] >> 32) as usize);
+    if 3 + 2 * ns + np != w.len() || ns == 0 {
+        fallback("edge segment");
+    }
+    (&w[3..3 + 2 * ns], &w[3 + 2 * ns..], w[1] & 0xFFFF_FFFF, (w[1] >> 32) as u32, w[2] >> 32, w[2] & 0xFFFF_FFFF)
 }
 
 #[inline(always)]
@@ -373,7 +517,7 @@ unsafe fn edge_copy(e: *mut Edge, tid: usize, u: u32, recs: &[Rec]) -> Seg {
 fn stage3a_old(g: &G, tid: usize) {
     let t = g.t(tid);
     t.slots = vec![Rec { w0: u64::MAX, w1: u64::MAX }; BSIZE];
-    let ed = unsafe { Edge::start(g, tid) };
+    let ed = unsafe { Edge::start(tid, std::ptr::null()) };
     let slots = t.slots.as_mut_ptr();
     loop {
         let b = g.next.fetch_add(1, Ordering::Relaxed);
@@ -495,6 +639,7 @@ const GEN_MAX: u64 = {
     }
 };
 const PF_CHUNK: bool = true;
+const XRC: usize = crate::env_u32(option_env!("XL_XRC"), 4) as usize;
 const M31: u32 = 0x7FFF_FFFF;
 const FLAG: u32 = 0x8000_0000;
 const NONE: u32 = u32::MAX;
@@ -655,16 +800,7 @@ const POW36: [u64; 9] = [1, 36, 1296, 46_656, 1_679_616, 60_466_176, 2_176_782_3
 
 #[inline(always)]
 pub fn fast_name(ukey: u64, u: u32, class: u32) -> (u64, usize) {
-    let mut m = class;
-    let mut best = u64::MAX;
-    while m != 0 {
-        let a = m.trailing_zeros() as u64;
-        m &= m - 1;
-        let y = crate::keyrec::scramble((u as u64) << 9 | a, ukey);
-        let len = 1 + (y >= POW36[1]) as usize + (y >= POW36[2]) as usize + (y >= POW36[3]) as usize + (y >= POW36[4]) as usize + (y >= POW36[5]) as usize + (y >= POW36[6]) as usize + (y >= POW36[7]) as usize;
-        let key = (y * POW36[8 - len]) << 4 | len as u64;
-        best = best.min(key);
-    }
+    let best = name_key_scalar(ukey, u, class);
     if best == u64::MAX {
         return (u64::MAX, 0);
     }
@@ -677,6 +813,21 @@ pub fn fast_name(ukey: u64, u: u32, class: u32) -> (u64, usize) {
 }
 
 #[inline(always)]
+fn name_key_scalar(ukey: u64, u: u32, class: u32) -> u64 {
+    let mut m = class;
+    let mut best = u64::MAX;
+    while m != 0 {
+        let a = m.trailing_zeros() as u64;
+        m &= m - 1;
+        let y = crate::keyrec::scramble((u as u64) << 9 | a, ukey);
+        let len = 1 + (y >= POW36[1]) as usize + (y >= POW36[2]) as usize + (y >= POW36[3]) as usize + (y >= POW36[4]) as usize + (y >= POW36[5]) as usize + (y >= POW36[6]) as usize + (y >= POW36[7]) as usize;
+        let key = (y * POW36[8 - len]) << 4 | len as u64;
+        best = best.min(key);
+    }
+    best
+}
+
+#[inline(always)]
 fn key_chars(best: u64) -> (u64, usize) {
     let (norm, len) = (best >> 4, (best & 15) as usize);
     let hi = (norm / 1_679_616) as u32;
@@ -686,12 +837,43 @@ fn key_chars(best: u64) -> (u64, usize) {
     (le.swap_bytes() & (u64::MAX << (8 * (8 - len))), len)
 }
 
+const NAME_C: f64 = (1.0 / 1_679_616.0) * (1.0 - 1.0 / 1_099_511_627_776.0);
+
+#[inline(always)]
+unsafe fn key_chars4(best: __m256i) -> __m256i {
+    let norm = _mm256_srli_epi64::<4>(best);
+    let len = _mm256_and_si256(best, _mm256_set1_epi64x(15));
+    let d = _mm256_set1_epi64x(1_679_616);
+    let mut hi = _mm256_cvttpd_epu64(_mm256_mul_pd(_mm256_cvtepu64_pd(norm), _mm256_set1_pd(NAME_C)));
+    let mut lo = _mm256_sub_epi64(norm, mul32_256(hi, d));
+    let fix = _mm256_cmpge_epu64_mask(lo, d);
+    hi = _mm256_mask_add_epi64(hi, fix, hi, _mm256_set1_epi64x(1));
+    lo = _mm256_mask_sub_epi64(lo, fix, lo, d);
+    let m = _mm256_set1_epi64x(207_127);
+    let c1296 = _mm256_set1_epi64x(1296);
+    let h1 = _mm256_srli_epi64::<24>(mul32_256(_mm256_srli_epi64::<4>(hi), m));
+    let h0 = _mm256_sub_epi64(hi, mul32_256(h1, c1296));
+    let l1 = _mm256_srli_epi64::<24>(mul32_256(_mm256_srli_epi64::<4>(lo), m));
+    let l0 = _mm256_sub_epi64(lo, mul32_256(l1, c1296));
+    let p = _mm256_or_si256(_mm256_or_si256(h1, _mm256_slli_epi64::<16>(h0)), _mm256_or_si256(_mm256_slli_epi64::<32>(l1), _mm256_slli_epi64::<48>(l0)));
+    let d1 = _mm256_mulhi_epu16(p, _mm256_set1_epi16(1821));
+    let d0 = _mm256_sub_epi16(p, _mm256_mullo_epi16(d1, _mm256_set1_epi16(36)));
+    let dg = _mm256_or_si256(d1, _mm256_slli_epi16::<8>(d0));
+    let ch = _mm256_add_epi8(_mm256_add_epi8(dg, _mm256_set1_epi8(48)), _mm256_and_si256(_mm256_cmpgt_epi8(dg, _mm256_set1_epi8(9)), _mm256_set1_epi8(39)));
+    let sh = _mm256_sub_epi64(_mm256_set1_epi64x(64), _mm256_slli_epi64::<3>(len));
+    _mm256_and_si256(ch, _mm256_srlv_epi64(_mm256_set1_epi64x(-1), sh))
+}
+
 #[inline(always)]
 unsafe fn name_key4(ukey: u64, u: u32, al: __m256i) -> __m256i {
+    name_key4v(ukey, _mm256_or_si256(_mm256_set1_epi64x(((u as u64) << 9) as i64), al))
+}
+
+#[inline(always)]
+unsafe fn name_key4v(ukey: u64, v: __m256i) -> __m256i {
     use crate::keyrec::{A, B, MASK as M40};
     let one = _mm256_set1_epi64x(1);
     let m40 = _mm256_set1_epi64x(M40 as i64);
-    let v = _mm256_or_si256(_mm256_set1_epi64x(((u as u64) << 9) as i64), al);
     let mut m = _mm256_and_si256(_mm256_xor_si256(_mm256_mullo_epi64(v, _mm256_set1_epi64x(A as i64)), _mm256_set1_epi64x(ukey as i64)), m40);
     m = _mm256_xor_si256(m, _mm256_srli_epi64(m, 17));
     let y = _mm256_and_si256(_mm256_mullo_epi64(m, _mm256_set1_epi64x(B as i64)), m40);
@@ -791,6 +973,41 @@ fn name_selftest(g: &G) {
         if want != fast_name(key, u, class) || want != unsafe { fast_name_v(key, u, class) } || want != unsafe { fast_name_y(key, u, class) } {
             bad(u, class);
         }
+        let b = name_key_scalar(key, u, class);
+        let mut ch = [0u64; 4];
+        unsafe { _mm256_storeu_si256(ch.as_mut_ptr() as *mut __m256i, key_chars4(_mm256_set_epi64x(x as i64, (x >> 9) as i64, 0x10, b as i64))) };
+        if ch[0].to_le_bytes() != want.0.to_be_bytes() || (b & 15) as usize != want.1 {
+            bad(u, class);
+        }
+    }
+    for i in 0..3_000_000u64 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let lim = POW36[8];
+        let norm = match i % 4 {
+            0 => (x >> 20) % lim,
+            1 => (((x >> 20) % 1_679_616) * 1_679_616 + (i / 4) % 3).wrapping_sub(1) % lim,
+            2 => (((x >> 20) % (lim / 1296)) * 1296 + (i / 4) % 3).wrapping_sub(1) % lim,
+            _ => (lim - 1 - (i / 4) % 5000) >> ((x >> 50) % 42),
+        };
+        let mut ks = [0u64; 4];
+        for (j, k) in ks.iter_mut().enumerate() {
+            *k = (norm + j as u64 * 7) % lim << 4 | (1 + (i + j as u64) % 8);
+        }
+        let mut ch = [0u64; 4];
+        unsafe { _mm256_storeu_si256(ch.as_mut_ptr() as *mut __m256i, key_chars4(_mm256_loadu_si256(ks.as_ptr() as *const __m256i))) };
+        for j in 0..4 {
+            let (v, _) = key_chars(ks[j]);
+            if ch[j].to_le_bytes() != v.to_be_bytes() {
+                eprintln!("[v2b] CHECK FAILED: key_chars4({:#x})", ks[j]);
+                unsafe { crate::sys::_exit(5) }
+            }
+        }
+    }
+    for xx in 0..1_679_616u64 {
+        if ((xx >> 4) * 207_127) >> 24 != xx / 1296 || (xx < 1296 && (xx * 1821) >> 16 != xx / 36) {
+            eprintln!("[v2b] CHECK FAILED: digit division at {xx}");
+            unsafe { crate::sys::_exit(5) }
+        }
     }
     for y in 0..(1u64 << 22) {
         if (y * DIV_M) >> 39 != y / 84_375 {
@@ -822,6 +1039,15 @@ struct Fast {
     run_s0: *mut u32,
     run_row0: *mut u32,
     run_pidx: *mut u32,
+    plist: *mut u16,
+    p_cell: *mut u32,
+    p_sid: *mut u32,
+    p_row: *mut u32,
+    p_w: *mut u32,
+    nm_v: *mut u64,
+    nm_k: *mut u64,
+    nm_r: *mut u32,
+    nm_best: *mut u64,
     mix: Vec<u32>,
     f: Vec<V16>,
     last: *mut u64,
@@ -832,9 +1058,7 @@ struct Fast {
     wl_s: *mut u32,
     wl_r: *mut u32,
     alist: *mut u32,
-    pool: *const Pool,
     edge: *mut Edge,
-    w_edge: Warm,
 }
 
 #[repr(C, align(64))]
@@ -886,24 +1110,22 @@ unsafe fn light_flush(fx: &mut Fast, nw: usize, org: u32) {
     }
 }
 impl Fast {
-    fn new(nc: usize, nd: usize, pool: &Pool) -> Fast {
+    fn new(nc: usize, nd: usize, sh: &Share) -> Fast {
         let n = BSIZE + GUARD + 64;
         let r64 = |x: usize| (x + 63) & !63;
-let dense = r64(16 * (BSIZE + 16)) + r64(8 * n) + 8 * r64(4 * n);
-        let sparse = r64(2 * (BSIZE / 8 + 2)) + 2 * r64(BSIZE / 8 + 8) + r64(4 * (BSIZE / 16 + 2)) + r64(2 * (BSIZE / 16 + 2)) + r64(n) + r64(4 * (BSIZE / 16 + 2)) + r64(2 * (BSIZE / 16 + 2)) + 3 * r64(4 * n) + r64(8 * (CBOUND + 2)) + r64(64 * (nc + 2)) + r64(4 * (nc + 2) * nd) + r64(256 * RC_N) + 2 * r64(4 * (WL_CAP + WL_RUN + 64)) + r64(4 * (AL_CAP + 64));
+        let (dense, hot) = fast_sizes(nc, nd);
+        let cold = r64(n) + 3 * r64(4 * n) + r64(2 * (BSIZE + 64)) + 4 * r64(4 * BSIZE) + 2 * r64(8 * (8 * n + 16)) + r64(4 * (8 * n + 16)) + r64(8 * n);
         unsafe {
-            let hp = anon(dense);
-            if dense <= 2 << 20 && pool.move_to(hp, 2 << 20) {
-                std::ptr::write_bytes(hp, 0, r64(16 * (BSIZE + 16)));
-            }
-            let sp = anon(sparse);
-            madvise(sp, sparse, MADV_NOHUGEPAGE);
-            let hot = r64(2 * (BSIZE / 8 + 2)) + 2 * r64(BSIZE / 8 + 8) + r64(4 * (BSIZE / 16 + 2)) + r64(2 * (BSIZE / 16 + 2)) + r64(4 * (BSIZE / 16 + 2)) + r64(2 * (BSIZE / 16 + 2)) + r64(8 * (CBOUND + 2)) + r64(64 * (nc + 2)) + r64(4 * (nc + 2) * nd) + r64(256 * RC_N) + 2 * r64(4 * (WL_CAP + WL_RUN + 64)) + r64(4 * (AL_CAP + 64));
-            let mut warm = 0usize;
-            while warm < hot && pool.move_to(sp.add(warm), RCH) {
-                warm += RCH;
-            }
-            let (mut h, mut q) = (0usize, 0usize);
+            let hp = if sh.dense.is_null() {
+                anon(dense)
+            } else {
+                std::ptr::write_bytes(sh.dense, 0, r64(16 * (BSIZE + 16)));
+                sh.dense
+            };
+            let sp = anon(cold + if sh.hot.is_null() { r4k(hot) } else { 0 });
+            madvise(sp, cold + if sh.hot.is_null() { r4k(hot) } else { 0 }, MADV_NOHUGEPAGE);
+            let (ht, cd) = if sh.hot.is_null() { (sp, sp.add(r4k(hot))) } else { (sh.hot, sp) };
+            let (mut h, mut q, mut c) = (0usize, 0usize, 0usize);
             let take = |base: *mut u8, cur: &mut usize, bytes: usize| -> *mut u8 {
                 let p = base.add(*cur);
                 *cur += r64(bytes);
@@ -920,35 +1142,42 @@ let dense = r64(16 * (BSIZE + 16)) + r64(8 * n) + 8 * r64(4 * n);
                 row_s0: take(hp, &mut h, 4 * n) as *mut u32,
                 row_r0: take(hp, &mut h, 4 * n) as *mut u32,
                 row_rev: take(hp, &mut h, 4 * n) as *mut u32,
-                blkk: take(sp, &mut q, 2 * (BSIZE / 8 + 2)) as *mut u16,
-                keepm: take(sp, &mut q, BSIZE / 8 + 8),
-                pkm: take(sp, &mut q, BSIZE / 8 + 8),
-                blk_ns: take(sp, &mut q, 4 * (BSIZE / 16 + 2)) as *mut u32,
-                ssb: take(sp, &mut q, 2 * (BSIZE / 16 + 2)) as *mut u16,
-                blk_nrow: take(sp, &mut q, 4 * (BSIZE / 16 + 2)) as *mut u32,
-                rwb: take(sp, &mut q, 2 * (BSIZE / 16 + 2)) as *mut u16,
+                blkk: take(ht, &mut q, 2 * (BSIZE / 8 + 2)) as *mut u16,
+                keepm: take(ht, &mut q, BSIZE / 8 + 8),
+                pkm: take(ht, &mut q, BSIZE / 8 + 8),
+                blk_ns: take(ht, &mut q, 4 * (BSIZE / 16 + 2)) as *mut u32,
+                ssb: take(ht, &mut q, 2 * (BSIZE / 16 + 2)) as *mut u16,
+                blk_nrow: take(ht, &mut q, 4 * (BSIZE / 16 + 2)) as *mut u32,
+                rwb: take(ht, &mut q, 2 * (BSIZE / 16 + 2)) as *mut u16,
                 mix: Vec::new(),
                 f: vec![V16([0; 16]); 64],
-                last: take(sp, &mut q, 8 * (CBOUND + 2)) as *mut u64,
+                last: take(ht, &mut q, 8 * (CBOUND + 2)) as *mut u64,
                 serial: 0,
-                asst: take(sp, &mut q, 64 * (nc + 2)) as *mut V16,
-                cred: take(sp, &mut q, 4 * (nc + 2) * nd) as *mut u32,
-                rc: take(sp, &mut q, 256 * RC_N) as *mut Rc,
-                wl_s: take(sp, &mut q, 4 * (WL_CAP + WL_RUN + 64)) as *mut u32,
-                wl_r: take(sp, &mut q, 4 * (WL_CAP + WL_RUN + 64)) as *mut u32,
-                alist: take(sp, &mut q, 4 * (AL_CAP + 64)) as *mut u32,
-                row_cat: take(sp, &mut q, n),
-                run_s0: take(sp, &mut q, 4 * n) as *mut u32,
-                run_row0: take(sp, &mut q, 4 * n) as *mut u32,
-                run_pidx: take(sp, &mut q, 4 * n) as *mut u32,
-                pool,
+                asst: take(ht, &mut q, 64 * (nc + 2)) as *mut V16,
+                cred: take(ht, &mut q, 4 * (nc + 2) * nd) as *mut u32,
+                rc: take(ht, &mut q, 256 * RC_N) as *mut Rc,
+                wl_s: take(ht, &mut q, 4 * (WL_CAP + WL_RUN + 64)) as *mut u32,
+                wl_r: take(ht, &mut q, 4 * (WL_CAP + WL_RUN + 64)) as *mut u32,
+                alist: take(ht, &mut q, 4 * (AL_CAP + 64)) as *mut u32,
+                row_cat: take(cd, &mut c, n),
+                run_s0: take(cd, &mut c, 4 * n) as *mut u32,
+                run_row0: take(cd, &mut c, 4 * n) as *mut u32,
+                run_pidx: take(cd, &mut c, 4 * n) as *mut u32,
+                plist: take(cd, &mut c, 2 * (BSIZE + 64)) as *mut u16,
+                p_cell: take(cd, &mut c, 4 * BSIZE) as *mut u32,
+                p_sid: take(cd, &mut c, 4 * BSIZE) as *mut u32,
+                p_row: take(cd, &mut c, 4 * BSIZE) as *mut u32,
+                p_w: take(cd, &mut c, 4 * BSIZE) as *mut u32,
+                nm_v: take(cd, &mut c, 8 * (8 * n + 16)) as *mut u64,
+                nm_k: take(cd, &mut c, 8 * (8 * n + 16)) as *mut u64,
+                nm_r: take(cd, &mut c, 4 * (8 * n + 16)) as *mut u32,
+                nm_best: take(cd, &mut c, 8 * n) as *mut u64,
                 edge: std::ptr::null_mut(),
-                w_edge: Warm::new(std::ptr::null_mut::<u8>(), 0),
             };
-            if h > dense || q > sparse {
+            if h > dense || q > hot || c > cold {
                 fallback("scratch layout");
             }
-            if warm != 0 {
+            if !sh.hot.is_null() {
                 std::ptr::write_bytes(fx.last as *mut u8, 0, r64(8 * (CBOUND + 2)));
                 std::ptr::write_bytes(fx.asst as *mut u8, 0, r64(64 * (nc + 2)));
                 std::ptr::write_bytes(fx.cred as *mut u8, 0, r64(4 * (nc + 2) * nd));
@@ -956,6 +1185,48 @@ let dense = r64(16 * (BSIZE + 16)) + r64(8 * n) + 8 * r64(4 * n);
             fx
         }
     }
+}
+
+#[inline(never)]
+unsafe fn flush_names(fx: &Fast, core: &mut crate::core::Core, ukey: u64, row_cap: usize, np: &mut usize, na: &mut usize) {
+    let (pv, pk, pr, best) = (fx.nm_v, fx.nm_k, fx.nm_r, fx.nm_best);
+    let mut p = 0usize;
+    while p < *np {
+        _mm256_storeu_si256(pk.add(p) as *mut __m256i, name_key4v(ukey, _mm256_loadu_si256(pv.add(p) as *const __m256i)));
+        p += 4;
+    }
+    for p in 0..*np {
+        let b = best.add(*pr.add(p) as usize);
+        *b = (*b).min(*pk.add(p));
+    }
+    let mut a = 0usize;
+    while a < *na {
+        _mm256_storeu_si256(pk.add(a) as *mut __m256i, key_chars4(_mm256_loadu_si256(best.add(a) as *const __m256i)));
+        a += 4;
+    }
+    let mut nl = core.names.len();
+    core.names.reserve_total(nl + 9 * *na + 32);
+    core.names_off.reserve_total(core.names_off.len() + *na + 1);
+    let ncap = core.names.cap().min(row_cap * 10);
+    let names = core.names.as_mut_ptr();
+    for a in 0..*na {
+        if nl + 16 > ncap {
+            fallback("avec full");
+        }
+        let b = *best.add(a);
+        let (ch, len) = if b == u64::MAX { (u64::MAX, 0) } else { (*pk.add(a), (b & 15) as usize) };
+        let q = names.add(nl);
+        *q = b'u';
+        (q.add(1) as *mut u64).write_unaligned(ch);
+        nl += 1 + len;
+        if nl > u32::MAX as usize {
+            fallback("names over 4 GB");
+        }
+        core.names_off.push(nl as u32);
+    }
+    core.names.truncate(nl);
+    *np = 0;
+    *na = 0;
 }
 
 #[inline(never)]
@@ -999,6 +1270,10 @@ unsafe fn run_clicks(fx: &mut Fast, cks: &[[u64; 2]], class: u32, s0: usize, nsr
         }
         let t = (k0 >> 32) as u32;
         let c = ((k0 >> 4) & (CBOUND as u64 - 1)) as usize;
+        if XRC != 0 {
+            let cn = (((*kp.add(XRC - 1))[0] >> 4) & (CBOUND as u64 - 1)) as usize;
+            _mm_prefetch::<_MM_HINT_T0>(asst.add(cn) as *const i8);
+        }
         let tv = _mm512_set1_epi32(t as i32);
         let mut n = _mm512_cmple_epu32_mask(hiv, tv).count_ones() as usize;
         while n == 16 {
@@ -1125,25 +1400,23 @@ unsafe fn pass_b(q: *const u64, k: usize, utab: *const u16, sidx: *mut u32, sts:
     ns
 }
 
-fn stage3a(g: &G, tid: usize, pool: &Pool) {
+fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
     let t = g.t(tid);
-    let mut fx = Fast::new(g.nc, g.nd, pool);
+    let mut fx = Fast::new(g.nc, g.nd, sh);
     unsafe {
-        fx.edge = Edge::start(g, tid);
-        fx.w_edge = Warm::new((*fx.edge).p, 0);
+        fx.edge = Edge::start(tid, pool);
     }
     unsafe {
         let cells = t.core.agg.len();
-        if t.n_runs == 0 && t.n_complex == 0 && t.core.n_sess == 0 {
-            warm_zeroed(pool, t.core.agg.as_mut_ptr() as *mut u8, cells * 8);
-            warm_zeroed(pool, t.core.aggp.as_mut_ptr() as *mut u8, cells * 16);
+        if t.n_runs == 0 && t.n_complex == 0 && t.core.n_sess == 0 && !sh.agg.is_null() && !sh.aggp.is_null() {
+            std::ptr::write_bytes(sh.agg, 0, cells * 8);
+            std::ptr::write_bytes(sh.aggp, 0, cells * 16);
+            t.core.agg.set_ptr(sh.agg as *mut [u32; 2]);
+            t.core.aggp.set_ptr(sh.aggp as *mut [u64; 2]);
         }
         t.cx_raw.reserve(g.ev_bytes / 64 / g.nt / 16);
+        slab_cols(&mut t.core, sh.slab, sh.slab_len);
     }
-    let (mut w_names, mut w_noff) = (Warm::new(t.core.names.as_mut_ptr(), t.core.names.len()), Warm::new(t.core.names_off.as_mut_ptr(), 4 * t.core.names_off.len()));
-    let rows0 = t.core.day.len();
-    let mut w_cols = [Warm::new(t.core.keys.as_mut_ptr(), 4 * rows0), Warm::new(t.core.day.as_mut_ptr(), 4 * rows0), Warm::new(t.core.ses.as_mut_ptr(), 4 * rows0), Warm::new(t.core.evs.as_mut_ptr(), 4 * rows0), Warm::new(t.core.rev.as_mut_ptr(), 4 * rows0)];
-    let mut w_cat = Warm::new(t.core.cat.as_mut_ptr(), rows0);
     let mut xp = Xp::new();
     let nd = g.nd;
     let org = g.nc as u32;
@@ -1155,7 +1428,9 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
         let (sidx, sts, sday, scamp, blk_ns, ssb) = (fx.sidx, fx.sts, fx.sday, fx.scamp, fx.blk_ns, fx.ssb);
         let (row_day, row_s0, row_r0, row_rev, row_cat, blk_nrow, rwb) = (fx.row_day, fx.row_s0, fx.row_r0, fx.row_rev, fx.row_cat, fx.blk_nrow, fx.rwb);
         let (run_s0, run_row0, run_pidx) = (fx.run_s0, fx.run_row0, fx.run_pidx);
+        let (nm_v, nm_r, nm_best) = (fx.nm_v, fx.nm_r, fx.nm_best);
         let mut gen = 0u64;
+        let dig_min = DIG_MIN.load(Ordering::Relaxed);
         let ev_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
         let od_idx = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
         let iota8q = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
@@ -1285,17 +1560,11 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
             std::ptr::write_bytes(row_rev, 0, nrow);
             std::ptr::write_bytes(row_cat, 255, nrow);
             xp.ph(3);
-            w_names.need(pool, (t.core.names.len() + 9 * nrun + 32).min(row_cap * 10));
-            w_noff.need(pool, 4 * (t.core.names_off.len() + nrun + 1).min(row_cap + 1));
-            {
-                let rows = (t.core.day.len() + nrow + 16).min(row_cap);
-                for wc in w_cols.iter_mut() {
-                    wc.need(pool, 4 * rows);
-                }
-                w_cat.need(pool, rows);
-            }
             let (mut cw, mut cb) = (0usize, 0u64);
             let (mut nw, mut nrc) = (0usize, 0usize);
+            let mut digs = [DigRun { first: false, user: 0, a: 0, e: 0, s0: 0, s1: 0 }; 2];
+            let mut ndig = 0usize;
+            let (mut nm_np, mut nm_na) = (0usize, 0usize);
             let mut mixp = 0usize;
             let orgv = _mm512_set1_epi32(org as i32);
             let trashv = _mm512_set1_epi32(trash as i32);
@@ -1322,13 +1591,23 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
                         _mm512_storeu_si512(scamp.add(x) as *mut _, trashv);
                         x += 16;
                     }
-                    if r == 0 {
+                    let dig = edge && !special && tv & COMPLEX == 0 && e - a >= dig_min && 3 + 2 * (s1 - s0) + (e - a) <= EP_WORDS;
+                    if dig {
+                        digs[ndig] = DigRun { first: r == 0, user: u, a, e, s0, s1 };
+                        ndig += 1;
+                        if r == 0 {
+                            info.n = 1;
+                        } else {
+                            info.n = 2;
+                        }
+                    } else if r == 0 {
                         info.first = edge_copy_k(tid, u, &mut fx, a, e - a);
                         info.n = 1;
                     } else if r + 1 == nrun {
                         info.last = edge_copy_k(tid, u, &mut fx, a, e - a);
                         info.n = 2;
                     } else {
+                        flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut nm_np, &mut nm_na);
                         let mut buf = std::mem::take(&mut t.runbuf);
                         buf.clear();
                         for_kept(slots, blkk, keepm, a, e - a, |w0| buf.push(Rec { w0, w1: (u as u64) << 37 }));
@@ -1355,21 +1634,18 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
                 let class = if bit & mask != 0 { mask } else { bit };
                 if XD { xp.ph(10); }
                 let core = &mut t.core;
-                let nl = core.names.len();
-                if nl + 16 > row_cap * 10 {
-                    fallback("avec full");
+                let ncl = class.count_ones() as usize;
+                *nm_best.add(nm_na) = u64::MAX;
+                *run_pidx.add(r) = (core.names_off.len() - 1 + nm_na) as u32;
+                if ncl == 0 || ncl > 8 {
+                    *nm_best.add(nm_na) = name_key_scalar(g.ukey, u, class);
+                } else {
+                    let al = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(_mm512_maskz_compress_epi32(class as u16, iota16)));
+                    _mm512_storeu_si512(nm_v.add(nm_np) as *mut _, _mm512_or_si512(_mm512_set1_epi64(((u as u64) << 9) as i64), al));
+                    _mm256_storeu_si256(nm_r.add(nm_np) as *mut _, _mm256_set1_epi32(nm_na as i32));
+                    nm_np += ncl;
                 }
-                let (v, len) = fast_name_y(g.ukey, u, class);
-                let p = core.names.as_mut_ptr().add(nl);
-                *p = b'u';
-                (p.add(1) as *mut [u8; 8]).write_unaligned(v.to_be_bytes());
-                let nl = nl + 1 + len;
-                core.names.truncate(nl);
-                if nl > u32::MAX as usize {
-                    fallback("names over 4 GB");
-                }
-                *run_pidx.add(r) = (core.names_off.len() - 1) as u32;
-                core.names_off.push(nl as u32);
+                nm_na += 1;
                 core.n_sess += (s1 - s0) as u64;
                 if XD { xp.ph(11); }
                 let mut x = s0;
@@ -1432,6 +1708,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
                     if XD { xp.ph(13); }
                 }
             }
+            flush_names(&fx, &mut t.core, g.ukey, row_cap, &mut nm_np, &mut nm_na);
             xp.ph(4);
             light_flush(&mut fx, nw, org);
             claim_word(g, cw, cb);
@@ -1448,38 +1725,73 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
                 let aggp = t.core.aggp.as_mut_ptr();
                 let mut csum = [0u64; 32];
                 let mut crow = [u32::MAX; 32];
-                let (mut prev_sid, mut cur_row, mut best_val, mut best_cat) = (u32::MAX, u32::MAX, 0u64, 255u32);
+                let pl = fx.plist;
+                let mut np = 0usize;
                 for wd in 0..BSIZE / 64 {
-                  let mut pm = (pkm.add(8 * wd) as *const u64).read_unaligned();
-                  while pm != 0 {
-                    let sl = 64 * wd + pm.trailing_zeros() as usize;
-                    pm &= pm - 1;
+                    let mut pm = (pkm.add(8 * wd) as *const u64).read_unaligned();
+                    let n = pm.count_ones() as usize;
+                    let base = (64 * wd) as u32;
+                    *pl.add(np) = (base + pm.trailing_zeros()) as u16;
+                    pm &= pm.wrapping_sub(1);
+                    *pl.add(np + 1) = (base + pm.trailing_zeros()) as u16;
+                    pm &= pm.wrapping_sub(1);
+                    *pl.add(np + 2) = (base + pm.trailing_zeros()) as u16;
+                    pm &= pm.wrapping_sub(1);
+                    *pl.add(np + 3) = (base + pm.trailing_zeros()) as u16;
+                    pm &= pm.wrapping_sub(1);
+                    if n > 4 {
+                        let mut j = np + 4;
+                        while pm != 0 {
+                            *pl.add(j) = (base + pm.trailing_zeros()) as u16;
+                            pm &= pm - 1;
+                            j += 1;
+                        }
+                    }
+                    _mm_prefetch::<_MM_HINT_T0>(slots.add(*pl.add(np) as usize) as *const i8);
+                    np += n;
+                }
+                let (pc, ps, pr, pw) = (fx.p_cell, fx.p_sid, fx.p_row, fx.p_w);
+                for j in 0..np {
+                    let sl = *pl.add(j) as usize;
                     let wv = (*slots.add(sl)).w0;
                     let i = *blkk.add(sl >> 3) as usize + (*keepm.add(sl >> 3) as u32 & ((1u32 << (sl & 7)) - 1)).count_ones() as usize;
-                    let price = (wv >> 9) & 0xFF_FFFF;
-                    let cat = ((wv >> 4) & 31) as u32;
                     let sid = *blk_ns.add(i >> 4) + (*ssb.add(i >> 4) as u32 & ((2u32 << (i & 15)) - 1)).count_ones() - 1;
                     let cell = *scamp.add(sid as usize) as usize * nd + *sday.add(sid as usize) as usize;
+                    let row = *blk_nrow.add(sid as usize >> 4) + (*rwb.add(sid as usize >> 4) as u32 & ((2u32 << (sid & 15)) - 1)).count_ones() - 1;
+                    _mm_prefetch::<_MM_HINT_T0>(aggp.add(cell) as *const i8);
+                    *pc.add(j) = cell as u32;
+                    *ps.add(j) = sid;
+                    *pr.add(j) = row;
+                    *pw.add(j) = ((wv >> 4) & 0x1FFF_FFFF) as u32;
+                }
+                for d in &digs[..ndig] {
+                    let seg = digest_put(tid, &mut fx, d, q, sidx, sts, np);
+                    if d.first {
+                        info.first = seg;
+                    } else {
+                        info.last = seg;
+                    }
+                }
+                let (mut prev_sid, mut cur_row, mut best) = (u32::MAX, u32::MAX, 0u64);
+                for j in 0..np {
+                    let w = *pw.add(j);
+                    let price = (w >> 5) as u64;
+                    let cat = w & 31;
+                    let sid = *ps.add(j);
+                    let cell = *pc.add(j) as usize;
+                    let row = *pr.add(j);
                     (*aggp.add(cell))[0] += (sid != prev_sid) as u64;
                     (*aggp.add(cell))[1] += price;
                     prev_sid = sid;
-                    let row = *blk_nrow.add(sid as usize >> 4) + (*rwb.add(sid as usize >> 4) as u32 & ((2u32 << (sid & 15)) - 1)).count_ones() - 1;
-                    let v = if crow[cat as usize] == row { csum[cat as usize] } else { 0 } + price;
+                    let v = std::hint::select_unpredictable(crow[cat as usize] == row, csum[cat as usize], 0) + price;
                     csum[cat as usize] = v;
                     crow[cat as usize] = row;
-                    if row != cur_row {
-                        best_val = 0;
-                        best_cat = 255;
-                    }
+                    best = std::hint::select_unpredictable(row != cur_row, 0, best);
                     cur_row = row;
-                    if v > best_val || (v == best_val && cat < best_cat) {
-                        best_val = v;
-                        best_cat = cat;
-                    }
+                    best = best.max(v << 5 | (31 - cat) as u64);
                     let rv = *row_rev.add(row as usize) as u64 + price;
                     *row_rev.add(row as usize) = rv.min(0x8000_0000) as u32;
-                    *row_cat.add(row as usize) = best_cat as u8;
-                  }
+                    *row_cat.add(row as usize) = (31 - (best & 31)) as u8;
                 }
             }
             xp.ph(7);
@@ -1489,6 +1801,13 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
                 if core.keys.len() != n || core.ses.len() != n || core.evs.len() != n || core.rev.len() != n || core.cat.len() != n {
                     fallback("row columns differ in length");
                 }
+                core.keys.reserve_total(n + nrow + 16);
+                core.day.reserve_total(n + nrow + 16);
+                core.ses.reserve_total(n + nrow + 16);
+                core.evs.reserve_total(n + nrow + 16);
+                core.rev.reserve_total(n + nrow + 16);
+                core.cat.reserve_total(n + nrow + 16);
+                let row_cap = row_cap.min(core.keys.cap()).min(core.day.cap()).min(core.ses.cap()).min(core.evs.cap()).min(core.rev.cap()).min(core.cat.cap());
                 let (keys, dayc, sesc, evsc, revc, catc) = (core.keys.as_mut_ptr(), core.day.as_mut_ptr(), core.ses.as_mut_ptr(), core.evs.as_mut_ptr(), core.rev.as_mut_ptr(), core.cat.as_mut_ptr());
                 let day0 = _mm512_set1_epi32(g.day0);
                 let m31v = _mm512_set1_epi32(M31 as i32);
@@ -1558,6 +1877,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
             t.prof[2] += (td - tc).as_nanos() as u64;
         }
         xp.done();
+        slab_settle(&mut t.core);
         for c in 0..=g.nc {
             for d in 0..nd {
                 t.core.agg[c * nd + d][0] += *fx.cred.add(c * nd + d);
@@ -1569,11 +1889,15 @@ fn stage3a(g: &G, tid: usize, pool: &Pool) {
 
 fn stage3b(g: &G, tid: usize) {
     let t = g.t(tid);
-    g.ev_arena.release_part(tid, g.nt);
+    let mut released = false;
     loop {
         let i = g.next.fetch_add(1, Ordering::Relaxed);
         if i >= g.joined.len() {
             break;
+        }
+        if i >= g.nt && !released {
+            g.ev_arena.release_part(tid, g.nt);
+            released = true;
         }
         let segs = &g.joined[i];
         let u = segs[0].user;
@@ -1582,20 +1906,45 @@ fn stage3b(g: &G, tid: usize) {
             let seg = |s: &Seg| seg_w0(s);
             if tv & COMPLEX == 0 {
                 let extra: &[u64] = if tv & EXTRA != 0 { &g.extra[&u] } else { &[] };
-                let first = seg(&segs[0])[0];
+                let first = if segs[0].len & DIG != 0 { digest_get(&segs[0]).4 << 33 } else { seg(&segs[0])[0] };
                 let mut st = t.core.begin(if !extra.is_empty() && extra[0] < first { extra[0] } else { first });
                 let (mut bits, mut prev, mut sorted, mut n, mut xi) = (0u32, 0u64, true, 0u64, 0usize);
+                let mut has_dig = false;
                 for s in segs {
-                    for &w0 in seg(s) {
-                        while xi < extra.len() && extra[xi] < w0 {
-                            bits |= 1 << (extra[xi] & 15);
-                            t.core.feed(&mut st, extra[xi]);
-                            xi += 1;
+                    if s.len & DIG != 0 {
+                        let (se, pu, cnt, ab, t0, t1) = digest_get(s);
+                        has_dig = true;
+                        bits |= ab;
+                        sorted &= t0 >= prev;
+                        bits |= t.core.feed_digest(&mut st, se, pu, extra, &mut xi);
+                        prev = t1;
+                        n += cnt;
+                        continue;
+                    }
+                    let ws = seg(s);
+                    let mut a = 0usize;
+                    while xi < extra.len() {
+                        let e = extra[xi];
+                        let j = match ws[a..].iter().position(|&w0| e < w0) {
+                            Some(d) => a + d,
+                            None => break,
+                        };
+                        if j > a {
+                            let (b, uns) = t.core.feed_slice(&mut st, &ws[a..j], prev);
+                            bits |= b;
+                            sorted &= !uns;
+                            prev = ws[j - 1] >> 33;
                         }
-                        bits |= 1 << (w0 & 15);
-                        sorted &= w0 >> 33 >= prev;
-                        prev = w0 >> 33;
-                        t.core.feed(&mut st, w0);
+                        bits |= 1 << (e & 15);
+                        t.core.feed(&mut st, e);
+                        xi += 1;
+                        a = j;
+                    }
+                    if a < ws.len() {
+                        let (b, uns) = t.core.feed_slice(&mut st, &ws[a..], prev);
+                        bits |= b;
+                        sorted &= !uns;
+                        prev = ws[ws.len() - 1] >> 33;
                     }
                     n += s.len as u64;
                 }
@@ -1613,6 +1962,9 @@ fn stage3b(g: &G, tid: usize) {
                     finish_simple(g, t, u, class, &st);
                     continue;
                 }
+                if has_dig {
+                    fallback("digest of a user that needs its records");
+                }
                 t.core.abort(&st);
             }
             let mut buf = std::mem::take(&mut t.runbuf);
@@ -1623,8 +1975,43 @@ fn stage3b(g: &G, tid: usize) {
             process_run(g, t, u, &mut buf);
             t.runbuf = buf;
         }
+        if !released {
+            g.ev_arena.release_part(tid, g.nt);
+            released = true;
+        }
+    }
+    if !released {
+        g.ev_arena.release_part(tid, g.nt);
     }
 }
+
+fn shares(g: &G, pool: &Pool, old: bool) -> Vec<Share> {
+    let none = Share { dense: std::ptr::null_mut(), hot: std::ptr::null_mut(), agg: std::ptr::null_mut(), aggp: std::ptr::null_mut(), slab: std::ptr::null_mut(), slab_len: 0 };
+    let mut v = vec![none; g.nt];
+    if old {
+        return v;
+    }
+    let (dense, hot) = fast_sizes(g.nc, g.nd);
+    let cells = (g.nc + 2) * g.nd;
+    for s in v.iter_mut() {
+        s.dense = pool.take(r4k(dense), 4096);
+        s.hot = pool.take(r4k(hot), 4096);
+        s.agg = pool.take(r4k(cells * 8), 4096);
+        s.aggp = pool.take(r4k(cells * 16), 4096);
+    }
+    let n_ev: usize = (0..g.nt).map(|t| g.t(t).n_ev_rows as usize).sum();
+    let left = pool.left();
+    let want = r4k(n_ev / g.nt * SLAB_ROWS / 100 * 131 / 5) + 16 * 4096;
+    let slab = want.min(left.saturating_sub(EP_BYTES * g.nt) / g.nt) & !4095;
+    if slab >= 1 << 20 {
+        for s in v.iter_mut() {
+            s.slab = pool.take(slab, 4096);
+            s.slab_len = if s.slab.is_null() { 0 } else { slab };
+        }
+    }
+    v
+}
+const SLAB_ROWS: usize = crate::env_u32(option_env!("XL_SLABROWS"), 13) as usize;
 
 pub fn stage3(g: &mut G) {
     g.next.store(0, Ordering::Relaxed);
@@ -1634,13 +2021,37 @@ pub fn stage3(g: &mut G) {
         if gr.check {
             name_selftest(gr);
         }
+        if let Some(v) = std::env::var("XL_DIGMIN").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            DIG_MIN.store(if v == 0 { usize::MAX } else { v }, Ordering::Relaxed);
+        }
         let pool = Pool::new(gr);
         let pool0 = pool.next.load(Ordering::Relaxed);
-        run_par(gr.nt, |tid| if old { stage3a_old(gr, tid) } else { stage3a(gr, tid, &pool) });
+        let shares = shares(gr, &pool, old);
+        run_par(gr.nt, |tid| {
+            if tid == gr.nt - 1 {
+                crate::links::uf_tail(gr);
+            }
+            if old {
+                stage3a_old(gr, tid)
+            } else {
+                stage3a(gr, tid, &pool, &shares[tid])
+            }
+        });
         if XR {
             eprintln!("XRU pool: {} kB of {} kB taken", (pool.next.load(Ordering::Relaxed) - pool0) >> 10, (pool.end.max(pool0) - pool0) >> 10);
+            for t in 0..gr.nt {
+                let c = &gr.t(t).core;
+                eprintln!("XRU core {t}: slab {} kB, rows {} of {} (slab {}), names {} of {} (slab {}), persons {} of {} (slab {}), edge pieces {}", shares[t].slab_len >> 10, c.day.len(), c.day.cap(), c.day.in_slab(), c.names.len(), c.names.cap(), c.names.in_slab(), c.names_off.len(), c.names_off.cap(), c.names_off.in_slab(), unsafe { EDGE[t].pieces.len() });
+            }
         }
         xp_report((0..gr.nt).map(|t| gr.t(t).n_simple).sum::<u64>().max(1));
+    }
+    g.uf = crate::links::uf_take(g);
+    let slabfull = std::env::var("XL_SLABFULL").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+    if slabfull == 1 {
+        for tid in 0..g.nt {
+            slab_full(&mut g.t(tid).core);
+        }
     }
     lap("ev3a");
     let mut joined: Vec<Vec<Seg>> = Vec::new();
@@ -1670,4 +2081,10 @@ pub fn stage3(g: &mut G) {
         let gr: &G = g;
         run_par(gr.nt, |tid| stage3b(gr, tid));
     }
+    if slabfull == 2 {
+        for tid in 0..g.nt {
+            slab_full(&mut g.t(tid).core);
+        }
+    }
+    crate::core::COLS_PINNED.store(true, Ordering::Relaxed);
 }
