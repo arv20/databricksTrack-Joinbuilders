@@ -21,6 +21,7 @@ pub const MADV_NOHUGEPAGE: i32 = 15;
 const HP: usize = 2 << 20;
 
 pub static HUGE: AtomicBool = AtomicBool::new(true);
+pub static RELEASE: AtomicBool = AtomicBool::new(true);
 
 pub static WORKERS: AtomicBool = AtomicBool::new(false);
 
@@ -101,6 +102,16 @@ impl Arena {
     }
     pub fn used(&self) -> usize {
         self.next.load(Ordering::Relaxed)
+    }
+    pub fn release_part(&self, tid: usize, nt: usize) {
+        if !RELEASE.load(Ordering::Relaxed) {
+            return;
+        }
+        let used = self.used().min(self.cap) / HP;
+        let (a, b) = (used * tid / nt * HP, used * (tid + 1) / nt * HP);
+        if b > a {
+            unsafe { madvise(self.base.add(a), b - a, MADV_DONTNEED) };
+        }
     }
 }
 

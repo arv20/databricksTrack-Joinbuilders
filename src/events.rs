@@ -240,6 +240,7 @@ fn stage3a(g: &G, tid: usize) {
 
 fn stage3b(g: &G, tid: usize) {
     let t = g.t(tid);
+    g.ev_arena.release_part(tid, g.nt);
     loop {
         let i = g.next.fetch_add(1, Ordering::Relaxed);
         if i >= g.joined.len() {

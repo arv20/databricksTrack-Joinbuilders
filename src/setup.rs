@@ -242,7 +242,7 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
         sample.add_event_lines(&bytes[..cut], 5000);
     }
     let mut st = keyrec::Stats::default();
-    let envkey = |n: &str| std::env::var(n).ok().and_then(|v| u64::from_str_radix(&v, 16).ok());
+    let envkey = |n: &str| if cfg!(feature = "testkeys") { std::env::var(n).ok().and_then(|v| u64::from_str_radix(&v, 16).ok()) } else { None };
     let (ukey, ekey) = match (envkey("XL_UKEY"), envkey("XL_EKEY")) {
         (Some(u), Some(e)) => (u, e),
         _ => {

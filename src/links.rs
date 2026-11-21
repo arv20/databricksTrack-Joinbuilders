@@ -134,7 +134,14 @@ fn sort_clicks(g: &G, s: &mut [[u64; 2]], tmp: &mut Vec<[u64; 2]>) {
     if n <= 16 {
         unsafe { rank_sort(s) };
     } else if n <= 2048 {
-        s.sort_unstable_by_key(|c| c[0]);
+        let mut keys = [0u64; 2048];
+        for (i, c) in s.iter().enumerate() {
+            keys[i] = c[0] >> 32 << 32 | i as u64;
+        }
+        keys[..n].sort_unstable();
+        tmp.clear();
+        tmp.extend(keys[..n].iter().map(|k| s[(k & 0xFFFF_FFFF) as usize]));
+        s.copy_from_slice(tmp);
     } else {
         radix_ts(s, tmp);
     }
@@ -254,8 +261,26 @@ fn radix_ts(s: &mut [[u64; 2]], tmp: &mut Vec<[u64; 2]>) {
     }
 }
 
-fn stage2b(g: &G, tid: usize) {
+fn stage2c(g: &G, tid: usize) {
+    g.us_arena.release_part(tid, g.nt);
     let mut tmp: Vec<[u64; 2]> = Vec::new();
+    let units = 64 + g.ucap as usize / 64 - 1;
+    loop {
+        let i = g.next.fetch_add(1, Ordering::Relaxed);
+        if i >= units {
+            break;
+        }
+        let (u0, u1) = if i < 64 { (i, i + 1) } else { ((i - 63) * 64, (i - 62) * 64) };
+        for u in u0..u1 {
+            let s = g.csr_range(u as u32);
+            if s.len() > 1 {
+                sort_clicks(g, unsafe { std::slice::from_raw_parts_mut(s.as_ptr() as *mut [u64; 2], s.len()) }, &mut tmp);
+            }
+        }
+    }
+}
+
+fn stage2b(g: &G, tid: usize) {
     let t = g.t(tid);
     t.cnt.clear();
     t.cnt.resize(UBSIZE + 1, 0);
@@ -345,12 +370,6 @@ fn stage2b(g: &G, tid: usize) {
         }
         let dbg2 = tstart.elapsed().as_nanos() as u64;
         t.prof[6] += dbg2;
-        for ul in 0..UBSIZE {
-            let (a, b) = (off[ul] as usize, off[ul + 1] as usize);
-            if b - a > 1 {
-                sort_clicks(g, unsafe { std::slice::from_raw_parts_mut(g.csr.add(a), b - a) }, &mut tmp);
-            }
-        }
         let el = tstart.elapsed().as_nanos() as u64;
         if el > 4_000_000 && std::env::var("XL_DBG").is_ok() {
             eprintln!("[v2b] slow bucket {ub}: {:.1} ms, clicks={} pend={} (pass1 end {:.1}, pass2 end {:.1})", el as f64 / 1e6, off[UBSIZE] - off[0], t.pend.len(), dbg1 as f64 / 1e6, dbg2 as f64 / 1e6);
@@ -477,5 +496,11 @@ pub fn stage2(g: &mut G) -> std::thread::JoinHandle<Uf> {
         run_par(gr.nt, |tid| stage2b(gr, tid));
     }
     g.st2b_done.store(true, Ordering::Release);
+    lap("st2b");
+    g.next.store(0, Ordering::Relaxed);
+    {
+        let gr: &G = g;
+        run_par(gr.nt, |tid| stage2c(gr, tid));
+    }
     handle
 }

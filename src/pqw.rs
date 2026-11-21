@@ -1,14 +1,9 @@
-//! pqw: minimal dependency-free Parquet writer (data page v1, UNCOMPRESSED,
-//! PLAIN + RLE_DICTIONARY, no statistics). One row group per call unless
-//! Opts::rows_per_group is set. Little-endian hosts only.
 #![allow(dead_code)]
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-/// Arrow-style string column: value i is data[offsets[i]..offsets[i+1]].
-/// offsets.len() == rows + 1 (or 0 for zero rows). Offsets may start at any value.
 #[derive(Clone, Copy)]
 pub struct StrCol<'a> {
     pub offsets: &'a [u32],
@@ -29,7 +24,6 @@ impl<'a> StrCol<'a> {
     }
 }
 
-/// Dictionary keys. For a nullable column the key type's MAX is null.
 #[derive(Clone, Copy)]
 pub enum Keys<'a> {
     U8(&'a [u8]),
@@ -45,24 +39,15 @@ impl<'a> Keys<'a> {
     }
 }
 
-/// Integer encoding. Dense: dictionary = every value min..=max, key = v - min
-/// (falls back to Plain if the range is too large). Hash: real dictionary of
-/// distinct values (falls back to Plain if too many). Auto: Dense if it pays, else Plain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IntEnc { Plain, Dense, Hash, Auto }
 
 #[derive(Clone, Copy)]
 pub enum Data<'a> {
-    /// INT32, required.
     I32(&'a [i32], IntEnc),
-    /// INT64, required.
     I64(&'a [i64], IntEnc),
-    /// INT32 annotated DATE (days since 1970-01-01), required.
     Date(&'a [i32], IntEnc),
-    /// BYTE_ARRAY UTF8, required, PLAIN.
     Str(StrCol<'a>),
-    /// BYTE_ARRAY UTF8 given as dictionary + keys. nullable: key MAX = null
-    /// (column is OPTIONAL). plain: write PLAIN strings instead of RLE_DICTIONARY.
     Dict { dict: StrCol<'a>, keys: Keys<'a>, nullable: bool, plain: bool },
 }
 
@@ -73,26 +58,19 @@ pub struct Column<'a> {
 
 #[derive(Clone, Copy)]
 pub struct Opts {
-    /// Rows per row group (usize::MAX = one row group).
     pub rows_per_group: usize,
 }
 impl Default for Opts {
     fn default() -> Self { Opts { rows_per_group: usize::MAX } }
 }
 
-/// How write_file puts bytes on disk.
 #[derive(Clone, Copy, Debug)]
 pub enum Method {
-    /// Encode the whole file into one Vec, then one write_all.
     Whole,
-    /// Encode into a buffer of about this many bytes and write() it each time it fills;
-    /// large PLAIN numeric columns are written straight from the caller's slice.
     Stream(usize),
-    /// Encode into one Vec, then ftruncate + mmap + memcpy (populate = MAP_POPULATE).
     Mmap { populate: bool },
 }
 
-// ---------------------------------------------------------------- output sink
 
 struct Out {
     buf: Vec<u8>,
@@ -130,7 +108,6 @@ impl Out {
         self.put(b);
         self.check()
     }
-    /// Pointer to n (+32 slack) writable bytes at the end of buf.
     #[inline]
     unsafe fn tail(&mut self, n: usize) -> *mut u8 {
         self.buf.reserve(n + 32);
@@ -140,7 +117,6 @@ impl Out {
     unsafe fn commit(&mut self, n: usize) { let l = self.buf.len(); self.buf.set_len(l + n); }
 }
 
-// ---------------------------------------------------------------- thrift compact
 
 struct Tw<'a> {
     b: &'a mut Vec<u8>,
@@ -179,7 +155,6 @@ fn zz64(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
 fn varint_len(mut v: u64) -> usize { let mut n = 1; while v >= 0x80 { v >>= 7; n += 1; } n }
 fn put_varint(b: &mut Vec<u8>, mut v: u64) { while v >= 0x80 { b.push(v as u8 | 0x80); v >>= 7; } b.push(v as u8); }
 
-// Parquet enum values
 const T_INT32: i32 = 1;
 const T_INT64: i32 = 2;
 const T_BYTE_ARRAY: i32 = 6;
@@ -211,9 +186,7 @@ fn page_header(b: &mut Vec<u8>, ptype: i32, size: usize, nv: usize, enc: i32) {
     t.stop();
 }
 
-// ---------------------------------------------------------------- bit packing
 
-/// LSB-first bit packer writing straight to memory (needs 8 bytes of slack).
 struct Packer { p: *mut u8, start: *mut u8, acc: u64, nb: u32, w: u32 }
 impl Packer {
     #[inline(always)]
@@ -229,7 +202,6 @@ impl Packer {
             self.nb -= 32;
         }
     }
-    /// Pad with zeros up to total bytes from start; returns total.
     #[inline(always)]
     unsafe fn finish(self, total: usize) -> usize {
         let written = self.p.offset_from(self.start) as usize;
@@ -242,13 +214,12 @@ impl Packer {
 }
 #[inline]
 fn bits_for(max: u64) -> u32 { (64 - max.leading_zeros()).max(1) }
-/// Bytes of one bit-packed hybrid run holding n values of width w (0 for n == 0).
 fn hybrid_len(n: usize, w: u32) -> usize {
     if n == 0 { return 0; }
     let g = (n + 7) / 8;
     varint_len(((g as u64) << 1) | 1) + g * w as usize
 }
-const BLOCK: usize = 8192; // rows per streaming block, multiple of 8
+const BLOCK: usize = 8192;
 
 #[inline(always)]
 unsafe fn pack_group<const W: u32>(p: *mut u8, v: [u32; 8]) {
@@ -272,7 +243,6 @@ unsafe fn pack_group<const W: u32>(p: *mut u8, v: [u32; 8]) {
         }
     }
 }
-/// Bit-pack n values (any n; last group zero-padded) at dst; needs 32 bytes of slack.
 #[inline(always)]
 unsafe fn pack_w<const W: u32, F: Fn(usize) -> u32>(dst: *mut u8, n: usize, get: &F) {
     let full = n / 8;
@@ -294,7 +264,6 @@ unsafe fn pack_any<F: Fn(usize) -> u32>(dst: *mut u8, n: usize, w: u32, get: &F)
     d!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
 }
 
-/// Write one bit-packed run of n values get(i) in blocks (flushing between blocks).
 unsafe fn emit_packed(o: &mut Out, n: usize, w: u32, get: impl Fn(usize) -> u32) -> io::Result<()> {
     if n == 0 { return Ok(()); }
     let g = (n + 7) / 8;
@@ -316,7 +285,6 @@ unsafe fn emit_packed(o: &mut Out, n: usize, w: u32, get: impl Fn(usize) -> u32)
     Ok(())
 }
 
-// ---------------------------------------------------------------- planning
 
 #[derive(Clone, Copy)]
 enum Ints<'a> { A(&'a [i32]), B(&'a [i64]) }
@@ -347,7 +315,6 @@ enum Plan {
     Plain,
     Dense { min: i64, card: usize, w: u32 },
     Hash { dict: Vec<i64>, keys: Vec<u32>, w: u32 },
-    /// strings via dictionary keys: m = non-null count, vbytes = PLAIN value bytes (plain mode)
     Dict { m: usize, vbytes: usize, w: u32 },
 }
 
@@ -363,7 +330,6 @@ fn plan_ints(v: Ints, enc: IntEnc) -> Plan {
     let card = r as usize + 1;
     let w = bits_for(r as u64);
     if enc == IntEnc::Auto {
-        // dictionary page + packed keys must beat plain by a margin
         let es = v.esize();
         let dense = card * es + (n + 7) / 8 * w as usize;
         if dense * 10 > n * es * 8 { return Plan::Plain; }
@@ -456,7 +422,6 @@ fn ptype(d: &Data) -> i32 {
 }
 fn is_opt(d: &Data) -> bool { matches!(d, Data::Dict { nullable: true, .. }) }
 
-/// Upper bound of the bytes a chunk takes (pages + headers).
 fn chunk_bound(d: &Data, p: &Plan) -> usize {
     let n = rows_of(d);
     let hdr = 64;
@@ -474,12 +439,9 @@ fn chunk_bound(d: &Data, p: &Plan) -> usize {
     }
 }
 
-// ---------------------------------------------------------------- emission
 
 struct Meta { ptype: i32, dict: bool, size: u64, data_off: u64, dict_off: u64, nv: usize }
 
-/// Copy l bytes from base[a..]; uses one 16-byte move when l <= 16 and the
-/// source has 16 readable bytes. dst needs 16 bytes of slack.
 #[inline(always)]
 unsafe fn copy_short(base: *const u8, dl: usize, a: usize, l: usize, dst: *mut u8) {
     if l <= 16 && a + 16 <= dl {
@@ -521,7 +483,6 @@ fn emit_dict_page_strs(o: &mut Out, dict: &StrCol) -> io::Result<()> {
     unsafe { emit_plain_strs(o, dict) }
 }
 
-/// 64 null flags (bit j = keys[j] != 255) for up to 64 keys starting at k.
 #[inline(always)]
 unsafe fn valid_mask64(k: *const u8, cnt: usize) -> u64 {
     #[cfg(target_feature = "avx512bw")]
@@ -539,7 +500,6 @@ unsafe fn valid_mask64(k: *const u8, cnt: usize) -> u64 {
     }
 }
 
-/// OPTIONAL dictionary column with u8 keys: one pass writes the def levels and the keys.
 unsafe fn emit_dict_u8_opt(o: &mut Out, dict: &StrCol, keys: &[u8], m: usize, w: u32) -> io::Result<u64> {
     let n = keys.len();
     emit_dict_page_strs(o, dict)?;
@@ -584,7 +544,6 @@ unsafe fn emit_dict_u8_opt(o: &mut Out, dict: &StrCol, keys: &[u8], m: usize, w:
     Ok(data_off)
 }
 
-/// Returns Some(data page offset) when a dictionary page was written.
 unsafe fn emit_dict_t<K: Key + PartialEq>(o: &mut Out, dict: &StrCol, keys: &[K], nullable: bool, plain: bool, m: usize, vbytes: usize, w: u32) -> io::Result<Option<u64>> {
     let n = keys.len();
     let use_dict = !plain && m > 0;
@@ -705,7 +664,6 @@ fn emit_chunk(o: &mut Out, d: &Data, p: &Plan) -> io::Result<Meta> {
     Ok(meta)
 }
 
-// ---------------------------------------------------------------- footer
 
 fn footer(cols: &[Column], groups: &[(usize, Vec<Meta>)], nrows: usize) -> Vec<u8> {
     let mut b = Vec::with_capacity(256 + 128 * cols.len() * groups.len().max(1));
@@ -767,7 +725,6 @@ fn footer(cols: &[Column], groups: &[(usize, Vec<Meta>)], nrows: usize) -> Vec<u
     b
 }
 
-// ---------------------------------------------------------------- top level
 
 fn encode_into(o: &mut Out, cols: &[Column], opts: &Opts) -> io::Result<()> {
     assert!(!cols.is_empty());
@@ -797,7 +754,6 @@ fn encode_into(o: &mut Out, cols: &[Column], opts: &Opts) -> io::Result<()> {
     o.flush()
 }
 
-/// Encode a whole Parquet file into memory.
 pub fn encode(cols: &[Column], opts: &Opts) -> Vec<u8> {
     let mut o = Out::mem(0);
     encode_into(&mut o, cols, opts).expect("in-memory encode cannot fail");
@@ -810,7 +766,6 @@ extern "C" {
     fn ftruncate(fd: i32, len: i64) -> i32;
 }
 
-/// Write a Parquet file. Returns the file size.
 pub fn write_file(path: &Path, cols: &[Column], opts: &Opts, method: Method) -> io::Result<u64> {
     match method {
         Method::Whole => {
