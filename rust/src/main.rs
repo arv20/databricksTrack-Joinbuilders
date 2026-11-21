@@ -1361,6 +1361,247 @@ fn main() {
     std::process::exit(0);
 }
 
+// Link endpoints are bucketed by the home slot of the all-uid table. Each
+// worker can then build its range with ordinary loads and stores. A chain
+// crossing the end of a range is completed after all range owners finish.
+const LINK_SHARDS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct LinkEnd {
+    key: u64,
+    name: u64,
+    check: u32,
+    endpoint: u32,
+}
+
+#[inline]
+fn link_slot(
+    slots: &mut [(u64, u64)],
+    mut i: usize,
+    mask: usize,
+    e: LinkEnd,
+    node: u32,
+    names: &[std::sync::atomic::AtomicU64],
+    endpoints: &[AtomicU32],
+    collision: &AtomicBool,
+) -> Option<(usize, u32)> {
+    while let Some(slot) = slots.get_mut(i) {
+        if slot.0 == 0 {
+            names[node as usize].store(e.name, Relaxed);
+            *slot = (e.key, (u64::from(e.check) << 32) | u64::from(node));
+            endpoints[node as usize].store(node, Relaxed);
+            return Some((i, node));
+        }
+        if slot.0 == e.key {
+            let other = slot.1 as u32;
+            let other_name = names[other as usize].load(Relaxed);
+            if (slot.1 >> 32) as u32 != e.check
+                || (other_name != e.name && unpack_ref(other_name) != unpack_ref(e.name))
+            {
+                collision.store(true, Relaxed);
+            }
+            endpoints[node as usize].store(other, Relaxed);
+            return None;
+        }
+        i = (i + 1) & mask;
+    }
+    None
+}
+
+#[inline]
+fn link_root(parent: &[AtomicU32], mut node: u32) -> u32 {
+    loop {
+        let next = parent[node as usize].load(Relaxed);
+        if next == 0 {
+            return node;
+        }
+        let grandparent = parent[(next - 1) as usize].load(Relaxed);
+        if grandparent == 0 {
+            return next - 1;
+        }
+        // Path halving keeps the replacement on the same ancestry chain.
+        let _ = parent[node as usize].compare_exchange(next, grandparent, Relaxed, Relaxed);
+        node = grandparent - 1;
+    }
+}
+
+fn build_links(
+    input: &[&[u8]],
+    estimated_users: usize,
+    seed: u64,
+) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
+    use std::sync::atomic::AtomicU64;
+    let chunks = chunks(input, 1 << 17);
+    // Physical rows give an upper bound on valid links, including a final
+    // unterminated line. Size the table before hashing and bucketing.
+    let rows: usize = chunks.par_iter().map(|chunk| {
+        memchr::memchr_iter(b'\n', chunk).count() + usize::from(chunk.last() != Some(&b'\n'))
+    }).sum();
+    let endpoint_bound = rows.checked_mul(2)?;
+    if endpoint_bound >= PERSON_SET as usize {
+        return None;
+    }
+    let capacity_hint = (endpoint_bound + 16).max(estimated_users).max(LINK_SHARDS / 2);
+    if capacity_hint > 1 << 31 {
+        return None;
+    }
+    let mut table = Tab::new(capacity_hint);
+    let range_len = (table.mask + 1) / LINK_SHARDS;
+    let shift = range_len.trailing_zeros();
+    let collision = AtomicBool::new(false);
+
+    let batches: Vec<_> = chunks.par_iter().map(|chunk| {
+        let mut ends: [Vec<LinkEnd>; LINK_SHARDS] = std::array::from_fn(|_| Vec::new());
+        let mut count = 0;
+        csv_rows(chunk, |_, [a, b]| {
+            if a.is_empty() || b.is_empty() {
+                return;
+            }
+            for s in [a, b] {
+                let Some(name) = pack_ref(s) else {
+                    collision.store(true, Relaxed);
+                    return;
+                };
+                let (key, check) = hs(s, seed);
+                let key = if key == 0 { 1 } else { key };
+                let shard = ((key as usize) & table.mask) >> shift;
+                ends[shard].push(LinkEnd { key, name, check, endpoint: count });
+                count += 1;
+            }
+        });
+        (ends, count)
+    }).collect();
+    if collision.load(Relaxed) {
+        return None;
+    }
+    lap("  links parsed+hashed");
+
+    let mut nend = 0u32;
+    let offsets: Vec<_> = batches.iter().map(|(_, count)| {
+        let start = nend;
+        nend += count;
+        start
+    }).collect();
+    let names: Vec<_> = (0..nend).map(|_| AtomicU64::new(0)).collect();
+    let endpoints: Vec<_> = (0..nend).map(|_| AtomicU32::new(u32::MAX)).collect();
+    let range_mask = range_len - 1;
+    let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).enumerate().map(|(shard, slots)| {
+        let mut nodes = Vec::new();
+        let mut spill = Vec::new();
+        for ((ends, _), &start) in batches.iter().zip(&offsets) {
+            for &e in &ends[shard] {
+                let node = start + e.endpoint;
+                let i = e.key as usize & range_mask;
+                if let Some((local, node)) = link_slot(slots, i, usize::MAX, e, node, &names, &endpoints, &collision) {
+                    nodes.push(((shard * range_len + local) as u32, node));
+                } else if endpoints[node as usize].load(Relaxed) == u32::MAX {
+                    spill.push((e, node));
+                }
+            }
+        }
+        (nodes, spill)
+    }).collect();
+    for (nodes, spill) in &mut ranges {
+        for (e, node) in spill.drain(..) {
+            let i = e.key as usize & table.mask;
+            if let Some((slot, node)) = link_slot(&mut table.slots, i, table.mask, e, node, &names, &endpoints, &collision) {
+                nodes.push((slot as u32, node));
+            }
+        }
+    }
+    if collision.load(Relaxed) {
+        return None;
+    }
+    lap("  links inserted");
+
+    let parent: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
+    endpoints.par_chunks(4096).for_each(|ends| {
+        for edge in ends.chunks_exact(2) {
+            let mut a = link_root(&parent, edge[0].load(Relaxed));
+            let mut b = link_root(&parent, edge[1].load(Relaxed));
+            while a != b {
+                let (lo, hi) = (a.min(b), a.max(b));
+                if parent[hi as usize].compare_exchange(0, lo + 1, Relaxed, Relaxed).is_ok() {
+                    break;
+                }
+                a = link_root(&parent, lo);
+                b = link_root(&parent, hi);
+            }
+        }
+    });
+    lap("  links union-find");
+
+    let smallest: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
+    let name = |node: u32| unpack_ref(names[node as usize].load(Relaxed));
+    let roots: Vec<Vec<u32>> = ranges.par_iter().map(|(nodes, _)| {
+        let mut roots = Vec::new();
+        for &(_, node) in nodes {
+            let r = link_root(&parent, node);
+            if r == node {
+                roots.push(r);
+            } else {
+                parent[node as usize].store(r + 1, Relaxed);
+            }
+            let best = &smallest[r as usize];
+            let me = name(node);
+            let mut other = best.load(Relaxed);
+            while other == 0 || me < name(other - 1) {
+                match best.compare_exchange_weak(other, node + 1, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => other = actual,
+                }
+            }
+        }
+        roots
+    }).collect();
+    lap("  links rooted");
+
+    let mut npersons = 0u32;
+    let offsets: Vec<_> = roots.iter().map(|roots| {
+        let start = npersons;
+        npersons += roots.len() as u32;
+        start
+    }).collect();
+    let person: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
+    let name_groups: Vec<Vec<_>> = roots.par_iter().zip(offsets).map(|(roots, start)| {
+        roots.iter().enumerate().map(|(i, &r)| {
+            person[r as usize].store(start + i as u32, Relaxed);
+            name(smallest[r as usize].load(Relaxed) - 1)
+        }).collect()
+    }).collect();
+    let pname = name_groups.into_iter().flatten().collect();
+    lap("  links numbered");
+
+    let nids = ranges.iter().map(|(nodes, _)| nodes.len()).sum();
+    // Spilled nodes belong to the shard containing the final slot. Group the
+    // few such entries before each worker updates only its own slot range.
+    let mut misplaced = Vec::new();
+    for (shard, (nodes, _)) in ranges.iter_mut().enumerate() {
+        nodes.retain(|&(slot, node)| {
+            let owner = slot as usize >> shift;
+            if owner != shard {
+                misplaced.push((owner, slot, node));
+            }
+            owner == shard
+        });
+    }
+    for (shard, slot, node) in misplaced {
+        ranges[shard].0.push((slot, node));
+    }
+    table.slots.par_chunks_mut(range_len).zip(&ranges).for_each(|(slots, (nodes, _))| {
+        for &(slot, node) in nodes {
+            let r = match parent[node as usize].load(Relaxed) {
+                0 => node,
+                p => p - 1,
+            };
+            let value = &mut slots[slot as usize & range_mask].1;
+            *value = (*value & !0xffff_ffff) | PERSON_SET | u64::from(person[r as usize].load(Relaxed));
+        }
+    });
+    lap("  links repointed");
+    Some((table, nend as usize / 2, nids, pname))
+}
+
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
 fn fast(seed: u64) -> bool {
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
@@ -1431,214 +1672,17 @@ fn fast(seed: u64) -> bool {
     });
     let ncamp = camp_names.len();
 
-    // links: union-find over hashed ids
-    let lch = chunks(&lkb, 1 << 20);
-    // parse and hash both ends in parallel; the serial union-find then only probes the table
-    struct End<'a> {
-        s: &'a [u8],
-        k: u64,
-        c: u32,
-    }
-    let edges: Vec<[End; 2]> = lch
-        .par_iter()
-        .flat_map_iter(|c| {
-            let mut v = vec![];
-            csv_rows(c, |_, [a, b]| {
-                if !a.is_empty() && !b.is_empty() {
-                    let (ka, ca) = hs(a, seed);
-                    let (kb, cb) = hs(b, seed);
-                    v.push([End { s: a, k: ka, c: ca }, End { s: b, k: kb, c: cb }]);
-                }
-            });
-            v
-        })
-        .collect();
-    lap("  links parsed+hashed");
-    // Parallel, lock-free build. Each distinct id owns one table slot (claimed by CAS on the
-    // key), and the slot index is its union-find node. Unions link the larger root under the
-    // smaller by CAS; the components do not depend on the order. Capacity > 2 * edges >= ids,
-    // so the table always keeps an empty slot (sized for a low load: most event lookups miss).
-    // The table also takes every unlinked user id seen on a valid event (inserted during the
-    // event parse), so size it for both; a fuller table than 3/4 declines to slow.rs.
     let est_users = evb.iter().find(|b| b.len() >= 1 << 16).map_or(0, |b| {
         let rows = memchr::memchr_iter(b'\n', &b[..1 << 16]).count().max(1);
         let total: usize = evb.iter().map(|b| b.len()).sum();
         total / ((1 << 16) / rows).max(1) / 12
     });
-    let mut ltab = Tab::new((edges.len() * 2 + 16).max(est_users));
-    let cap = ltab.slots.len();
-    let mask = ltab.mask;
-    let lcoll = AtomicBool::new(false);
-    let (nids, pname) = {
-        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::{Acquire, Release}};
-        // the slots as atomics: (key, (chk << 32) | 1) while building; AtomicU64 has u64's layout
-        let sl: &[AtomicU64] = unsafe { std::slice::from_raw_parts(ltab.slots.as_mut_ptr() as *const AtomicU64, cap * 2) };
-        // zeroed (calloc'd, so untouched pages cost nothing) arrays viewed as atomics
-        fn zeroed<A>(n: usize) -> &'static [A] {
-            let v: Vec<u64> = vec![0; n];
-            let p = v.as_ptr() as *const A;
-            std::mem::forget(v);
-            unsafe { std::slice::from_raw_parts(p, n * 8 / std::mem::size_of::<A>()) }
-        }
-        let refs: &[AtomicU64] = zeroed(cap);
-        // parent[x] = 0: x is a root; else parent is node parent[x] - 1 (always < x)
-        let parent: &[AtomicU32] = zeroed(cap.div_ceil(2));
-        let best: &[AtomicU32] = zeroed(cap.div_ceil(2)); // slot + 1 of the smallest id, per root
-        let pnum: &[AtomicU32] = zeroed(cap.div_ceil(2)); // person number, per root
-        let insert = |e: &End| -> u32 {
-            let k = if e.k == 0 { 1 } else { e.k };
-            let tag = ((e.c as u64) << 32) | 1;
-            let mut i = (k as usize) & mask;
-            loop {
-                let kk = sl[2 * i].load(Acquire);
-                if kk == 0 {
-                    match sl[2 * i].compare_exchange(0, k, Acquire, Acquire) {
-                        Ok(_) => {
-                            match pack_ref(e.s) {
-                                Some(r) => refs[i].store(r, Relaxed),
-                                None => lcoll.store(true, Relaxed),
-                            }
-                            sl[2 * i + 1].store(tag, Release);
-                            return i as u32;
-                        }
-                        Err(_) => continue, // re-read this slot
-                    }
-                }
-                if kk == k {
-                    let mut v = sl[2 * i + 1].load(Acquire);
-                    while v == 0 {
-                        std::hint::spin_loop();
-                        v = sl[2 * i + 1].load(Acquire);
-                    }
-                    if v != tag {
-                        lcoll.store(true, Relaxed);
-                    }
-                    return i as u32;
-                }
-                i = (i + 1) & mask;
-            }
-        };
-        let find = |mut x: u32| -> u32 {
-            loop {
-                let p = parent[x as usize].load(Relaxed);
-                if p == 0 {
-                    return x;
-                }
-                let g = parent[(p - 1) as usize].load(Relaxed);
-                if g == 0 {
-                    return p - 1;
-                }
-                // path halving; a stale write still points at an ancestor
-                let _ = parent[x as usize].compare_exchange(p, g, Relaxed, Relaxed);
-                x = g - 1;
-            }
-        };
-        edges.par_chunks(4096).for_each(|ch| {
-            for (ei, e) in ch.iter().enumerate() {
-                if let Some(f) = ch.get(ei + 16) {
-                    ltab_prefetch(sl, mask, f[0].k);
-                    ltab_prefetch(sl, mask, f[1].k);
-                }
-                let (a, b) = (insert(&e[0]), insert(&e[1]));
-                let (mut ra, mut rb) = (find(a), find(b));
-                while ra != rb {
-                    let (lo, hi) = (ra.min(rb), ra.max(rb));
-                    match parent[hi as usize].compare_exchange(0, lo + 1, Relaxed, Relaxed) {
-                        Ok(_) => break,
-                        Err(_) => {
-                            ra = find(lo);
-                            rb = find(hi);
-                        }
-                    }
-                }
-            }
-        });
-        if lcoll.load(Relaxed) {
-            return false;
-        }
-        lap("  links union-find");
-        // one pass: root of every id (kept as root + 1, roots stay 0), the smallest id of each
-        // component, and per-chunk counts of ids and roots
-        let occ = |i: usize| sl[2 * i].load(Relaxed) != 0;
-        let str_of = |i: u32| unpack_ref(refs[i as usize].load(Relaxed));
-        const CH: usize = 1 << 14;
-        let nch = cap.div_ceil(CH);
-        let counts: Vec<(u32, u32)> = (0..nch)
-            .into_par_iter()
-            .map(|c| {
-                let (mut ids, mut roots) = (0u32, 0u32);
-                for i in c * CH..((c + 1) * CH).min(cap) {
-                    if !occ(i) {
-                        continue;
-                    }
-                    ids += 1;
-                    let r = find(i as u32);
-                    if r == i as u32 {
-                        roots += 1;
-                    } else {
-                        parent[i].store(r + 1, Relaxed);
-                    }
-                    let me = str_of(i as u32);
-                    let b = &best[r as usize];
-                    let mut cur = b.load(Relaxed);
-                    while cur == 0 || me < str_of(cur - 1) {
-                        match b.compare_exchange_weak(cur, i as u32 + 1, Relaxed, Relaxed) {
-                            Ok(_) => break,
-                            Err(x) => cur = x,
-                        }
-                    }
-                }
-                (ids, roots)
-            })
-            .collect();
-        lap("  links rooted");
-        let nids: u32 = counts.iter().map(|x| x.0).sum();
-        let mut offs = Vec::with_capacity(nch);
-        let mut acc = 0u32;
-        for x in &counts {
-            offs.push(acc);
-            acc += x.1;
-        }
-        let npersons = acc as usize;
-        // number the persons (roots) in slot order
-        let mut pname: Vec<&[u8]> = vec![&[]; npersons];
-        {
-            let pn = pname.as_mut_ptr() as usize;
-            (0..nch).into_par_iter().for_each(|c| {
-                let mut p = offs[c];
-                for i in c * CH..((c + 1) * CH).min(cap) {
-                    if occ(i) && parent[i].load(Relaxed) == 0 {
-                        pnum[i].store(p, Relaxed);
-                        // each person index is written by exactly one chunk
-                        unsafe { *(pn as *mut &[u8]).add(p as usize) = str_of(best[i].load(Relaxed) - 1) };
-                        p += 1;
-                    }
-                }
-            });
-        }
-        lap("  links numbered");
-        // re-point the table: id -> person (check kept in the high half)
-        (0..nch).into_par_iter().for_each(|c| {
-            for i in c * CH..((c + 1) * CH).min(cap) {
-                if occ(i) {
-                    let r = match parent[i].load(Relaxed) {
-                        0 => i,
-                        p => (p - 1) as usize,
-                    };
-                    let v = sl[2 * i + 1].load(Relaxed);
-                    sl[2 * i + 1].store((v & !0xffff_ffff) | PERSON_SET | pnum[r].load(Relaxed) as u64, Relaxed);
-                }
-            }
-        });
-        (nids as usize, pname)
+    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed) else {
+        return false;
     };
-    lap("  links repointed");
     let coll = AtomicBool::new(false);
-    // All-uid table: linked ids already map to persons 0..npersons. Each unlinked user id
-    // seen on a valid event copy gets the next dense id when first inserted, from per-thread
-    // blocks of P ids so every partition receives one id per block.
     let users = Users::new(&mut ltab, nids, pname.len());
-    lap(&format!("links: {} edges, {} ids, {} persons", edges.len(), nids, pname.len()));
+    lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
     // Events phase A: route valid copies directly to people, and record
     // every eligible event ID for the global earliest-ingest decision.
@@ -1949,22 +1993,6 @@ fn pt<I, T: Send>(items: impl ParallelIterator<Item = I>, init: impl Fn() -> T +
         *g = Some(f(acc, it));
     });
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
-}
-
-#[inline]
-fn ltab_prefetch(sl: &[std::sync::atomic::AtomicU64], mask: usize, key: u64) {
-    let index = (if key == 0 { 1 } else { key }) as usize & mask;
-    let ptr = sl.as_ptr().wrapping_add(2 * index);
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        std::arch::asm!("prfm pstl1keep, [{ptr}]", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = ptr;
 }
 
 /// Reused per-worker buffers for `radix_sort`.
