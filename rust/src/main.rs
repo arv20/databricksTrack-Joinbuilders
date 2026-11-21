@@ -166,15 +166,15 @@ struct ReadAhead {
 const RA_PIECE: usize = 16 << 20;
 
 impl ReadAhead {
-    fn start(maps: Vec<&'static memmap2::Mmap>) -> &'static ReadAhead {
+    fn start(maps: Vec<&'static memmap2::Mmap>, paths: Vec<&'static str>) -> &'static ReadAhead {
         let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
         let mut table = vec![];
         let mut ranges = vec![];
-        for m in &maps {
+        for (m, path) in maps.iter().zip(&paths) {
             table.push((m.as_ptr() as usize, m.len(), ranges.len()));
             let mut off = 0;
             while off < m.len() {
-                ranges.push((*m, off, RA_PIECE.min(m.len() - off)));
+                ranges.push((*m, *path, off, RA_PIECE.min(m.len() - off)));
                 off += RA_PIECE;
             }
         }
@@ -185,19 +185,43 @@ impl ReadAhead {
             ready: (0..ranges.len()).map(|_| std::sync::atomic::AtomicBool::new(!on)).collect(),
         }));
         if on {
-            let ranges: &'static [(&'static memmap2::Mmap, usize, usize)] = Box::leak(ranges.into_boxed_slice());
+            let ranges: &'static [(&'static memmap2::Mmap, &'static str, usize, usize)] = Box::leak(ranges.into_boxed_slice());
+            let populate = std::env::var_os("BLUE2_WARM_POPULATE").is_some();
             let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
             for _ in 0..threads {
-                std::thread::spawn(move || loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    let Some(&(m, off, len)) = ranges.get(i) else { break };
-                    #[cfg(target_os = "linux")]
-                    if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
-                        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                std::thread::spawn(move || {
+                    // sendfile to /dev/null fills the page cache without copying to user space
+                    // (std::io::copy picks sendfile/splice for a file reader on Linux).
+                    let mut null = std::fs::OpenOptions::new().write(true).open("/dev/null").ok();
+                    let mut open: Option<(&str, std::fs::File)> = None;
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        let Some(&(m, path, off, len)) = ranges.get(i) else { break };
+                        let mut done = false;
+                        if !populate {
+                            if let Some(sink) = null.as_mut() {
+                                if open.as_ref().map(|o| o.0) != Some(path) {
+                                    open = std::fs::File::open(path).ok().map(|f| (path, f));
+                                }
+                                if let Some((_, f)) = open.as_mut() {
+                                    use std::io::{Read, Seek, SeekFrom};
+                                    if f.seek(SeekFrom::Start(off as u64)).is_ok() {
+                                        let reader: &std::fs::File = f;
+                                        done = std::io::copy(&mut reader.take(len as u64), sink).is_ok();
+                                    }
+                                }
+                            }
+                        }
+                        if !done {
+                            #[cfg(target_os = "linux")]
+                            if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
+                                let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+                        }
+                        ra.ready[i].store(true, std::sync::atomic::Ordering::Release);
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
-                    ra.ready[i].store(true, std::sync::atomic::Ordering::Release);
                 });
             }
         }
@@ -1831,7 +1855,13 @@ fn fast(seed: u64) -> bool {
     let ckm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&ckf).into_boxed_slice());
     let lkm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&lkf).into_boxed_slice());
     // Start the cold-cache read-ahead before anything else touches the inputs.
-    let ra = ReadAhead::start(lkm.iter().chain(evm.iter()).chain(ckm.iter()).flatten().collect());
+    let ra = {
+        let files: Vec<&'static str> = lkf.iter().chain(evf.iter()).chain(ckf.iter()).map(|f| &*Box::leak(f.clone().into_boxed_str())).collect();
+        let maps: Vec<(&'static memmap2::Mmap, &'static str)> = lkm.iter().chain(evm.iter()).chain(ckm.iter()).zip(files)
+            .filter_map(|(m, f)| m.as_ref().map(|m| (m, f))).collect();
+        let (maps, paths) = maps.into_iter().unzip();
+        ReadAhead::start(maps, paths)
+    };
     let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
     let evb = as_slices(evm);
     if evb.iter().any(|file| file.len() > u32::MAX as usize) {
