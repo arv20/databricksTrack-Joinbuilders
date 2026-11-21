@@ -84,6 +84,91 @@ fn chunks<'a>(bufs: &[&'a [u8]], target: usize) -> Vec<&'a [u8]> {
     out
 }
 
+/// Chunks of about `target` bytes whose line boundaries are found only when a worker takes
+/// them, so a cold input is not read serially up front. Chunk k of a file holds the lines
+/// that start in [k * target, (k + 1) * target); the header line is skipped.
+struct LazyChunks<'a> {
+    bufs: Vec<&'a [u8]>,
+    raw: Vec<(u32, usize, usize)>,
+}
+
+impl<'a> LazyChunks<'a> {
+    fn new(bufs: &[&'a [u8]], target: usize) -> Self {
+        let mut raw = vec![];
+        for (f, b) in bufs.iter().enumerate() {
+            let mut s = 0;
+            while s < b.len() {
+                let e = (s + target).min(b.len());
+                raw.push((f as u32, s, e));
+                s = e;
+            }
+        }
+        LazyChunks { bufs: bufs.to_vec(), raw }
+    }
+    fn len(&self) -> usize {
+        self.raw.len()
+    }
+    /// The first line start at or after `at` (position 0 is the header, never a data line).
+    #[inline]
+    fn line_start(b: &[u8], at: usize) -> usize {
+        if at >= b.len() {
+            return b.len();
+        }
+        let from = at.saturating_sub(1);
+        match memchr::memchr(b'\n', &b[from..]) {
+            Some(i) => from + i + 1,
+            None => b.len(),
+        }
+    }
+    fn get(&self, i: usize) -> &'a [u8] {
+        let (f, s, e) = self.raw[i];
+        let b = self.bufs[f as usize];
+        let start = Self::line_start(b, s);
+        let end = Self::line_start(b, e).max(start);
+        &b[start..end]
+    }
+    fn total(&self) -> usize {
+        self.bufs.iter().map(|b| b.len()).sum()
+    }
+}
+
+/// Like `pt`, but workers take items in index order from a shared counter, so input is
+/// consumed front to back, right behind the read-ahead pool.
+fn pt_ordered<T: Send>(n: usize, init: impl Fn() -> T + Sync, f: impl Fn(T, usize) -> T + Sync) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    rayon::broadcast(|_| {
+        let mut acc = init();
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n {
+                break acc;
+            }
+            acc = f(acc, i);
+        }
+    })
+}
+
+/// Read every input range into the page cache from its own threads, in the order the parse
+/// consumes them, with many requests in flight (cold-cache scorer). Returns the joiners.
+fn read_ahead(ranges: Vec<(&'static memmap2::Mmap, usize, usize)>) -> Vec<std::thread::JoinHandle<()>> {
+    let threads: usize = std::env::var("BLUE2_IO_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    if threads == 0 || ranges.is_empty() {
+        return vec![];
+    }
+    let ranges: &'static [(&'static memmap2::Mmap, usize, usize)] = Box::leak(ranges.into_boxed_slice());
+    let next: &'static std::sync::atomic::AtomicUsize = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+    (0..threads).map(|_| std::thread::spawn(move || loop {
+        let i = next.fetch_add(1, Relaxed);
+        let Some(&(m, off, len)) = ranges.get(i) else { break };
+        #[cfg(target_os = "linux")]
+        if m.advise_range(memmap2::Advice::PopulateRead, off, len).is_err() {
+            let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+    })).collect()
+}
+
 /// Iterate lines of a chunk ('\n' only; a trailing '\n' does not start a new line).
 #[inline]
 fn for_lines<'a>(c: &'a [u8], mut f: impl FnMut(&'a [u8])) {
@@ -1675,16 +1760,31 @@ fn fast(seed: u64) -> bool {
     }
     let ckf = csv_files(&format!("{data}/clicks"));
     let lkf = csv_files(&format!("{data}/links"));
-    let evm = map_all(&evf);
-    let ckm = map_all(&ckf);
-    let lkm = map_all(&lkf);
+    // Mappings live for the whole run (the process exits right after), so the read-ahead
+    // threads can hold them.
+    let evm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&evf).into_boxed_slice());
+    let ckm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&ckf).into_boxed_slice());
+    let lkm: &'static [Option<memmap2::Mmap>] = Box::leak(map_all(&lkf).into_boxed_slice());
+    let _io = {
+        const PIECE: usize = 4 << 20;
+        let mut ranges = vec![];
+        for m in lkm.iter().chain(evm.iter()).chain(ckm.iter()).flatten() {
+            let mut off = 0;
+            while off < m.len() {
+                let len = PIECE.min(m.len() - off);
+                ranges.push((m, off, len));
+                off += len;
+            }
+        }
+        read_ahead(ranges)
+    };
     let smm = map_all(&[format!("{data}/products.csv"), format!("{data}/campaigns.csv")]);
-    let evb = as_slices(&evm);
+    let evb = as_slices(evm);
     if evb.iter().any(|file| file.len() > u32::MAX as usize) {
         return false;
     }
-    let ckb = as_slices(&ckm);
-    let lkb = as_slices(&lkm);
+    let ckb = as_slices(ckm);
+    let lkb = as_slices(lkm);
     let smb = as_slices(&smm);
     lap("mapped files");
 
@@ -1736,18 +1836,20 @@ fn fast(seed: u64) -> bool {
 
     // Events phase A: route valid copies directly to people, and record
     // every eligible event ID for the global earliest-ingest decision.
-    let ech = chunks(&evb, 1 << 20);
-    let shard_capacity = ech.iter().find(|chunk| chunk.len() >= 1 << 16).map_or(0, |sample| {
+    let ech = LazyChunks::new(&evb, 1 << 20);
+    let shard_capacity = evb.iter().find(|b| b.len() >= 1 << 17).map_or(0, |b| {
+        let sample = &b[1 << 16..1 << 17];
         let rows = memchr::memchr_iter(b'\n', sample).count();
         let avg_bytes = (sample.len() / rows.max(1)).max(64);
-        let input_bytes: usize = ech.iter().map(|chunk| chunk.len()).sum();
+        let input_bytes: usize = ech.total();
         let per_shard = (input_bytes / avg_bytes).div_ceil(SH * rayon::current_num_threads());
         (per_shard + per_shard / 8).min(32_768)
     });
     let window_seconds = w0.div_euclid(1000);
-    let folds: Vec<EventFold> = pt(ech.par_iter(),
+    let folds: Vec<EventFold> = pt_ordered(ech.len(),
             || EventFold::new(shard_capacity),
-            |mut acc, c| {
+            |mut acc, ci| {
+                let c = ech.get(ci);
                 let mut dates = Dates::default();
                 let mut batch = Vec::<ParsedEvent>::with_capacity(16);
                 let mut short_writer = acc.short_copies.writer();
@@ -1865,11 +1967,12 @@ fn fast(seed: u64) -> bool {
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
-    let cch = chunks(&ckb, 1 << 20);
-    let caccs: Vec<Vec<Vec<Click>>> = pt(
-        cch.par_iter(),
+    let cch = LazyChunks::new(&ckb, 1 << 20);
+    let caccs: Vec<Vec<Vec<Click>>> = pt_ordered(
+        cch.len(),
         || (0..P).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
-        |mut acc, chunk| {
+        |mut acc, ci| {
+            let chunk = cch.get(ci);
             let mut dates = Dates::default();
             let mut batch = Vec::with_capacity(16);
             let mut flush = |batch: &mut Vec<PendingClick>| {
@@ -2323,4 +2426,40 @@ fn top_cat(catsum: &mut [i64], touched: &mut Vec<u32>, names: &[&[u8]]) -> u32 {
     }
     touched.clear();
     top
+}
+
+#[cfg(test)]
+#[test]
+fn lazy_chunks_cover_every_data_line_once() {
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    for case in 0..300 {
+        let mut file = b"h1,h2\n".to_vec();
+        if case % 7 == 0 {
+            file.clear(); // header-only and empty variants below
+        }
+        let rows = (case * 13) % 97;
+        for r in 0..rows {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let len = (x % 9) as usize;
+            file.extend(std::iter::repeat_n(b'a' + (r % 26) as u8, len));
+            file.push(b'\n');
+        }
+        if case % 3 == 0 {
+            file.extend_from_slice(b"tail,no,newline");
+        }
+        let mut want = Vec::new();
+        if let Some(h) = memchr::memchr(b'\n', &file) {
+            for_lines(&file[h + 1..], |l| want.push(l.to_vec()));
+        }
+        for target in [1, 2, 3, 5, 8, 64, 1 << 20] {
+            let lc = LazyChunks::new(&[&file[..]], target);
+            let mut got = Vec::new();
+            for i in 0..lc.len() {
+                for_lines(lc.get(i), |l| got.push(l.to_vec()));
+            }
+            assert_eq!(got, want, "case {case} target {target}");
+        }
+    }
 }
