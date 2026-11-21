@@ -58,3 +58,23 @@ fn populate_flag() -> i32 {
 fn populate_flag() -> i32 {
     0
 }
+
+/// Pre-faults the page-cache pages of `[s, e)` of a mapping in one call
+/// (MADV_POPULATE_READ, Linux 5.14+); silently does nothing elsewhere.
+#[inline]
+pub fn populate(data: &[u8], s: usize, e: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if std::env::var_os("SS_NOPOP").is_some() {
+            return;
+        }
+        let page = 4096usize;
+        let a = (data.as_ptr() as usize + s) & !(page - 1);
+        let b = data.as_ptr() as usize + e.min(data.len());
+        if b > a {
+            libc::madvise(a as *mut libc::c_void, b - a, 22 /* MADV_POPULATE_READ */);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (data, s, e);
+}

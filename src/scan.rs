@@ -76,16 +76,22 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 pub struct Scanner<'a> {
     pub data: &'a [u8],
     base: usize,
+    /// separator (`,` or `\n`) bits of the current block not yet handed out
+    rem: u64,
     nl: u64,
-    cm: u64,
     qt: u64,
+    /// quotes before `base`, and before the start of the current line
+    qbase: u32,
+    qstart: u32,
+    /// bit of the last separator handed out
+    k: u32,
 }
 
 impl<'a> Scanner<'a> {
-    /// A scanner positioned on the block starting at `pos` (`pos <= data.len()`).
+    /// A scanner whose first line starts at `pos` (`pos <= data.len()`).
     #[inline(always)]
     pub fn new(data: &'a [u8], pos: usize) -> Self {
-        let mut s = Scanner { data, base: pos, nl: 0, cm: 0, qt: 0 };
+        let mut s = Scanner { data, base: pos, rem: 0, nl: 0, qt: 0, qbase: 0, qstart: 0, k: 0 };
         s.load();
         s
     }
@@ -97,105 +103,71 @@ impl<'a> Scanner<'a> {
         if left < 64 {
             let keep = (1u64 << left) - 1;
             self.nl = (nl & keep) | (1u64 << left);
-            self.cm = cm & keep;
             self.qt = qt & keep;
+            self.rem = self.nl | (cm & keep);
         } else {
             self.nl = nl;
-            self.cm = cm;
             self.qt = qt;
+            self.rem = nl | cm;
         }
     }
 
-    /// The next `,` or `\n` at or after `pos` (the current block must not
-    /// lie after `pos`), and the number of quotes in between.
+    /// The next separator.
     #[inline(always)]
-    pub fn next_sep(&mut self, pos: usize) -> (usize, u32) {
-        let mut quotes = 0u32;
-        let mut rel = pos - self.base;
-        loop {
-            if rel < 64 {
-                let sep = (self.cm | self.nl) >> rel;
-                let q = self.qt >> rel;
-                if sep != 0 {
-                    let k = sep.trailing_zeros();
-                    quotes += (q & ((1u64 << k) - 1)).count_ones();
-                    return (pos_of(self.base, rel, k), quotes);
-                }
-                quotes += q.count_ones();
-            } else if rel != 64 {
-                // pos lies beyond the next block: jump to it
-                self.base = pos;
-                self.load();
-                rel = 0;
-                continue;
-            }
+    fn next_sep(&mut self) -> usize {
+        while self.rem == 0 {
+            self.qbase += self.qt.count_ones();
             self.base += 64;
             self.load();
-            rel = 0;
         }
+        let k = self.rem.trailing_zeros();
+        self.rem &= self.rem - 1;
+        self.k = k;
+        self.base + k as usize
     }
 
-    /// Whether the separator found at `q` (in the current block) is a newline.
     #[inline(always)]
-    pub fn is_nl(&self, q: usize) -> bool {
-        (self.nl >> (q - self.base)) & 1 != 0
+    fn last_is_nl(&self) -> bool {
+        (self.nl >> self.k) & 1 != 0
     }
 
-    /// The next `\n` (or end) at or after `pos`.
+    /// Quotes before the last separator handed out.
     #[inline(always)]
-    pub fn next_nl(&mut self, pos: usize) -> usize {
-        let mut rel = pos - self.base;
-        loop {
-            if rel < 64 {
-                let m = self.nl >> rel;
-                if m != 0 {
-                    return pos_of(self.base, rel, m.trailing_zeros());
-                }
-            } else if rel != 64 {
-                self.base = pos;
-                self.load();
-                rel = 0;
-                continue;
-            }
-            self.base += 64;
-            self.load();
-            rel = 0;
-        }
+    fn quotes_before_last(&self) -> u32 {
+        self.qbase + (self.qt & ((1u64 << self.k) - 1)).count_ones()
     }
 
-    /// Splits the line starting at `start` into exactly `N` fields. Returns
-    /// whether the line is well formed, and the start of the next line.
+    /// Splits the line starting where the previous one ended into exactly `N`
+    /// fields (`start` must be that position). Returns whether the line is well
+    /// formed, and the start of the next line.
     #[inline(always)]
     pub fn line<const N: usize>(&mut self, start: usize, out: &mut [&'a [u8]; N]) -> (bool, usize) {
         let data = self.data;
         let mut p = start;
-        let mut ok = true;
         let mut k = 0;
+        let mut expected = 0u32;
         loop {
-            let (q, quotes) = self.next_sep(p);
-            // branchless: a field is either quote-free, or "..." with exactly two quotes
+            let q = self.next_sep();
+            // a well-formed field is quote-free or "..." with exactly two quotes;
+            // the per-line quote total below checks there are no others
             let first = unsafe { *data.as_ptr().add(p) };
             let last = unsafe { *data.as_ptr().add(q.wrapping_sub(1).max(p)) };
-            let quoted = (quotes == 2) & (first == b'"') & (last == b'"') & (q - p >= 2);
-            ok &= (quotes == 0) | quoted;
+            let quoted = (first == b'"') & (last == b'"') & (q - p >= 2);
+            expected += 2 * quoted as u32;
             let off = quoted as usize;
-            out[k] = unsafe { data.get_unchecked(p + off..q - off.min(q - p)) };
-            if self.is_nl(q) {
-                return (ok && k == N - 1, q + 1);
+            if k < N {
+                out[k] = unsafe { data.get_unchecked(p + off..q - off) };
             }
-            if k == N - 1 {
-                let e = self.next_nl(q + 1);
-                return (false, e + 1);
+            if self.last_is_nl() {
+                let qend = self.quotes_before_last();
+                let ok = k == N - 1 && qend - self.qstart == expected;
+                self.qstart = qend;
+                return (ok, q + 1);
             }
             k += 1;
             p = q + 1;
         }
     }
-}
-
-#[inline(always)]
-fn pos_of(base: usize, rel: usize, k: u32) -> usize {
-    base + rel + k as usize
 }
 
 #[cfg(test)]

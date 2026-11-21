@@ -2,6 +2,8 @@
 //! from a per-thread bump arena of huge-page-backed chunks. Pushing is a
 //! store plus a counter bump; nothing is reallocated or copied.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 pub const BLOCK: usize = 128;
 const CHUNK: usize = 64 << 20;
 
@@ -33,6 +35,35 @@ pub fn map_chunk(bytes: usize) -> *mut u8 {
     }
 }
 
+/// One big virtual reservation shared by all arenas, cut into slabs with an
+/// atomic bump, so the hot phases make no mmap calls (which would contend on
+/// the kernel's mmap lock with page faults).
+static RES_BASE: AtomicUsize = AtomicUsize::new(0);
+static RES_END: AtomicUsize = AtomicUsize::new(0);
+static RES_NEXT: AtomicUsize = AtomicUsize::new(0);
+const SLAB: usize = 2 << 20;
+
+/// Reserves `bytes` of address space (no memory is committed until touched).
+pub fn reserve(bytes: usize) {
+    let p = map_chunk(bytes) as usize;
+    RES_BASE.store(p, Ordering::Relaxed);
+    RES_NEXT.store(p, Ordering::Relaxed);
+    RES_END.store(p + bytes, Ordering::Relaxed);
+}
+
+fn slab(bytes: usize) -> (usize, usize) {
+    let size = bytes.div_ceil(SLAB) * SLAB;
+    if RES_BASE.load(Ordering::Relaxed) != 0 {
+        let p = RES_NEXT.fetch_add(size, Ordering::Relaxed);
+        if p + size <= RES_END.load(Ordering::Relaxed) {
+            return (p, p + size);
+        }
+    }
+    let size = CHUNK.max(size);
+    let p = map_chunk(size) as usize;
+    (p, p + size)
+}
+
 impl Arena {
     pub fn new() -> Self {
         Arena { cur: 0, end: 0 }
@@ -41,10 +72,9 @@ impl Arena {
     pub fn alloc(&mut self, bytes: usize, align: usize) -> *mut u8 {
         let mut p = (self.cur + align - 1) & !(align - 1);
         if p + bytes > self.end {
-            let size = CHUNK.max(bytes + align);
-            let base = map_chunk(size) as usize;
-            self.cur = base;
-            self.end = base + size;
+            let (s, e) = slab(bytes + align);
+            self.cur = s;
+            self.end = e;
             p = (self.cur + align - 1) & !(align - 1);
         }
         self.cur = p + bytes;

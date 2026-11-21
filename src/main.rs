@@ -544,6 +544,7 @@ fn main() {
 
 fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     let t0 = Instant::now();
+    EXP.store(std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     let mut tm = Timer { t0, last: t0 };
 
     // ---- small inputs
@@ -629,6 +630,47 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     let event_files = map_all("events");
     let click_files = map_all("clicks");
     let ev_bytes: usize = event_files.iter().map(|f| f.len()).sum();
+    let ck_bytes: usize = click_files.iter().map(|f| f.len()).sum();
+    // address space for every scatter buffer: EvRec ~0.8x, PEv ~0.5x of the
+    // event bytes, PCk ~1x of the click bytes, plus partly filled blocks
+    arena::reserve(2 * ev_bytes + 2 * ck_bytes + (nthreads << 30));
+    if EXP.load(std::sync::atomic::Ordering::Relaxed) == 9 {
+        let big = *event_files.iter().max_by_key(|f| f.len()).unwrap();
+        for round in 0..3 {
+            let t = Instant::now();
+            let mut n = 0usize;
+            let mut tot = 0usize;
+            for_lines::<7>(big, 0, big.len(), |f| { n += 1; tot += f[2].len(); });
+            eprintln!("round {round}: scan {} MB, {n} lines in {:.1} ms ({tot})", big.len() >> 20, t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let mut acc = 0i64;
+            for_lines::<7>(big, 0, big.len(), |f| { acc = acc.wrapping_add(ts::parse_f1(f[3]).unwrap_or(0)); });
+            eprintln!("  +ingest {:.1} ms ({acc})", t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            for_lines::<7>(big, 0, big.len(), |f| { acc = acc.wrapping_add(ts::parse(f[2]).unwrap_or(0)); });
+            eprintln!("  +ts {:.1} ms ({acc})", t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            for_lines::<7>(big, 0, big.len(), |f| { if !f[0].is_empty() && !f[1].is_empty() { acc = acc.wrapping_add((hash(key(f[0])) ^ key(f[1]) as u64) as i64); } });
+            eprintln!("  +keys {:.1} ms ({acc})", t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            for_lines::<7>(big, 0, big.len(), |f| { if !f[5].is_empty() { acc = acc.wrapping_add(product_cat(ctx, f[5]) as i64); } });
+            eprintln!("  +product {:.1} ms ({acc})", t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let mut sc: Scatter<EvRec> = Scatter::new(1024);
+            for_lines::<7>(big, 0, big.len(), |f| parse_event(ctx, f, &mut sc, 54));
+            eprintln!("  full parse_event {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let mut c = 0usize;
+            let mut p = 0;
+            while let Some(i) = memchr::memchr(b'\n', &big[p..]) { c += 1; p += i + 1; }
+            eprintln!("  memchr lines {c} in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            let mut x = 0u64;
+            for w in big.chunks_exact(8) { x = x.wrapping_add(u64::from_le_bytes(w.try_into().unwrap())); }
+            eprintln!("  sum {x} in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        std::process::exit(0);
+    }
     tm.lap("setup");
 
     // ---- links
@@ -680,6 +722,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             |_| ParseOut { ev: Scatter::new(ne), ck: Vec::new() },
             |st: &mut ParseOut, i| {
                 let c = &chunks[i];
+                io::populate(c.data, c.s, c.e + 4096);
                 if i < n_ev_chunks {
                     for_lines::<7>(c.data, c.s, c.e, |f| parse_event(ctx, f, &mut st.ev, ne_shift));
                 } else {
@@ -987,8 +1030,11 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     std::process::exit(0);
 }
 
+static EXP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[inline(always)]
 fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], out: &mut Scatter<EvRec>, shift: u32) {
+    let exp = EXP.load(std::sync::atomic::Ordering::Relaxed);
+    if exp == 1 { std::hint::black_box(f); return; }
     if f[0].is_empty() {
         return;
     }
@@ -1024,6 +1070,7 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], out: &mut Scatter<EvRec>, shift: u32) 
         rec.price = price;
         rec.cat = product_cat(ctx, pid);
     }
+    if exp == 2 { std::hint::black_box(rec); return; }
     out.push((hash(eid) >> shift) as usize, rec);
 }
 
