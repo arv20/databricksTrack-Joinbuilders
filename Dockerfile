@@ -11,5 +11,8 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=x86-64-
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/rproto /app/rproto
+# Back malloc with transparent huge pages (glibc >= 2.35; bookworm has 2.36). Cuts ~450K 4K page
+# faults to a few hundred; measured -20% wall on Linux at NCPU=8 with identical output.
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 USER 1000:1000
 CMD ["/app/rproto"]
