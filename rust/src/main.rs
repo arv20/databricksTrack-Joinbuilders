@@ -621,6 +621,16 @@ struct EvP {
 }
 
 impl EvP {
+    // Keep the session reader independent of the in-memory ingest layout.
+    // The 12-byte ingest record can supply the same ID and packed payload.
+    #[inline]
+    fn session_input(&self) -> Option<(u64, u64)> {
+        let ts = self.ts.load(Relaxed);
+        (ts != TOMBSTONE).then(|| {
+            (self.person, (u64::from(ts) << 32) | u64::from(self.price))
+        })
+    }
+
     #[cfg(test)]
     fn live(&self) -> Option<u32> {
         let ts = self.ts.load(Relaxed);
@@ -1054,22 +1064,18 @@ struct PendingClick {
     check: u32,
 }
 
-// Sorting by this key orders people, timestamps, then clicks before
-// events at the same timestamp. The width is checked before ingest.
 #[derive(Clone, Copy)]
-struct TimelineRow {
-    key: u64,
-    payload: u64,
+struct ClickMeta {
+    id: u64,
+    campaign: u32,
 }
 
-impl TimelineRow {
-    #[inline]
-    fn new(person: u32, ts: u32, event: bool, payload: u64) -> Self {
-        Self {
-            key: (u64::from(person) << 32) | (u64::from(ts) << 1) | u64::from(event),
-            payload,
-        }
-    }
+// Within a dense local person, the high word sorts by time and then
+// clicks before events. The low word is price/category or a click index.
+#[inline]
+fn timeline_payload(ts: u32, event: bool, payload: u32) -> u64 {
+    let time_key = (ts << 1) | u32::from(event);
+    (u64::from(time_key) << 32) | u64::from(payload)
 }
 
 #[derive(Default)]
@@ -1612,93 +1618,14 @@ fn fast(seed: u64) -> bool {
         },
     );
     lap("clicks parsed");
-
-    // Each partition owns its exact name interning, single mixed sort, and
-    // output columns. Start the heaviest partitions first on the same pool.
-    let ncs = ncamp + 1;
-    let mut order: Vec<_> = (0..P).map(|p| {
-        let events: usize = paccs.iter().map(|fold| fold[p].len()).sum();
-        let clicks: usize = caccs.iter().map(|fold| fold[p].len()).sum();
-        (std::cmp::Reverse(events + clicks), p)
-    }).collect();
-    order.sort_unstable();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let partitions = (0..P).into_par_iter().map(|_| order[next.fetch_add(1, Relaxed)].1);
-    let states: Vec<PartitionState> = pt(
-        partitions,
-        || PartitionState::new(ncs, ndays, cat_names.len()),
-        |mut state, partition| {
-            state.unlinked.clear();
-            state.names.clear();
-            state.rows.clear();
-            state.click_ids.clear();
-            for fold in &paccs {
-                for event in &fold[partition] {
-                    let ts = event.ts.load(Relaxed);
-                    if ts == TOMBSTONE {
-                        continue;
-                    }
-                    let Some(person) = dense_person(
-                        event.person, linked_count, &mut state.unlinked, &mut state.names,
-                    ) else {
-                        coll.store(true, Relaxed);
-                        return state;
-                    };
-                    state.rows.push(TimelineRow::new(
-                        person, ts + LOOK as u32, true, u64::from(event.price),
-                    ));
-                }
-            }
-            for fold in &caccs {
-                for click in &fold[partition] {
-                    // Hold only clicks for people with at least one surviving
-                    // event. Linked root IDs occupy a stable namespace.
-                    let person = if click.person >> 48 == 0 {
-                        (click.person as u32) >> PB
-                    } else if let Some(&id) = state.unlinked.get(unpack_ref(click.person)) {
-                        id
-                    } else {
-                        continue;
-                    };
-                    let Ok(id) = u32::try_from(state.click_ids.len()) else {
-                        coll.store(true, Relaxed);
-                        return state;
-                    };
-                    state.click_ids.push(click.id);
-                    let payload = (u64::from(click.campaign) << 32) | u64::from(id);
-                    state.rows.push(TimelineRow::new(person, click.ts, false, payload));
-                }
-            }
-            sort_timeline(&mut state.rows, &mut state.sort_scratch);
-            state.aggregate(partition, linked_count, &pname, &cat_names, click_start, day0, ndays, ncamp);
-            state
-        },
-    );
-    std::mem::forget(paccs);
-    std::mem::forget(caccs);
     if coll.load(Relaxed) {
         return false;
     }
-    lap("sessions + credit + aggregate");
-
-    // merge campaign_daily
-    let mut cd = vec![[0i64; 4]; ncs * ndays];
-    for s in &states {
-        for (a, b) in cd.iter_mut().zip(&s.cd) {
-            for k in 0..4 {
-                a[k] += b[k];
-            }
-        }
-    }
-    let nrows: usize = states.iter().map(|s| s.user.day.len()).sum();
-    lap(&format!("merged: user_daily {}", nrows));
 
     // write parquet: user_daily in parallel parts, campaign_daily in one file
     use arrow_array::*;
     use arrow_array::builder::StringBuilder;
     use arrow_schema::{DataType, Field, Schema};
-    std::fs::create_dir_all(format!("{out}/user_daily")).unwrap();
-    std::fs::create_dir_all(format!("{out}/campaign_daily")).unwrap();
     let props = parquet::file::properties::WriterProperties::builder()
         .set_compression(parquet::basic::Compression::UNCOMPRESSED)
         .set_dictionary_enabled(false)
@@ -1727,22 +1654,57 @@ fn fast(seed: u64) -> bool {
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("assisted_sessions", DataType::Int64, false),
     ]));
-    let user_job = || {
-        if nrows == 0 {
-            write(format!("{out}/user_daily/part-0.parquet"), RecordBatch::new_empty(s1.clone()));
-        } else {
-            states.into_par_iter().enumerate().for_each(|(part, state)| {
-                if !state.user.day.is_empty() {
-                    // Preserve scratch allocations until process exit, as with
-                    // the input buffers. Only the Arrow columns feed the writer.
-                    let mut state = state;
-                    let columns = std::mem::take(&mut state.user);
-                    std::mem::forget(state);
-                    write(format!("{out}/user_daily/part-{part}.parquet"), columns.finish(s1.clone()));
-                }
-            });
+    // Precompute row bounds and schedule large partitions first. These
+    // bounds also cover the dense-ID and click-index widths before writing.
+    let ncs = ncamp + 1;
+    let mut order = Vec::with_capacity(P);
+    for partition in 0..P {
+        let events: usize = paccs.iter().map(|fold| fold[partition].len()).sum();
+        let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
+        if events > (u32::MAX - linked_count) as usize || clicks > u32::MAX as usize {
+            return false;
         }
-    };
+        order.push((std::cmp::Reverse(events + clicks), partition));
+    }
+    std::fs::create_dir_all(format!("{out}/user_daily")).unwrap();
+    std::fs::create_dir_all(format!("{out}/campaign_daily")).unwrap();
+    order.sort_unstable();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Each existing Rayon worker handles whole partitions and flushes its
+    // own Parquet file as soon as it runs out of work.
+    let states = rayon::broadcast(|worker| {
+        let mut state = PartitionState::new(ncs, ndays, cat_names.len());
+        while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
+            state.group(partition, linked_count, &paccs, &caccs);
+            state.aggregate(partition, linked_count, &pname, &cat_names, click_start, day0, ndays, ncamp);
+        }
+        let nrows = state.user.day.len();
+        if nrows != 0 {
+            let columns = std::mem::take(&mut state.user);
+            let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
+            write(path, columns.finish(s1.clone()));
+        }
+        (nrows, state.cd)
+    });
+    std::mem::forget(paccs);
+    std::mem::forget(caccs);
+    lap("sessions + credit + aggregate + user parquet");
+
+    let mut cd = vec![[0i64; 4]; ncs * ndays];
+    let mut nrows = 0;
+    for (count, totals) in states {
+        nrows += count;
+        for (a, b) in cd.iter_mut().zip(totals) {
+            for k in 0..4 {
+                a[k] += b[k];
+            }
+        }
+    }
+    if nrows == 0 {
+        write(format!("{out}/user_daily/part-0.parquet"), RecordBatch::new_empty(s1));
+    }
+    lap(&format!("merged: user_daily {}", nrows));
+
     let camp_job = || {
         let (mut cid, mut cch2, mut cday) = (StringBuilder::new(), StringBuilder::new(), vec![]);
         let mut cv: [Vec<i64>; 4] = Default::default();
@@ -1777,7 +1739,7 @@ fn fast(seed: u64) -> bool {
         .unwrap();
         write(format!("{out}/campaign_daily/part-0.parquet"), batch);
     };
-    rayon::join(user_job, camp_job);
+    camp_job();
     lap("parquet written");
     true
 }
@@ -1838,9 +1800,12 @@ struct PartitionState {
     touched_categories: Vec<u32>,
     unlinked: HashMap<&'static [u8], u32>,
     names: Vec<&'static [u8]>,
-    click_ids: Vec<u64>,
-    rows: Vec<TimelineRow>,
-    sort_scratch: Vec<TimelineRow>,
+    event_people: Vec<u32>,
+    click_people_times: Vec<(u32, u32)>,
+    click_meta: Vec<ClickMeta>,
+    ends: Vec<usize>,
+    rows: Vec<u64>,
+    sort_scratch: Vec<u64>,
     click_window: Vec<(u32, u32)>,
     user: UserColumns,
 }
@@ -1856,11 +1821,87 @@ impl PartitionState {
             touched_categories: Vec::new(),
             unlinked: HashMap::new(),
             names: Vec::new(),
-            click_ids: Vec::new(),
+            event_people: Vec::new(),
+            click_people_times: Vec::new(),
+            click_meta: Vec::new(),
+            ends: Vec::new(),
             rows: Vec::new(),
             sort_scratch: Vec::new(),
             click_window: Vec::new(),
             user: UserColumns::default(),
+        }
+    }
+
+    fn group(
+        &mut self,
+        partition: usize,
+        linked_count: u32,
+        events: &[Vec<Vec<EvP>>],
+        clicks: &[Vec<Vec<Click>>],
+    ) {
+        self.unlinked.clear();
+        self.names.clear();
+        self.event_people.clear();
+        self.click_people_times.clear();
+        self.click_meta.clear();
+        self.ends.clear();
+        self.ends.resize(linked_count as usize, 0);
+
+        // The linked namespace is dense in each partition. This one-time
+        // exact-name interning for unlinked people is the bridge until the
+        // all-UID table supplies their dense IDs at ingest.
+        for fold in events {
+            for event in &fold[partition] {
+                if let Some((token, _)) = event.session_input() {
+                    let person = dense_person(token, linked_count, &mut self.unlinked, &mut self.names)
+                        .expect("partition row bound checked");
+                    self.event_people.push(person);
+                    if person as usize == self.ends.len() {
+                        self.ends.push(0);
+                    }
+                    self.ends[person as usize] += 1;
+                }
+            }
+        }
+        for fold in clicks {
+            for click in &fold[partition] {
+                let person = if click.person >> 48 == 0 {
+                    (click.person as u32) >> PB
+                } else if let Some(&id) = self.unlinked.get(unpack_ref(click.person)) {
+                    id
+                } else {
+                    continue;
+                };
+                if self.ends[person as usize] != 0 {
+                    self.click_people_times.push((person, click.ts));
+                    self.click_meta.push(ClickMeta { id: click.id, campaign: click.campaign });
+                }
+            }
+        }
+        for &(person, _) in &self.click_people_times {
+            self.ends[person as usize] += 1;
+        }
+        let mut total = 0;
+        for count in &mut self.ends {
+            total += std::mem::replace(count, total);
+        }
+        self.rows.resize(total, 0);
+        let mut emit = |person: u32, payload: u64| {
+            let next = &mut self.ends[person as usize];
+            self.rows[*next] = payload;
+            *next += 1;
+        };
+        let mut people = self.event_people.iter().copied();
+        for fold in events {
+            for event in &fold[partition] {
+                if let Some((_, payload)) = event.session_input() {
+                    let ts = (payload >> 32) as u32 + LOOK as u32;
+                    emit(people.next().unwrap(), timeline_payload(ts, true, payload as u32));
+                }
+            }
+        }
+        for (idx, &(person, ts)) in self.click_people_times.iter().enumerate() {
+            emit(person, timeline_payload(ts, false, idx as u32));
         }
     }
 
@@ -1877,14 +1918,21 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories, names,
-            click_ids, rows, click_window, user, ..
+            click_meta, ends, rows, sort_scratch, click_window, user, ..
         } = self;
         let mut flush_day = |name: &[u8], row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
             let category = top_cat(sums, touched, categories);
             user.append(name, row, categories.get(category as usize).copied());
         };
-        for group in rows.chunk_by(|a, b| a.key >> 32 == b.key >> 32) {
-            let person = (group[0].key >> 32) as u32;
+        let mut start = 0;
+        for (person, &end) in ends.iter().enumerate() {
+            let group = &mut rows[start..end];
+            start = end;
+            if group.is_empty() {
+                continue;
+            }
+            sort_person(group, sort_scratch);
+            let person = person as u32;
             let name = if person < linked_count {
                 linked_names[(person as usize) * P + partition]
             } else {
@@ -1895,11 +1943,13 @@ impl PartitionState {
             let mut head = 0;
             let mut best_click: Option<(u32, u64, usize)> = None;
             click_window.clear();
-            for row in group {
-                let time = (row.key as u32) >> 1;
-                if row.key & 1 == 0 {
-                    let campaign = (row.payload >> 32) as usize;
-                    let id = click_ids[row.payload as u32 as usize];
+            for &row in group.iter() {
+                let time_key = (row >> 32) as u32;
+                let time = time_key >> 1;
+                let payload = row as u32;
+                if time_key & 1 == 0 {
+                    let ClickMeta { id, campaign } = click_meta[payload as usize];
+                    let campaign = campaign as usize;
                     click_window.push((time, campaign as u32));
                     counts[campaign] += 1;
                     if !in_active[campaign] {
@@ -1957,9 +2007,9 @@ impl PartitionState {
                 let session = session.as_mut().unwrap();
                 session.last_event = time;
                 day.events += 1;
-                if row.payload != 0 {
-                    let price = (row.payload & 0xff_ffff) as i64;
-                    let category = (row.payload >> 24) as usize;
+                if payload != 0 {
+                    let price = (payload & 0xff_ffff) as i64;
+                    let category = (payload >> 24) as usize;
                     if catsum[category] == 0 {
                         touched_categories.push(category as u32);
                     }
@@ -1980,36 +2030,39 @@ impl PartitionState {
     }
 }
 
-fn sort_timeline(rows: &mut Vec<TimelineRow>, scratch: &mut Vec<TimelineRow>) {
-    if rows.len() < 256 || rows.len() > u32::MAX as usize {
-        rows.sort_unstable_by_key(|row| row.key);
+fn sort_person(rows: &mut [u64], scratch: &mut Vec<u64>) {
+    if rows.len() <= 4096 || rows.len() > u32::MAX as usize {
+        rows.sort_unstable();
         return;
     }
-    let max = rows.iter().map(|row| row.key).max().unwrap_or(0);
-    let bits = u64::BITS - max.leading_zeros();
+    // Only time/type needs sorting. Equal keys of the same type are
+    // interchangeable here, including tied clicks handled by their IDs.
     const STEP: u32 = 11;
     const BUCKETS: usize = 1 << STEP;
-    scratch.resize(rows.len(), TimelineRow { key: 0, payload: 0 });
-    for shift in (0..bits).step_by(STEP as usize) {
-        let buckets = 1 << (bits - shift).min(STEP);
+    scratch.resize(rows.len(), 0);
+    let scatter = |input: &[u64], output: &mut [u64], shift: u32| {
+        let buckets = 1 << (64 - shift).min(STEP);
         let mask = buckets - 1;
         let mut counts = [0u32; BUCKETS];
         let digit = |key: u64| (key >> shift) as usize & mask;
-        for row in rows.iter() {
-            counts[digit(row.key)] += 1;
+        for &key in input {
+            counts[digit(key)] += 1;
         }
         let mut offset = 0;
         for count in &mut counts[..buckets] {
             let count = std::mem::replace(count, offset);
             offset += count;
         }
-        for &row in rows.iter() {
-            let next = &mut counts[digit(row.key)];
-            scratch[*next as usize] = row;
+        for &key in input {
+            let next = &mut counts[digit(key)];
+            output[*next as usize] = key;
             *next += 1;
         }
-        std::mem::swap(rows, scratch);
-    }
+    };
+    scatter(rows, scratch, 32);
+    scatter(scratch, rows, 43);
+    scatter(rows, scratch, 54);
+    rows.copy_from_slice(scratch);
 }
 
 /// Highest summed price; ties to the byte-wise smallest name. Resets the sums.
