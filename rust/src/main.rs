@@ -2154,7 +2154,7 @@ fn fast(seed: u64) -> bool {
     // own Parquet file as soon as it runs out of work.
     let states = rayon::broadcast(|worker| {
         let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
-        let user = user_parquet::UserParquet::new(path, user_schema.clone(), props.clone());
+        let user = user_parquet::UserParquet::new(path, user_schema.clone());
         let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
         while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
             state.group(partition, linked_count, &paccs, &caccs);
@@ -2245,6 +2245,7 @@ struct PartitionState {
     clicks: Vec<Click>,
     event_scratch: Vec<u64>,
     click_scratch: Vec<Click>,
+    buckets: EventBuckets,
     user: user_parquet::UserParquet,
     user_rows: usize,
 }
@@ -2264,6 +2265,7 @@ impl PartitionState {
             clicks: Vec::new(),
             event_scratch: Vec::new(),
             click_scratch: Vec::new(),
+            buckets: EventBuckets::default(),
             user,
             user_rows: 0,
         }
@@ -2326,13 +2328,9 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            event_ends, click_ends, events, clicks, event_scratch, click_scratch, user, user_rows,
+            event_ends, click_ends, events, clicks, event_scratch, click_scratch, buckets,
+            user, user_rows,
         } = self;
-        let mut flush_day = |name: &[u8], row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
-            let category = top_cat(sums, touched, categories);
-            user.append(name, row, categories.get(category as usize).copied());
-            *user_rows += 1;
-        };
         let (mut event_start, mut click_start) = (0, 0);
         for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
             let events = &mut events[event_start..event_end];
@@ -2341,47 +2339,15 @@ impl PartitionState {
             if events.is_empty() {
                 continue;
             }
-            sort_timeline(events, event_scratch, |event| (event >> 32) as u32);
             sort_timeline(clicks, click_scratch, |click| click.ts);
             let name = pname[person * P + partition];
-            let mut day = UserDay::default();
+            let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
+                let category = top_cat(sums, touched, categories);
+                user.append(name, row, categories.get(category as usize).copied());
+                *user_rows += 1;
+            };
             let (mut lo, mut hi, mut best_click) = (0, 0, None::<Click>);
-            let mut i = 0;
-            while i < events.len() {
-                let start = (events[i] >> 32) as u32;
-                let session_day = (origin + i64::from(start)).div_euclid(DAY);
-                if day.sessions != 0 && day.day != session_day {
-                    flush_day(name, &day, catsum, touched_categories);
-                    day = UserDay::default();
-                }
-                day.day = session_day;
-                day.sessions += 1;
-
-                let mut end = i;
-                let mut previous = start;
-                let mut revenue = 0i64;
-                while let Some(&event) = events.get(end) {
-                    let time = (event >> 32) as u32;
-                    if time - previous > GAP as u32 {
-                        break;
-                    }
-                    previous = time;
-                    let payload = event as u32;
-                    if payload != 0 {
-                        let price = i64::from(payload & 0xff_ffff);
-                        let category = (payload >> 24) as usize;
-                        if catsum[category] == 0 {
-                            touched_categories.push(category as u32);
-                        }
-                        catsum[category] += price;
-                        revenue += price;
-                    }
-                    end += 1;
-                }
-                day.revenue += revenue;
-                day.events += (end - i) as i64;
-                i = end;
-
+            let mut attribute = |start, session_day, revenue| {
                 let time = start + LOOK as u32;
                 let day_index = (session_day - day0) as usize;
                 let lower = start;
@@ -2424,13 +2390,157 @@ impl PartitionState {
                 total[0] += 1;
                 total[1] += i64::from(revenue > 0);
                 total[2] += revenue;
+            };
+
+            if events.len() < BUCKET_MIN_LEN {
+                sort_timeline(events, event_scratch, |event| (event >> 32) as u32);
+                aggregate_sessions(
+                    events, origin, catsum, touched_categories,
+                    |event| {
+                        let time = (event >> 32) as u32;
+                        (time, time)
+                    },
+                    |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
+                    write_day, &mut attribute,
+                );
+            } else {
+                buckets.build(events);
+                aggregate_sessions(
+                    &buckets.used, origin, catsum, touched_categories,
+                    |index| {
+                        let b = &buckets.by_time[index];
+                        (b.first, b.last)
+                    },
+                    |index, sums, touched| buckets.aggregate(index, sums, touched),
+                    write_day, &mut attribute,
+                );
             }
-            flush_day(name, &day, catsum, touched_categories);
             for campaign in active.drain(..) {
                 counts[campaign as usize] = 0;
                 in_active[campaign as usize] = false;
             }
         }
+    }
+}
+
+/// Each span is either a single event or an exact summary of a connected
+/// half-hour bucket. Session credit and day totals consume either directly.
+#[inline]
+fn aggregate_sessions<T: Copy>(
+    rows: &[T],
+    origin: i64,
+    catsum: &mut [i64],
+    touched: &mut Vec<u32>,
+    bounds: impl Fn(T) -> (u32, u32),
+    aggregate: impl Fn(T, &mut [i64], &mut Vec<u32>) -> (i64, i64),
+    mut write_day: impl FnMut(&UserDay, &mut [i64], &mut Vec<u32>),
+    mut credit: impl FnMut(u32, i64, i64),
+) {
+    let mut day = UserDay::default();
+    let mut i = 0;
+    while i < rows.len() {
+        let (start, _) = bounds(rows[i]);
+        let session_day = (origin + i64::from(start)).div_euclid(DAY);
+        if day.sessions != 0 && day.day != session_day {
+            write_day(&day, catsum, touched);
+            day = UserDay::default();
+        }
+        day.day = session_day;
+        day.sessions += 1;
+
+        let mut previous = start;
+        let mut revenue = 0i64;
+        while let Some(&row) = rows.get(i) {
+            let (first, last) = bounds(row);
+            if first - previous > GAP as u32 {
+                break;
+            }
+            previous = last;
+            let (events, price) = aggregate(row, catsum, touched);
+            day.events += events;
+            revenue += price;
+            i += 1;
+        }
+        day.revenue += revenue;
+        credit(start, session_day, revenue);
+    }
+    write_day(&day, catsum, touched);
+}
+
+#[inline]
+fn add_purchase(payload: u32, sums: &mut [i64], touched: &mut Vec<u32>) -> i64 {
+    if payload == 0 {
+        return 0;
+    }
+    let price = i64::from(payload & 0xff_ffff);
+    let category = (payload >> 24) as usize;
+    if sums[category] == 0 {
+        touched.push(category as u32);
+    }
+    sums[category] += price;
+    price
+}
+
+const BUCKET_MIN_LEN: usize = 128;
+const MAX_EVENT_BUCKETS: usize = ((1u32 << 31) / GAP as u32) as usize + 1;
+
+#[derive(Default)]
+struct EventBucket {
+    first: u32,
+    last: u32,
+    count: i64,
+    /// One-based index of the most recent purchase in the bucket.
+    purchase: usize,
+}
+
+#[derive(Default)]
+struct EventBuckets {
+    by_time: Vec<EventBucket>,
+    used: Vec<usize>,
+    purchases: Vec<(u32, usize)>,
+}
+
+impl EventBuckets {
+    fn build(&mut self, events: &[u64]) {
+        for index in self.used.drain(..) {
+            self.by_time[index] = EventBucket::default();
+        }
+        self.by_time.resize_with(MAX_EVENT_BUCKETS, EventBucket::default);
+        self.purchases.clear();
+        for &event in events {
+            let time = (event >> 32) as u32;
+            // A half-hour bucket is connected for every input distribution.
+            // Only its endpoints matter when joining adjacent occupied buckets.
+            let index = (time / GAP as u32) as usize;
+            let bucket = &mut self.by_time[index];
+            if bucket.count == 0 {
+                bucket.first = time;
+                bucket.last = time;
+                self.used.push(index);
+            } else {
+                bucket.first = bucket.first.min(time);
+                bucket.last = bucket.last.max(time);
+            }
+            bucket.count += 1;
+            let payload = event as u32;
+            if payload != 0 {
+                self.purchases.push((payload, bucket.purchase));
+                bucket.purchase = self.purchases.len();
+            }
+        }
+        self.used.sort_unstable();
+    }
+
+    fn aggregate(&self, index: usize, sums: &mut [i64], touched: &mut Vec<u32>) -> (i64, i64) {
+        let bucket = &self.by_time[index];
+        let mut node = bucket.purchase;
+        let mut revenue = 0;
+        while node != 0 {
+            let (payload, previous) = self.purchases[node - 1];
+            revenue += add_purchase(payload, sums, touched);
+            node = previous;
+        }
+        (bucket.count, revenue)
     }
 }
 
