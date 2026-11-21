@@ -1341,29 +1341,6 @@ fn csv_str(bytes: &[u8]) -> &str {
 }
 
 #[inline]
-fn dense_person(
-    token: u64,
-    linked_count: u32,
-    unlinked: &mut HashMap<&'static [u8], u32>,
-    names: &mut Vec<&'static [u8]>,
-) -> Option<u32> {
-    if token >> 48 == 0 {
-        return Some((token as u32) >> PB);
-    }
-    use std::collections::hash_map::Entry;
-    let name = unpack_ref(token);
-    match unlinked.entry(name) {
-        Entry::Occupied(entry) => Some(*entry.get()),
-        Entry::Vacant(entry) => {
-            let id = linked_count.checked_add(u32::try_from(names.len()).ok()?)?;
-            names.push(name);
-            entry.insert(id);
-            Some(id)
-        }
-    }
-}
-
-#[inline]
 fn pack_ref(s: &[u8]) -> Option<u64> {
     let p = s.as_ptr() as u64;
     if p >> 48 != 0 || s.len() >= (1 << 16) { None } else { Some(p | ((s.len() as u64) << 48)) }
@@ -1870,14 +1847,14 @@ fn fast(seed: u64) -> bool {
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("assisted_sessions", DataType::Int64, false),
     ]));
-    // Precompute row bounds and schedule large partitions first. These
-    // bounds also cover the dense-ID and click-index widths before writing.
+    // Schedule large partitions first and check click-index width
+    // before writing any output.
     let ncs = ncamp + 1;
     let mut order = Vec::with_capacity(P);
     for partition in 0..P {
         let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
         let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
-        if events > (u32::MAX - linked_count) as usize || clicks > u32::MAX as usize {
+        if clicks > u32::MAX as usize {
             return false;
         }
         order.push((std::cmp::Reverse(events + clicks), partition));
@@ -2014,9 +1991,6 @@ struct PartitionState {
     active: Vec<u32>,
     catsum: Vec<i64>,
     touched_categories: Vec<u32>,
-    unlinked: HashMap<&'static [u8], u32>,
-    names: Vec<&'static [u8]>,
-    event_people: Vec<u32>,
     click_people_times: Vec<(u32, u32)>,
     click_meta: Vec<ClickMeta>,
     ends: Vec<usize>,
@@ -2035,9 +2009,6 @@ impl PartitionState {
             active: Vec::new(),
             catsum: vec![0; categories],
             touched_categories: Vec::new(),
-            unlinked: HashMap::new(),
-            names: Vec::new(),
-            event_people: Vec::new(),
             click_people_times: Vec::new(),
             click_meta: Vec::new(),
             ends: Vec::new(),
@@ -2055,39 +2026,23 @@ impl PartitionState {
         events: &[People],
         clicks: &[Vec<Vec<Click>>],
     ) {
-        self.unlinked.clear();
-        self.names.clear();
-        self.event_people.clear();
         self.click_people_times.clear();
         self.click_meta.clear();
         self.ends.clear();
         self.ends.resize(linked_count as usize, 0);
 
-        // The linked namespace is dense in each partition. This one-time
-        // exact-name interning for unlinked people is the bridge until the
-        // all-UID table supplies their dense IDs at ingest.
+        // Every accepted record has a dense ID from the all-UID table.
+        // The partition already encodes the low bits of that ID.
         for fold in events {
             for event in fold.records(partition).into_iter().flatten() {
-                if let Some((token, _)) = event.session_input() {
-                    let person = dense_person(token, linked_count, &mut self.unlinked, &mut self.names)
-                        .expect("partition row bound checked");
-                    self.event_people.push(person);
-                    if person as usize == self.ends.len() {
-                        self.ends.push(0);
-                    }
-                    self.ends[person as usize] += 1;
+                if let Some((person, _)) = event.session_input() {
+                    self.ends[(person >> PB) as usize] += 1;
                 }
             }
         }
         for fold in clicks {
             for click in &fold[partition] {
-                let person = if click.person >> 48 == 0 {
-                    (click.person as u32) >> PB
-                } else if let Some(&id) = self.unlinked.get(unpack_ref(click.person)) {
-                    id
-                } else {
-                    continue;
-                };
+                let person = (click.person >> PB) as u32;
                 if self.ends[person as usize] != 0 {
                     self.click_people_times.push((person, click.ts));
                     self.click_meta.push(ClickMeta { id: click.id, campaign: click.campaign });
@@ -2107,12 +2062,11 @@ impl PartitionState {
             self.rows[*next] = payload;
             *next += 1;
         };
-        let mut people = self.event_people.iter().copied();
         for fold in events {
             for event in fold.records(partition).into_iter().flatten() {
-                if let Some((_, payload)) = event.session_input() {
+                if let Some((person, payload)) = event.session_input() {
                     let ts = (payload >> 32) as u32 + LOOK as u32;
-                    emit(people.next().unwrap(), timeline_payload(ts, true, payload as u32));
+                    emit((person >> PB) as u32, timeline_payload(ts, true, payload as u32));
                 }
             }
         }
@@ -2125,7 +2079,7 @@ impl PartitionState {
         &mut self,
         partition: usize,
         linked_count: u32,
-        linked_names: &[&[u8]],
+        pname: &[&[u8]],
         categories: &[&[u8]],
         origin: i64,
         day0: i64,
@@ -2133,7 +2087,7 @@ impl PartitionState {
         organic: usize,
     ) {
         let Self {
-            cd, counts, in_active, active, catsum, touched_categories, names,
+            cd, counts, in_active, active, catsum, touched_categories,
             click_meta, ends, rows, sort_scratch, click_window, user, ..
         } = self;
         let mut flush_day = |name: &[u8], row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
@@ -2148,12 +2102,8 @@ impl PartitionState {
                 continue;
             }
             sort_person(group, sort_scratch);
-            let person = person as u32;
-            let name = if person < linked_count {
-                linked_names[(person as usize) * P + partition]
-            } else {
-                names[(person - linked_count) as usize]
-            };
+            debug_assert!(person < linked_count as usize);
+            let name = pname[person * P + partition];
             let mut session: Option<Session> = None;
             let mut day = UserDay::default();
             let mut head = 0;
