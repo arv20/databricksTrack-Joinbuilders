@@ -1399,7 +1399,7 @@ impl LinkName {
 
 enum LinkSlot {
     Inserted(usize),
-    Duplicate,
+    Duplicate(u32),
     Spill,
 }
 
@@ -1411,14 +1411,12 @@ fn link_slot(
     e: LinkEnd,
     node: u32,
     names: &[LinkName],
-    endpoints: &[AtomicU32],
     collision: &AtomicBool,
 ) -> LinkSlot {
     while let Some(slot) = slots.get_mut(i) {
         if slot.0 == 0 {
             names[node as usize].set(e.name);
             *slot = (e.key, (u64::from(e.check) << 32) | u64::from(node));
-            endpoints[node as usize].store(node, Relaxed);
             return LinkSlot::Inserted(i);
         }
         if slot.0 == e.key {
@@ -1429,8 +1427,7 @@ fn link_slot(
             {
                 collision.store(true, Relaxed);
             }
-            endpoints[node as usize].store(other, Relaxed);
-            return LinkSlot::Duplicate;
+            return LinkSlot::Duplicate(other);
         }
         i = (i + 1) & mask;
     }
@@ -1506,38 +1503,61 @@ fn build_links(
     }
     lap("  links parsed+hashed");
 
-    let mut nend = 0u32;
-    let offsets: Vec<_> = batches.iter().map(|(_, count)| {
-        let start = nend;
-        nend += count;
+    // Keep resolved endpoints in their parsed buffers until an entire input
+    // batch can be gathered by one worker. Insertion writes only shard-local names.
+    let sizes: Vec<_> = batches.iter().map(|(_, count)| *count).collect();
+    let nend: u32 = sizes.iter().sum();
+    let mut buckets: [Vec<Vec<LinkEnd>>; LINK_SHARDS] =
+        std::array::from_fn(|_| Vec::with_capacity(batches.len()));
+    for (ends, _) in batches {
+        for (bucket, batch) in buckets.iter_mut().zip(ends) {
+            bucket.push(batch);
+        }
+    }
+    let mut node_start = 0u32;
+    let starts: Vec<_> = buckets.iter().map(|bucket| {
+        let start = node_start;
+        node_start += bucket.iter().map(|batch| batch.len() as u32).sum::<u32>();
         start
     }).collect();
     let names: Vec<_> = (0..nend).map(|_| LinkName::default()).collect();
-    let endpoints: Vec<_> = (0..nend).map(|_| AtomicU32::new(u32::MAX)).collect();
     let range_mask = range_len - 1;
-    let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).enumerate().map(|(shard, slots)| {
-        let mut nodes = Vec::new();
-        let mut spill = Vec::new();
-        for ((ends, _), &start) in batches.iter().zip(&offsets) {
-            for &e in &ends[shard] {
-                let node = start + e.endpoint;
-                let i = e.key as usize & range_mask;
-                match link_slot(slots, i, usize::MAX, e, node, &names, &endpoints, &collision) {
-                    LinkSlot::Inserted(local) => nodes.push(((shard * range_len + local) as u32, node)),
-                    LinkSlot::Duplicate => {}
-                    LinkSlot::Spill => spill.push((e, node)),
+    let mut ranges: Vec<_> = table.slots.par_chunks_mut(range_len).zip(&mut buckets)
+        .enumerate().map(|(shard, (slots, bucket))| {
+            let mut nodes = Vec::new();
+            let mut spill = Vec::new();
+            for (batch_id, batch) in bucket.iter_mut().enumerate() {
+                for (end_id, e) in batch.iter_mut().enumerate() {
+                    let node = starts[shard] + nodes.len() as u32;
+                    let i = e.key as usize & range_mask;
+                    match link_slot(slots, i, usize::MAX, *e, node, &names, &collision) {
+                        LinkSlot::Inserted(local) => {
+                            nodes.push(((shard * range_len + local) as u32, node));
+                            e.key = u64::from(node);
+                        }
+                        LinkSlot::Duplicate(other) => e.key = u64::from(other),
+                        LinkSlot::Spill => spill.push((batch_id, end_id)),
+                    }
                 }
             }
-        }
-        (nodes, spill)
-    }).collect();
-    for shard in 0..ranges.len() {
-        for (e, node) in std::mem::take(&mut ranges[shard].1) {
+            (nodes, spill)
+        }).collect();
+    let mut next: Vec<_> = starts.iter().zip(&ranges)
+        .map(|(start, (nodes, _))| start + nodes.len() as u32)
+        .collect();
+    for (shard, bucket) in buckets.iter_mut().enumerate() {
+        for (batch_id, end_id) in std::mem::take(&mut ranges[shard].1) {
+            let e = &mut bucket[batch_id][end_id];
+            let node = next[shard];
             let i = e.key as usize & table.mask;
-            if let LinkSlot::Inserted(slot) =
-                link_slot(&mut table.slots, i, table.mask, e, node, &names, &endpoints, &collision)
-            {
-                ranges[slot >> shift].0.push((slot as u32, node));
+            match link_slot(&mut table.slots, i, table.mask, *e, node, &names, &collision) {
+                LinkSlot::Inserted(slot) => {
+                    ranges[slot >> shift].0.push((slot as u32, node));
+                    next[shard] += 1;
+                    e.key = u64::from(node);
+                }
+                LinkSlot::Duplicate(other) => e.key = u64::from(other),
+                LinkSlot::Spill => unreachable!("all-uid table has spare slots"),
             }
         }
     }
@@ -1546,11 +1566,25 @@ fn build_links(
     }
     lap("  links inserted");
 
+    let empty_batch = |_| std::array::from_fn(|_| Vec::new());
+    let mut batches: Vec<[Vec<LinkEnd>; LINK_SHARDS]> = sizes.iter().map(empty_batch).collect();
+    for (shard, bucket) in buckets.into_iter().enumerate() {
+        for (batch, ends) in batches.iter_mut().zip(bucket) {
+            batch[shard] = ends;
+        }
+    }
+
     let parent: Vec<_> = (0..nend).map(|_| AtomicU32::new(0)).collect();
-    endpoints.par_chunks(4096).for_each(|ends| {
+    batches.into_par_iter().zip(sizes).for_each(|(batch, size)| {
+        let mut ends = vec![0u32; size as usize];
+        for lane in &batch {
+            for e in lane {
+                ends[e.endpoint as usize] = e.key as u32;
+            }
+        }
         for edge in ends.chunks_exact(2) {
-            let mut a = link_root(&parent, edge[0].load(Relaxed));
-            let mut b = link_root(&parent, edge[1].load(Relaxed));
+            let mut a = link_root(&parent, edge[0]);
+            let mut b = link_root(&parent, edge[1]);
             while a != b {
                 // Root order is immutable, so concurrent unions cannot form a
                 // cycle. The root itself is also the smallest ID in its component.
