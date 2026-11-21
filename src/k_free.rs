@@ -980,7 +980,7 @@ unsafe fn ev_fast<S: EventSink>(
         let kr = T.kind2.get_unchecked(r4 * 2 + (*rs4.wrapping_add(3) & 1) as usize);
         let bad_kind = _mm_and_si128(_mm_xor_si128(ld(rs4), ld(kr.cand.as_ptr())), ld(kr.maskv.as_ptr()));
         let q3 = (raw3 >> 1 & 1) as usize;
-        let j = (c2 - c1 - 1) * 2 + q3;
+        let j = here(((c2 - c1 - 1) * 2 + q3) as u64) as usize;
         let (ja, jb, jc, jd, je) = (T.tja.get_unchecked(j), T.tjb.get_unchecked(j), T.tjc.get_unchecked(j), T.tjd.get_unchecked(j), T.tje.get_unchecked(j));
         let e2 = p.wrapping_add(c2);
         let kp2 = p.wrapping_add(c1 + 1).wrapping_offset(je.koff as isize);
