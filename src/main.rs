@@ -457,7 +457,13 @@ struct Scratch<E> {
     starts: Vec<i64>,
     run_end: Vec<u32>,
     cp: Vec<E>,
+    /// per campaign: the last session (`sid`) it assisted, for direct assists
+    stamp: Vec<u64>,
+    sid: u64,
 }
+
+/// Up to this many sessions x clicks, a person's assists are found per session.
+const DIRECT_ASSISTS: usize = 2048;
 
 #[inline]
 fn process_person<E: EvT>(
@@ -555,6 +561,13 @@ fn process_person<E: EvT>(
     let mut j = 0usize;
     let mut grp = 0usize; // first index of the run of equal ts ending at j-1
     let mut chosen = (usize::MAX, 0u32); // (grp, its smallest click_id's campaign)
+    // few sessions x clicks: assists straight from each session's window of
+    // clicks [lo, j), a campaign counted once per session by stamping it
+    let direct = ns * cks.len() <= DIRECT_ASSISTS;
+    if direct && sc.stamp.len() < organic as usize {
+        sc.stamp.resize(organic as usize, 0);
+    }
+    let mut lo = 0usize;
     for s in &sc.sess {
         let srel = (s.start - cws) as u64; // >= 7 days: sessions start in the window
         while j < cks.len() && cks[j].hi() <= srel {
@@ -583,6 +596,23 @@ fn process_person<E: EvT>(
         c[0] += 1;
         c[1] += (s.rev > 0) as u64;
         c[2] += s.rev;
+        if direct {
+            while lo < j && cks[lo].hi() + (LOOKBACK as u64) < srel {
+                lo += 1;
+            }
+            sc.sid += 1;
+            for c in &cks[lo..j] {
+                let camp = ck_camp[c.lo() as usize];
+                let st = unsafe { sc.stamp.get_unchecked_mut(camp as usize) };
+                if *st != sc.sid {
+                    *st = sc.sid;
+                    cd.cell(camp, s.day)[3] += 1;
+                }
+            }
+        }
+    }
+    if direct {
+        return;
     }
     // assists: the union over a campaign's clicks of [ts, ts + 7d] holds the
     // starts of exactly the sessions it assists
@@ -1085,7 +1115,7 @@ fn dedup_sessions<E: EvT>(
             cks: Vec::new(),
             ck_cid: Vec::new(),
             ck_camp: Vec::new(),
-            sc: Scratch { sess: Vec::new(), cats: Vec::new(), starts: Vec::new(), run_end: Vec::new(), cp: Vec::new() },
+            sc: Scratch { sess: Vec::new(), cats: Vec::new(), starts: Vec::new(), run_end: Vec::new(), cp: Vec::new(), stamp: Vec::new(), sid: 0 },
         },
         |st: &mut AggOut<E>, task| {
             let p = order[task];
