@@ -25,7 +25,6 @@ const PF_DIST: usize = 32;
 const GAP: i64 = 30 * ts::MIN;
 const LATE: i64 = DAY;
 const LOOKBACK: i64 = 7 * DAY;
-const INVALID: u32 = u32::MAX;
 const NO_CAT: u32 = u32::MAX;
 
 // ------------------------------------------------------------------ records
@@ -34,13 +33,12 @@ const NO_CAT: u32 = u32::MAX;
 /// fails validation (or is late); its other payload is unused.
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
-struct EvRec {
+struct EvRec<E: Copy> {
     eid: Key,
     user: Key,
     ingest: i64,
-    ts: i64,
-    cat: u32,
-    price: u32,
+    /// the event packed as it is kept (`E::make`), or `E::INVALID`
+    ev: E,
 }
 
 /// One valid click line.
@@ -53,8 +51,8 @@ struct CkRec {
     camp: u32,
 }
 
-struct ParseOut {
-    ev: Scatter<EvRec>,
+struct ParseOut<E: Copy> {
+    ev: Scatter<EvRec<E>>,
     ck: Vec<CkRec>,
 }
 
@@ -80,6 +78,9 @@ struct PCk {
 /// packed into one integer whose order is `ts` order first, so a person's
 /// events sort as plain integers.
 trait EvT: Copy + Default + Ord + Send + Sync + 'static {
+    /// Marks a copy that fails validation: all ones, never a valid packing
+    /// (its price field would exceed 10^7).
+    const INVALID: Self;
     fn make(rel: u64, cat: u32, price: u32) -> Self;
     fn rel(self) -> u64;
     fn cat(self) -> u32;
@@ -94,6 +95,7 @@ trait EvT: Copy + Default + Ord + Send + Sync + 'static {
 /// `rel << 32 | price << 8 | cat`: needs `rel < 2^32` (a window under ~49
 /// days), at most 256 categories, and price < 2^24 (it is at most 10^7).
 impl EvT for u64 {
+    const INVALID: Self = u64::MAX;
     #[inline(always)]
     fn make(rel: u64, cat: u32, price: u32) -> Self {
         (rel << 32) | ((price as u64) << 8) | cat as u64
@@ -126,6 +128,7 @@ impl EvT for u64 {
 
 /// `rel << 64 | price << 32 | cat`: the general fallback.
 impl EvT for u128 {
+    const INVALID: Self = u128::MAX;
     #[inline(always)]
     fn make(rel: u64, cat: u32, price: u32) -> Self {
         ((rel as u128) << 64) | ((price as u128) << 32) | cat as u128
@@ -159,7 +162,7 @@ impl EvT for u128 {
 /// Whether every surviving event and click fits the `u64` packing (a click's
 /// `ts - (window_start - 7 days)` is the larger offset).
 fn packed_fits(ctx: &Ctx) -> bool {
-    ctx.cat_names.len() <= 256 && ctx.we - ctx.cws <= u32::MAX as i64
+    ctx.cat_names.len() <= 256 && ctx.we - ctx.cws <= u32::MAX as i64 && std::env::var_os("SS_WIDE").is_none()
 }
 
 /// A person bucket's valid clicks: `keys` hold `pair(ts - cws, pos)` (sorted
@@ -808,57 +811,16 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     // ---- events + clicks parse (and persons built alongside)
     let est_lines = ev_bytes / 70 + 1;
     let ne = (est_lines / 40_000).next_power_of_two().clamp(16, 4096);
-    let ne_shift = 64 - ne.trailing_zeros();
     let mut chunks = Vec::new();
     plan_chunks(&event_files, 4 << 20, &mut chunks);
     let n_ev_chunks = chunks.len();
     plan_chunks(&click_files, 4 << 20, &mut chunks);
 
-    let persons_slot: Mutex<Option<Persons>> = Mutex::new(None);
-    let parse_out: Vec<ParseOut> = std::thread::scope(|sc| {
-        sc.spawn(|| {
-            let t = Instant::now();
-            let p = build_persons(link_pairs);
-            eprintln!(
-                "  persons: {} linked ids, built in {:.1} ms",
-                p.map.len(),
-                t.elapsed().as_secs_f64() * 1e3
-            );
-            *persons_slot.lock().unwrap() = Some(p);
-        });
-        parallel(
-            nthreads,
-            chunks.len(),
-            |_| ParseOut { ev: Scatter::new(ne), ck: Vec::new() },
-            |st: &mut ParseOut, i| {
-                let c = &chunks[i];
-                io::populate(c.data, c.s, c.e + 4096);
-                if i < n_ev_chunks {
-                    for_lines::<7>(c.data, c.s, c.e, |f| parse_event(ctx, f, &mut st.ev, ne_shift));
-                } else {
-                    for_lines::<4>(c.data, c.s, c.e, |f| parse_click(ctx, f, &mut st.ck));
-                }
-            },
-        )
-    });
-    let persons = persons_slot.into_inner().unwrap().unwrap();
-    let persons = &persons;
-    tm.lap("parse");
-    // nothing reads the input mappings after the parse (keys are copied), so
-    // a helper thread unmaps them now: page-table teardown of ~2 GB of file
-    // pages is otherwise ~10 ms of single-threaded work inside exit()
-    drop(chunks);
     let in_files: Vec<&'static [u8]> = link_files.into_iter().chain(event_files).chain(click_files).collect();
-    std::thread::spawn(move || {
-        for f in in_files {
-            unsafe { io::unmap(f) };
-        }
-    });
-
     let agg: Vec<(Vec<UdRow>, CampAcc)> = if packed_fits(ctx) {
-        dedup_sessions::<u64>(ctx, persons, &parse_out, ne, nthreads, &mut tm)
+        parse_dedup_sessions::<u64>(ctx, chunks, n_ev_chunks, link_pairs, in_files, ne, nthreads, &mut tm)
     } else {
-        dedup_sessions::<u128>(ctx, persons, &parse_out, ne, nthreads, &mut tm)
+        parse_dedup_sessions::<u128>(ctx, chunks, n_ev_chunks, link_pairs, in_files, ne, nthreads, &mut tm)
     };
 
     // ---- write outputs
@@ -902,17 +864,76 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     std::process::exit(0);
 }
 
+/// Parse of events and clicks (persons built alongside), then dedup and
+/// sessions, with events packed as `E` from the parse on.
+#[allow(clippy::too_many_arguments)]
+fn parse_dedup_sessions<E: EvT>(
+    ctx: &Ctx,
+    chunks: Vec<Chunk>,
+    n_ev_chunks: usize,
+    link_pairs: Vec<Vec<(Key, Key)>>,
+    in_files: Vec<&'static [u8]>,
+    ne: usize,
+    nthreads: usize,
+    tm: &mut Timer,
+) -> Vec<(Vec<UdRow>, CampAcc)> {
+    let ne_shift = 64 - ne.trailing_zeros();
+    let persons_slot: Mutex<Option<Persons>> = Mutex::new(None);
+    let parse_out: Vec<ParseOut<E>> = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let t = Instant::now();
+            let p = build_persons(link_pairs);
+            eprintln!(
+                "  persons: {} linked ids, built in {:.1} ms",
+                p.map.len(),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            *persons_slot.lock().unwrap() = Some(p);
+        });
+        parallel(
+            nthreads,
+            chunks.len(),
+            |_| ParseOut { ev: Scatter::new(ne), ck: Vec::new() },
+            |st: &mut ParseOut<E>, i| {
+                let c = &chunks[i];
+                io::populate(c.data, c.s, c.e + 4096);
+                if i < n_ev_chunks {
+                    for_lines::<7>(c.data, c.s, c.e, |f| parse_event(ctx, f, &mut st.ev, ne_shift));
+                } else {
+                    for_lines::<4>(c.data, c.s, c.e, |f| parse_click(ctx, f, &mut st.ck));
+                }
+            },
+        )
+    });
+    // leaked like everything else big: the exit reclaims it
+    let persons: &Persons = Box::leak(Box::new(persons_slot.into_inner().unwrap().unwrap()));
+    tm.lap("parse");
+    // nothing reads the input mappings after the parse (keys are copied), so
+    // a helper thread unmaps them now: page-table teardown of ~2 GB of file
+    // pages is otherwise ~10 ms of single-threaded work inside exit()
+    drop(chunks);
+    std::thread::spawn(move || {
+        for f in in_files {
+            unsafe { io::unmap(f) };
+        }
+    });
+
+    let agg = dedup_sessions::<E>(ctx, persons, &parse_out, ne, nthreads, tm);
+    std::mem::forget(parse_out);
+    agg
+
+}
+
 /// Dedup (events by event_id, clicks and events mapped to persons and
 /// scattered by person), then sessions per person. `E` is the in-memory event.
 fn dedup_sessions<E: EvT>(
     ctx: &Ctx,
     persons: &Persons,
-    parse_out: &[ParseOut],
+    parse_out: &[ParseOut<E>],
     ne: usize,
     nthreads: usize,
     tm: &mut Timer,
 ) -> Vec<(Vec<UdRow>, CampAcc)> {
-    let ws = ctx.ws;
     let ndays = ctx.ndays;
     // ---- dedup events by event_id, map to persons; scatter by person
     let total_ev: usize = parse_out.iter().map(|p| (0..ne).map(|b| p.ev.len(b)).sum::<usize>()).sum();
@@ -933,7 +954,7 @@ fn dedup_sessions<E: EvT>(
         ck: Scatter<PCk>,
         table: Vec<u64>,
         win: Vec<u64>,
-        blks: Vec<*const EvRec>,
+        blks: Vec<*const EvRec<E>>,
         kept: usize,
     }
     unsafe impl<E: Copy> Send for DedupOut<E> {}
@@ -971,7 +992,7 @@ fn dedup_sessions<E: EvT>(
                 }
                 let blks = &st.blks;
                 // ref = block index << 7 | offset (BLOCK = 128)
-                let get = |r: u64| -> &EvRec {
+                let get = |r: u64| -> &EvRec<E> {
                     let r = (r as u32) & 0x7fff_ffff;
                     unsafe { &*blks[(r >> 7) as usize].add((r & 127) as usize) }
                 };
@@ -986,7 +1007,7 @@ fn dedup_sessions<E: EvT>(
                     for (i, r) in blk.iter().enumerate() {
                         let eid = r.eid;
                         let w = (bi << 7) | i;
-                        let wbit = ((r.cat != INVALID) as u64) << (w & 63);
+                        let wbit = (({ r.ev } != E::INVALID) as u64) << (w & 63);
                         let hh = hash(eid);
                         let tag = (hh >> 16) & 0xffff_ffff;
                         let ent = (tag << 32) | (1 << 31) | ((bi as u64) << 7) | i as u64;
@@ -1030,7 +1051,7 @@ fn dedup_sessions<E: EvT>(
                         let rf = (wi << 6) | w.trailing_zeros() as usize;
                         w &= w - 1;
                         let r = unsafe { &*blks[rf >> 7].add(rf & 127) };
-                        let x = (r.user, E::make((r.ts - ws) as u64, r.cat, r.price));
+                        let x = (r.user, r.ev);
                         persons.map.prefetch(x.0);
                         if cnt >= D {
                             emit(&ring[cnt % D], &mut st.ev);
@@ -1216,7 +1237,7 @@ fn dedup_sessions<E: EvT>(
 }
 
 #[inline(always)]
-fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], out: &mut Scatter<EvRec>, shift: u32) {
+fn parse_event<E: EvT>(ctx: &Ctx, f: &[&[u8]; 7], out: &mut Scatter<EvRec<E>>, shift: u32) {
     if f[0].is_empty() {
         return;
     }
@@ -1224,7 +1245,7 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], out: &mut Scatter<EvRec>, shift: u32) 
         return;
     };
     let eid = key(f[0]);
-    let mut rec = EvRec { eid, user: 0, ingest, ts: 0, cat: INVALID, price: 0 };
+    let mut rec = EvRec { eid, user: 0, ingest, ev: E::INVALID };
     'v: {
         let (user, pid) = (f[1], f[5]);
         if user.is_empty() || pid.is_empty() {
@@ -1248,9 +1269,7 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], out: &mut Scatter<EvRec>, shift: u32) 
             break 'v;
         };
         rec.user = key(user);
-        rec.ts = t;
-        rec.price = price;
-        rec.cat = product_cat(ctx, pid);
+        rec.ev = E::make((t - ctx.ws) as u64, product_cat(ctx, pid), price);
     }
     out.push((hash(eid) >> shift) as usize, rec);
 }
