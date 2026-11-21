@@ -301,7 +301,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
         };
         if mask(a, b'\n' as i8) | mask(b, b'\n' as i8) != 0 {
             let n = memchr::memchr(b'\n', &bytes[..64]).unwrap();
-            if let Some(fields) = crate::event_fields(&bytes[..n]) {
+            if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
                 sink.row(&bytes[..n], fields);
             }
             bytes = &bytes[n + 1..];
@@ -311,7 +311,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
         let newline = mask(c, b'\n' as i8);
         if newline == 0 {
             let n = memchr::memchr(b'\n', &bytes[96..]).map_or(bytes.len(), |n| n + 96);
-            if let Some(fields) = crate::event_fields(&bytes[..n]) {
+            if let Some(fields) = crate::row_fields::<7>(&bytes[..n]) {
                 sink.row(&bytes[..n], fields);
             }
             bytes = &bytes[(n + 1).min(bytes.len())..];
@@ -332,7 +332,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a
                 Some(0)
             } else if commas & 1 != 0 {
                 // The first field ends before the start mask when it is empty.
-                if let Some(fields) = crate::event_fields(line) {
+                if let Some(fields) = crate::row_fields::<7>(line) {
                     sink.row(line, fields);
                 }
                 None
