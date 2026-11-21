@@ -733,6 +733,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
         ev: Scatter<PEv>,
         ck: Scatter<PCk>,
         table: Vec<u64>,
+        win: Vec<u64>,
         blks: Vec<*const EvRec>,
         kept: usize,
     }
@@ -746,6 +747,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             ev: Scatter::new(np),
             ck: Scatter::new(np),
             table: Vec::new(),
+            win: Vec::new(),
             blks: Vec::new(),
             kept: 0,
         },
@@ -774,10 +776,18 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                     let r = (r as u32) & 0x7fff_ffff;
                     unsafe { &*blks[(r >> 7) as usize].add((r & 127) as usize) }
                 };
+                // winners as a bitmap over refs, so survivors are read back in
+                // memory order; an invalid winner stays in the table (it still
+                // beats later copies) but never gets a bit
+                let win = &mut st.win;
+                win.clear();
+                win.resize(blks.len() * 2, 0);
                 for (bi, (&bp, &bl)) in blks.iter().zip(&lens).enumerate() {
                     let blk = unsafe { std::slice::from_raw_parts(bp, bl as usize) };
                     for (i, r) in blk.iter().enumerate() {
                         let eid = r.eid;
+                        let w = (bi << 7) | i;
+                        let wbit = ((r.cat != INVALID) as u64) << (w & 63);
                         let hh = hash(eid);
                         let tag = (hh >> 16) & 0xffff_ffff;
                         let ent = (tag << 32) | (1 << 31) | ((bi as u64) << 7) | i as u64;
@@ -786,6 +796,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                             let s = st.table[h];
                             if s == 0 {
                                 st.table[h] = ent;
+                                win[w >> 6] |= wbit;
                                 break;
                             }
                             if s >> 32 == tag {
@@ -793,6 +804,9 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                                 if { o.eid } == eid {
                                     if r.ingest < o.ingest {
                                         st.table[h] = ent;
+                                        win[w >> 6] |= wbit;
+                                        let ow = (s as usize) & 0x7fff_ffff;
+                                        win[ow >> 6] &= !(1u64 << (ow & 63));
                                     }
                                     break;
                                 }
@@ -811,21 +825,20 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                     let pb = (hash(person) >> np_shift) as usize;
                     st_ev.push(pb, PEv { person, ts: x.1, cat: x.2, price: x.3 });
                 };
-                for &s in st.table.iter() {
-                    if s == 0 {
-                        continue;
+                for (wi, &w0) in st.win.iter().enumerate() {
+                    let mut w = w0;
+                    while w != 0 {
+                        let rf = (wi << 6) | w.trailing_zeros() as usize;
+                        w &= w - 1;
+                        let r = unsafe { &*blks[rf >> 7].add(rf & 127) };
+                        let x = (r.user, r.ts, r.cat, r.price);
+                        persons.map.prefetch(x.0);
+                        if cnt >= D {
+                            emit(&ring[cnt % D], &mut st.ev);
+                        }
+                        ring[cnt % D] = x;
+                        cnt += 1;
                     }
-                    let r = get(s);
-                    if r.cat == INVALID {
-                        continue;
-                    }
-                    let x = (r.user, r.ts, r.cat, r.price);
-                    persons.map.prefetch(x.0);
-                    if cnt >= D {
-                        emit(&ring[cnt % D], &mut st.ev);
-                    }
-                    ring[cnt % D] = x;
-                    cnt += 1;
                 }
                 for i in cnt.saturating_sub(D)..cnt {
                     emit(&ring[i % D], &mut st.ev);
