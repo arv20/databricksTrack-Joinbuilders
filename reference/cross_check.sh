@@ -15,7 +15,10 @@ SEEDS=${*:-2 3 4 5 6 7 15 62 249}
 CLICKS=$((EVENTS / 4))
 WORK=seeds
 mkdir -p "$WORK"
-cp "$PIPE" "$WORK/pipeline_snapshot.py"
+case "$PIPE" in
+  *.py) cp "$PIPE" "$WORK/pipeline_snapshot.py"; RUN="$PY $WORK/pipeline_snapshot.py" ;;
+  *) cp "$PIPE" "$WORK/pipeline_snapshot.bin"; RUN="$WORK/pipeline_snapshot.bin" ;;  # compiled binary
+esac
 echo "pipeline snapshot: $PIPE ($(shasum "$PIPE" | cut -c1-8))"
 status=0
 for s in $SEEDS; do
@@ -25,11 +28,11 @@ for s in $SEEDS; do
   win=$(tr -d '\n ' < "$d/data/manifest.json")
   mkdir -p "$d/scratch"
   if ! DATA_DIR="$d/data" OUTPUT_DIR="$d/pipe" SCRATCH_DIR="$d/scratch" NCPU=8 MEM_GB=8 \
-       $PY "$WORK/pipeline_snapshot.py" >/dev/null 2>"$d/pipe.err"; then
+       $RUN >/dev/null 2>"$d/pipe.err"; then
     echo "seed $s: PIPELINE CRASHED"; tail -5 "$d/pipe.err"; status=1; rm -rf "$d"; continue
   fi
   DATA_DIR="$d/data" OUTPUT_DIR="$d/ref" $PY reference/reference.py >/dev/null 2>"$d/ref.err" || { echo "seed $s: REFERENCE CRASHED"; tail -5 "$d/ref.err"; status=1; rm -rf "$d"; continue; }
-  result=$(cd starter-duckdb/scripts && ../../$PY compare.py "../../$d/pipe" "../../$d/ref" 2>&1)
+  result=$(cd scripts && ../$PY compare.py "../$d/pipe" "../$d/ref" 2>&1)
   if echo "$result" | tail -1 | grep -q '^MATCH'; then
     echo "seed $s: MATCH  $win"
   else
@@ -39,5 +42,5 @@ for s in $SEEDS; do
   fi
   rm -rf "$d"
 done
-rm -f "$WORK/pipeline_snapshot.py"
+rm -f "$WORK/pipeline_snapshot.py" "$WORK/pipeline_snapshot.bin"
 exit $status

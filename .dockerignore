@@ -13,3 +13,4 @@ starter-*/
 _archive/
 dev-answer/
 ship.sh
+rust/target/

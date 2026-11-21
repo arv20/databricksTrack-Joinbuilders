@@ -15,3 +15,4 @@ solution/
 starter-duckdb/
 starter-polars/
 starter-pyspark/
+rust/target/
