@@ -509,6 +509,7 @@ dependencies = [
  "ahash",
  "arrow-array",
  "arrow-schema",
+ "bytes",
  "memchr",
  "memmap2",
  "parquet",

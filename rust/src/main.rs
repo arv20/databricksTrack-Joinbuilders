@@ -8,6 +8,7 @@
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
 mod nova;
 mod slow;
+mod user_parquet;
 
 use ahash::AHashMap as HashMap;
 use rayon::prelude::*;
@@ -391,18 +392,18 @@ fn csv_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [
     });
 }
 
-/// Fixed-arity event rows already separated by the newline iterator.
-/// Collect two masks for the whole row, then decode exactly six cuts.
+/// Fixed-arity rows already separated by the newline iterator.
+/// Collect two masks for the whole row, then decode the field boundaries.
 #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline]
-fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
+fn row_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(target_arch = "aarch64")]
     const WIDTH: usize = 16;
     #[cfg(target_arch = "x86_64")]
     const WIDTH: usize = 32;
 
     if !(WIDTH..=128).contains(&line.len()) {
-        return fields::<7>(line);
+        return fields::<N>(line);
     }
     let masks = |offset: usize| {
         // The caller loads full vectors inside the row, overlapping the last
@@ -448,18 +449,19 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
         commas |= u128::from(c >> overlap) << offset;
         quotes |= u128::from(q >> overlap) << offset;
     }
-    if commas.count_ones() != 6 {
+    if commas.count_ones() as usize != N - 1 {
         return None;
     }
-    let mut cuts = [0; 8];
-    for cut in &mut cuts[1..7] {
+    const { assert!(N >= 2 && N < 16) };
+    let mut cuts = [0; 16];
+    for cut in &mut cuts[1..N] {
         *cut = commas.trailing_zeros() as usize + 1;
         commas &= commas - 1;
     }
-    cuts[7] = line.len() + 1;
+    cuts[N] = line.len() + 1;
     if quotes == 0 {
         return Some(std::array::from_fn(|i| {
-            // Six distinct cuts precede the terminal offset.
+            // Distinct cuts precede the terminal offset.
             unsafe { line.get_unchecked(cuts[i]..cuts[i + 1] - 1) }
         }));
     }
@@ -479,15 +481,20 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
 }
 
 #[inline]
-fn event_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+fn mask_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; N])) {
     #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
     for_lines(bytes, |line| {
-        if let Some(values) = event_fields(line) {
+        if let Some(values) = row_fields::<N>(line) {
             row(line, values);
         }
     });
     #[cfg(not(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2"))))]
-    csv_rows(bytes, row);
+    csv_rows::<N>(bytes, row);
+}
+
+#[inline]
+fn event_rows<'a>(bytes: &'a [u8], row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+    mask_rows::<7>(bytes, row);
 }
 
 #[cfg(test)]
@@ -521,7 +528,7 @@ fn event_row_masks_match_scalar_at_simd_and_tail_boundaries() {
         }
     });
     let mut actual = Vec::new();
-    event_rows(&data, |line, values| actual.push((line, values)));
+    mask_rows::<7>(&data, |line, values| actual.push((line, values)));
     assert_eq!(actual, expected);
 }
 
@@ -1432,13 +1439,53 @@ mod single_scatter_tests {
     }
 }
 
-/// A validated click, with exact click ID available for tie-breaking.
+/// n for an id spelled exactly c_<n> with ASCII digits, no leading zero, n < 10^9.
+#[inline]
+fn campaign_number(c: &[u8]) -> Option<usize> {
+    let d = c.strip_prefix(b"c_")?;
+    if d.is_empty() || d.len() > 9 || (d[0] == b'0' && d.len() > 1) {
+        return None;
+    }
+    let mut n = 0usize;
+    for &b in d {
+        let x = b.wrapping_sub(b'0');
+        if x > 9 {
+            return None;
+        }
+        n = n * 10 + x as usize;
+    }
+    Some(n)
+}
+
+/// The dense person ID and time are explicit. The validated click ID's
+/// position is only dereferenced for a timestamp tie.
 #[derive(Clone, Copy)]
 struct Click {
-    person: u64,
-    id: u64,
+    tag: u64,
+    person: u32,
     ts: u32,
-    campaign: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Click>() == 16);
+
+impl Click {
+    #[inline]
+    fn campaign(self) -> usize {
+        (self.tag >> 48) as usize
+    }
+
+    fn id(self) -> &'static [u8] {
+        let ptr = (self.tag & ((1 << 48) - 1)) as *const u8;
+        let mut len = 0;
+        // The validated first field is followed by a comma or closing quote
+        // inside the mapped file. No separator occurs inside the ID.
+        unsafe {
+            while !matches!(*ptr.add(len), b',' | b'"') {
+                len += 1;
+            }
+            std::slice::from_raw_parts(ptr, len)
+        }
+    }
 }
 
 struct PendingClick {
@@ -1447,66 +1494,12 @@ struct PendingClick {
     check: u32,
 }
 
-#[derive(Clone, Copy)]
-struct ClickMeta {
-    id: u64,
-    campaign: u32,
-}
-
-// Within a dense local person, the high word sorts by time and then
-// clicks before events. The low word is price/category or a click index.
-#[inline]
-fn timeline_payload(ts: u32, event: bool, payload: u32) -> u64 {
-    let time_key = (ts << 1) | u32::from(event);
-    (u64::from(time_key) << 32) | u64::from(payload)
-}
-
-#[derive(Default)]
-struct UserColumns {
-    name: arrow_array::builder::StringBuilder,
-    day: Vec<i32>,
-    sessions: Vec<i64>,
-    events: Vec<i64>,
-    revenue: Vec<i64>,
-    category: arrow_array::builder::StringBuilder,
-}
-
 #[derive(Default)]
 struct UserDay {
     day: i64,
     sessions: i64,
     events: i64,
     revenue: i64,
-}
-
-impl UserColumns {
-    fn append(&mut self, name: &[u8], row: &UserDay, category: Option<&[u8]>) {
-        self.name.append_value(csv_str(name));
-        self.day.push(row.day as i32);
-        self.sessions.push(row.sessions);
-        self.events.push(row.events);
-        self.revenue.push(row.revenue);
-        if let Some(category) = category {
-            self.category.append_value(csv_str(category));
-        } else {
-            self.category.append_null();
-        }
-    }
-
-    fn finish(mut self, schema: std::sync::Arc<arrow_schema::Schema>) -> arrow_array::RecordBatch {
-        use arrow_array::{Date32Array, Int64Array, RecordBatch};
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(self.name.finish()),
-                Arc::new(Date32Array::from(self.day)),
-                Arc::new(Int64Array::from(self.sessions)),
-                Arc::new(Int64Array::from(self.events)),
-                Arc::new(Int64Array::from(self.revenue)),
-                Arc::new(self.category.finish()),
-            ],
-        ).unwrap()
-    }
 }
 
 #[inline]
@@ -1916,6 +1909,27 @@ fn fast(seed: u64, nova: bool) -> bool {
         }
     });
     let ncamp = camp_names.len();
+    if ncamp >= 1 << 16 {
+        return false;
+    }
+    // Canonical c_<decimal> IDs have unique numeric keys. The bounded
+    // direct index avoids hashing these IDs; other spellings still use bytes.
+    const MAX_INDEXED_CAMPAIGN: usize = 1 << 20;
+    let mut by_number: Vec<u32> = Vec::new();
+    for (i, c) in camp_names.iter().enumerate() {
+        if let Some(n) = campaign_number(c).filter(|&n| n < MAX_INDEXED_CAMPAIGN) {
+            if by_number.len() <= n {
+                by_number.resize(n + 1, u32::MAX);
+            }
+            by_number[n] = i as u32;
+        }
+    }
+    let campaign_of = |c: &[u8]| -> Option<u32> {
+        match campaign_number(c).filter(|&n| n < MAX_INDEXED_CAMPAIGN) {
+            Some(n) => by_number.get(n).copied().filter(|&i| i != u32::MAX),
+            None => camp.get(c).copied(),
+        }
+    };
 
     let est_users = evb.iter().find(|b| b.len() >= 1 << 16).map_or(0, |b| {
         let rows = memchr::memchr_iter(b'\n', &b[..1 << 16]).count().max(1);
@@ -2088,20 +2102,21 @@ fn fast(seed: u64, nova: bool) -> bool {
                 for PendingClick { mut click, key, check } in batch.drain(..) {
                     // A user id not in the table has no valid event, so no session to credit.
                     let Some(person) = users.find(key, check, &coll) else { continue };
-                    click.person = u64::from(person);
+                    click.person = person;
                     acc[person as usize & (P - 1)].push(click);
                 }
             };
-            csv_rows(chunk, |_, [cid, user, cmp, ts]| {
+            mask_rows::<4>(chunk, |_, [cid, user, cmp, ts]| {
                 if cid.is_empty() || user.is_empty() {
                     return;
                 }
-                let Some(&campaign) = camp.get(cmp) else { return };
+                let Some(campaign) = campaign_of(cmp) else { return };
                 let ts = match dates.parse(ts) {
                     Some(t) if t >= click_start && t < w1 => (t - click_start) as u32,
                     _ => return,
                 };
-                let (Some(person), Some(id)) = (pack_ref(user), pack_ref(cid)) else {
+                let ptr = cid.as_ptr() as u64;
+                if ptr >> 48 != 0 {
                     coll.store(true, Relaxed);
                     return;
                 };
@@ -2113,7 +2128,8 @@ fn fast(seed: u64, nova: bool) -> bool {
                     hs(user, seed)
                 };
                 users.prefetch(key);
-                batch.push(PendingClick { click: Click { person, id, ts, campaign }, key, check });
+                let tag = ptr | (u64::from(campaign) << 48);
+                batch.push(PendingClick { click: Click { tag, person: 0, ts }, key, check });
                 if batch.len() == 16 {
                     flush(&mut batch);
                 }
@@ -2131,25 +2147,18 @@ fn fast(seed: u64, nova: bool) -> bool {
     use arrow_array::*;
     use arrow_array::builder::StringBuilder;
     use arrow_schema::{DataType, Field, Schema};
-    let props = parquet::file::properties::WriterProperties::builder()
+    let props = Arc::new(parquet::file::properties::WriterProperties::builder()
         .set_compression(parquet::basic::Compression::UNCOMPRESSED)
         .set_dictionary_enabled(false)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
-        .build();
+        .build());
     let write = |path: String, batch: RecordBatch| {
         let f = std::fs::File::create(path).unwrap();
-        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), Some(props.clone())).unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(f, batch.schema(), Some(props.as_ref().clone())).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
     };
-    let s1 = Arc::new(Schema::new(vec![
-        Field::new("user_id", DataType::Utf8, false),
-        Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
-        Field::new("revenue_cents", DataType::Int64, false),
-        Field::new("top_category", DataType::Utf8, true),
-    ]));
+    let user_schema = user_parquet::schema();
     let s2 = Arc::new(Schema::new(vec![
         Field::new("campaign_id", DataType::Utf8, false),
         Field::new("channel", DataType::Utf8, false),
@@ -2159,16 +2168,12 @@ fn fast(seed: u64, nova: bool) -> bool {
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("assisted_sessions", DataType::Int64, false),
     ]));
-    // Schedule large partitions first and check click-index width
-    // before writing any output.
+    // Schedule large partitions first.
     let ncs = ncamp + 1;
     let mut order = Vec::with_capacity(P);
     for partition in 0..P {
         let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
         let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
-        if clicks > u32::MAX as usize {
-            return false;
-        }
         order.push((std::cmp::Reverse(events + clicks), partition));
     }
     std::fs::create_dir_all(format!("{out}/user_daily")).unwrap();
@@ -2178,18 +2183,15 @@ fn fast(seed: u64, nova: bool) -> bool {
     // Each existing Rayon worker handles whole partitions and flushes its
     // own Parquet file as soon as it runs out of work.
     let states = rayon::broadcast(|worker| {
-        let mut state = PartitionState::new(ncs, ndays, cat_names.len());
+        let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
+        let user = user_parquet::UserParquet::new(path, user_schema.clone());
+        let mut state = PartitionState::new(ncs, ndays, cat_names.len(), user);
         while let Some(&(_, partition)) = order.get(next.fetch_add(1, Relaxed)) {
             state.group(partition, linked_count, &paccs, &caccs);
-            state.aggregate(partition, linked_count, &pname, &cat_names, click_start, day0, ndays, ncamp);
+            state.aggregate(partition, &pname, &cat_names, w0, day0, ndays, ncamp);
         }
-        let nrows = state.user.day.len();
-        if nrows != 0 {
-            let columns = std::mem::take(&mut state.user);
-            let path = format!("{out}/user_daily/part-{}.parquet", worker.index());
-            write(path, columns.finish(s1.clone()));
-        }
-        (nrows, state.cd)
+        state.user.close();
+        (state.user_rows, state.cd)
     });
     std::mem::forget(paccs);
     std::mem::forget(caccs);
@@ -2204,9 +2206,6 @@ fn fast(seed: u64, nova: bool) -> bool {
                 a[k] += b[k];
             }
         }
-    }
-    if nrows == 0 {
-        write(format!("{out}/user_daily/part-0.parquet"), RecordBatch::new_empty(s1));
     }
     lap(&format!("merged: user_daily {}", nrows));
 
@@ -2263,23 +2262,6 @@ fn pt<I, T: Send>(items: impl ParallelIterator<Item = I>, init: impl Fn() -> T +
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
-/// Reused per-worker buffers for `radix_sort`.
-#[derive(Default)]
-struct Session {
-    last_event: u32,
-    campaign_day: usize,
-    revenue: i64,
-}
-
-impl Session {
-    fn credit(self, totals: &mut [[i64; 4]]) {
-        let total = &mut totals[self.campaign_day];
-        total[0] += 1;
-        total[1] += i64::from(self.revenue > 0);
-        total[2] += self.revenue;
-    }
-}
-
 struct PartitionState {
     cd: Vec<[i64; 4]>,
     counts: Vec<usize>,
@@ -2287,17 +2269,19 @@ struct PartitionState {
     active: Vec<u32>,
     catsum: Vec<i64>,
     touched_categories: Vec<u32>,
-    click_people_times: Vec<(u32, u32)>,
-    click_meta: Vec<ClickMeta>,
-    ends: Vec<usize>,
-    rows: Vec<u64>,
-    sort_scratch: Vec<u64>,
-    click_window: Vec<(u32, u32)>,
-    user: UserColumns,
+    event_ends: Vec<usize>,
+    click_ends: Vec<usize>,
+    events: Vec<u64>,
+    clicks: Vec<Click>,
+    event_scratch: Vec<u64>,
+    click_scratch: Vec<Click>,
+    buckets: EventBuckets,
+    user: user_parquet::UserParquet,
+    user_rows: usize,
 }
 
 impl PartitionState {
-    fn new(campaigns: usize, days: usize, categories: usize) -> Self {
+    fn new(campaigns: usize, days: usize, categories: usize, user: user_parquet::UserParquet) -> Self {
         Self {
             cd: vec![[0; 4]; campaigns * days],
             counts: vec![0; campaigns],
@@ -2305,76 +2289,66 @@ impl PartitionState {
             active: Vec::new(),
             catsum: vec![0; categories],
             touched_categories: Vec::new(),
-            click_people_times: Vec::new(),
-            click_meta: Vec::new(),
-            ends: Vec::new(),
-            rows: Vec::new(),
-            sort_scratch: Vec::new(),
-            click_window: Vec::new(),
-            user: UserColumns::default(),
+            event_ends: Vec::new(),
+            click_ends: Vec::new(),
+            events: Vec::new(),
+            clicks: Vec::new(),
+            event_scratch: Vec::new(),
+            click_scratch: Vec::new(),
+            buckets: EventBuckets::default(),
+            user,
+            user_rows: 0,
         }
     }
 
     fn group(
         &mut self,
         partition: usize,
-        linked_count: u32,
-        events: &[People],
-        clicks: &[Vec<Vec<Click>>],
+        people: u32,
+        event_folds: &[People],
+        click_folds: &[Vec<Vec<Click>>],
     ) {
-        self.click_people_times.clear();
-        self.click_meta.clear();
-        self.ends.clear();
-        self.ends.resize(linked_count as usize, 0);
-
-        // Every accepted record has a dense ID from the all-UID table.
-        // The partition already encodes the low bits of that ID.
-        for fold in events {
-            for event in fold.records(partition).into_iter().flatten() {
-                if let Some((person, _)) = event.session_input() {
-                    self.ends[(person >> PB) as usize] += 1;
-                }
+        let Self { event_ends, click_ends, events, clicks, .. } = self;
+        event_ends.clear();
+        event_ends.resize(people as usize, 0);
+        click_ends.clear();
+        click_ends.resize(people as usize, 0);
+        let event_rows = || event_folds.iter()
+            .flat_map(|fold| fold.records(partition))
+            .flatten()
+            .filter_map(EvP::session_input);
+        let click_rows = || click_folds.iter().flat_map(|fold| &fold[partition]);
+        for (person, _) in event_rows() {
+            event_ends[(person >> PB) as usize] += 1;
+        }
+        for click in click_rows() {
+            let person = (click.person >> PB) as usize;
+            if event_ends[person] != 0 {
+                click_ends[person] += 1;
             }
         }
-        for fold in clicks {
-            for click in &fold[partition] {
-                let person = (click.person >> PB) as u32;
-                if self.ends[person as usize] != 0 {
-                    self.click_people_times.push((person, click.ts));
-                    self.click_meta.push(ClickMeta { id: click.id, campaign: click.campaign });
-                }
+        // Retain the original event counts until the click scatter is done.
+        // The prefix sums then become exclusive ends as records are placed.
+        clicks.resize(prefix_starts(click_ends), Click { tag: 0, person: 0, ts: 0 });
+        for &click in click_rows() {
+            let person = (click.person >> PB) as usize;
+            if event_ends[person] != 0 {
+                let next = &mut click_ends[person];
+                clicks[*next] = click;
+                *next += 1;
             }
         }
-        for &(person, _) in &self.click_people_times {
-            self.ends[person as usize] += 1;
-        }
-        let mut total = 0;
-        for count in &mut self.ends {
-            total += std::mem::replace(count, total);
-        }
-        self.rows.resize(total, 0);
-        let mut emit = |person: u32, payload: u64| {
-            let next = &mut self.ends[person as usize];
-            self.rows[*next] = payload;
+        events.resize(prefix_starts(event_ends), 0);
+        for (person, payload) in event_rows() {
+            let next = &mut event_ends[(person >> PB) as usize];
+            events[*next] = payload;
             *next += 1;
-        };
-        for fold in events {
-            for event in fold.records(partition).into_iter().flatten() {
-                if let Some((person, payload)) = event.session_input() {
-                    let ts = (payload >> 32) as u32 + LOOK as u32;
-                    emit((person >> PB) as u32, timeline_payload(ts, true, payload as u32));
-                }
-            }
-        }
-        for (idx, &(person, ts)) in self.click_people_times.iter().enumerate() {
-            emit(person, timeline_payload(ts, false, idx as u32));
         }
     }
 
     fn aggregate(
         &mut self,
         partition: usize,
-        linked_count: u32,
         pname: &[&[u8]],
         categories: &[&[u8]],
         origin: i64,
@@ -2384,105 +2358,92 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            click_meta, ends, rows, sort_scratch, click_window, user, ..
+            event_ends, click_ends, events, clicks, event_scratch, click_scratch, buckets,
+            user, user_rows,
         } = self;
-        let mut flush_day = |name: &[u8], row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
-            let category = top_cat(sums, touched, categories);
-            user.append(name, row, categories.get(category as usize).copied());
-        };
-        let mut start = 0;
-        for (person, &end) in ends.iter().enumerate() {
-            let group = &mut rows[start..end];
-            start = end;
-            if group.is_empty() {
+        let (mut event_start, mut click_start) = (0, 0);
+        for (person, (&event_end, &click_end)) in event_ends.iter().zip(click_ends.iter()).enumerate() {
+            let events = &mut events[event_start..event_end];
+            let clicks = &mut clicks[click_start..click_end];
+            (event_start, click_start) = (event_end, click_end);
+            if events.is_empty() {
                 continue;
             }
-            sort_person(group, sort_scratch);
-            debug_assert!(person < linked_count as usize);
+            sort_timeline(clicks, click_scratch, |click| click.ts);
             let name = pname[person * P + partition];
-            let mut session: Option<Session> = None;
-            let mut day = UserDay::default();
-            let mut head = 0;
-            let mut best_click: Option<(u32, u64, usize)> = None;
-            click_window.clear();
-            for &row in group.iter() {
-                let time_key = (row >> 32) as u32;
-                let time = time_key >> 1;
-                let payload = row as u32;
-                if time_key & 1 == 0 {
-                    let ClickMeta { id, campaign } = click_meta[payload as usize];
-                    let campaign = campaign as usize;
-                    click_window.push((time, campaign as u32));
+            let write_day = |row: &UserDay, sums: &mut [i64], touched: &mut Vec<u32>| {
+                let category = top_cat(sums, touched, categories);
+                user.append(name, row, categories.get(category as usize).copied());
+                *user_rows += 1;
+            };
+            let (mut lo, mut hi, mut best_click) = (0, 0, None::<Click>);
+            let mut attribute = |start, session_day, revenue| {
+                let time = start + LOOK as u32;
+                let day_index = (session_day - day0) as usize;
+                let lower = start;
+                while lo < hi && clicks[lo].ts < lower {
+                    counts[clicks[lo].campaign()] -= 1;
+                    lo += 1;
+                }
+                while let Some(&click) = clicks.get(hi) {
+                    if click.ts > time {
+                        break;
+                    }
+                    hi += 1;
+                    if click.ts < lower {
+                        // This click has already expired before its first session.
+                        lo += 1;
+                        continue;
+                    }
+                    let campaign = click.campaign();
                     counts[campaign] += 1;
                     if !in_active[campaign] {
                         in_active[campaign] = true;
                         active.push(campaign as u32);
                     }
-                    if best_click.is_none_or(|(t, old_id, _)| {
-                        time > t || (id != old_id && unpack_ref(id) < unpack_ref(old_id))
-                    }) {
-                        best_click = Some((time, id, campaign));
+                    if best_click.is_none_or(|old| click.ts != old.ts || click.id() < old.id()) {
+                        best_click = Some(click);
                     }
-                    continue;
                 }
+                active.retain(|&campaign| {
+                    let c = campaign as usize;
+                    if counts[c] == 0 {
+                        in_active[c] = false;
+                        false
+                    } else {
+                        cd[c * days + day_index][3] += 1;
+                        true
+                    }
+                });
+                let campaign = best_click.filter(|click| click.ts >= lower).map_or(organic, Click::campaign);
+                let total = &mut cd[campaign * days + day_index];
+                total[0] += 1;
+                total[1] += i64::from(revenue > 0);
+                total[2] += revenue;
+            };
 
-                if session.as_ref().is_none_or(|s| time - s.last_event > GAP as u32) {
-                    if let Some(previous) = session.take() {
-                        previous.credit(cd);
-                    }
-                    let session_day = (origin + i64::from(time)).div_euclid(DAY);
-                    if day.sessions != 0 && day.day != session_day {
-                        flush_day(name, &day, catsum, touched_categories);
-                        day = UserDay::default();
-                    }
-                    day.day = session_day;
-                    day.sessions += 1;
-
-                    let lower = time - LOOK as u32;
-                    while let Some(&(t, campaign)) = click_window.get(head) {
-                        if t >= lower {
-                            break;
-                        }
-                        counts[campaign as usize] -= 1;
-                        head += 1;
-                    }
-                    let day_index = (session_day - day0) as usize;
-                    active.retain(|&campaign| {
-                        let i = campaign as usize;
-                        if counts[i] == 0 {
-                            in_active[i] = false;
-                            false
-                        } else {
-                            cd[i * days + day_index][3] += 1;
-                            true
-                        }
-                    });
-                    let campaign = best_click.filter(|&(t, _, _)| t >= lower)
-                        .map_or(organic, |(_, _, campaign)| campaign);
-                    session = Some(Session {
-                        last_event: time,
-                        campaign_day: campaign * days + day_index,
-                        revenue: 0,
-                    });
-                }
-
-                let session = session.as_mut().unwrap();
-                session.last_event = time;
-                day.events += 1;
-                if payload != 0 {
-                    let price = (payload & 0xff_ffff) as i64;
-                    let category = (payload >> 24) as usize;
-                    if catsum[category] == 0 {
-                        touched_categories.push(category as u32);
-                    }
-                    catsum[category] += price;
-                    day.revenue += price;
-                    session.revenue += price;
-                }
-            }
-            if let Some(session) = session {
-                session.credit(cd);
-                flush_day(name, &day, catsum, touched_categories);
+            if events.len() < BUCKET_MIN_LEN {
+                sort_timeline(events, event_scratch, |event| (event >> 32) as u32);
+                aggregate_sessions(
+                    events, origin, catsum, touched_categories,
+                    |event| {
+                        let time = (event >> 32) as u32;
+                        (time, time)
+                    },
+                    |event, sums, touched| (1, add_purchase(event as u32, sums, touched)),
+                    write_day, &mut attribute,
+                );
+            } else {
+                buckets.build(events);
+                aggregate_sessions(
+                    &buckets.used, origin, catsum, touched_categories,
+                    |index| {
+                        let b = &buckets.by_time[index];
+                        (b.first, b.last)
+                    },
+                    |index, sums, touched| buckets.aggregate(index, sums, touched),
+                    write_day, &mut attribute,
+                );
             }
             for campaign in active.drain(..) {
                 counts[campaign as usize] = 0;
@@ -2492,39 +2453,179 @@ impl PartitionState {
     }
 }
 
-fn sort_person(rows: &mut [u64], scratch: &mut Vec<u64>) {
-    if rows.len() <= 4096 || rows.len() > u32::MAX as usize {
-        rows.sort_unstable();
+/// Each span is either a single event or an exact summary of a connected
+/// half-hour bucket. Session credit and day totals consume either directly.
+#[inline]
+fn aggregate_sessions<T: Copy>(
+    rows: &[T],
+    origin: i64,
+    catsum: &mut [i64],
+    touched: &mut Vec<u32>,
+    bounds: impl Fn(T) -> (u32, u32),
+    aggregate: impl Fn(T, &mut [i64], &mut Vec<u32>) -> (i64, i64),
+    mut write_day: impl FnMut(&UserDay, &mut [i64], &mut Vec<u32>),
+    mut credit: impl FnMut(u32, i64, i64),
+) {
+    let mut day = UserDay::default();
+    let mut i = 0;
+    while i < rows.len() {
+        let (start, _) = bounds(rows[i]);
+        let session_day = (origin + i64::from(start)).div_euclid(DAY);
+        if day.sessions != 0 && day.day != session_day {
+            write_day(&day, catsum, touched);
+            day = UserDay::default();
+        }
+        day.day = session_day;
+        day.sessions += 1;
+
+        let mut previous = start;
+        let mut revenue = 0i64;
+        while let Some(&row) = rows.get(i) {
+            let (first, last) = bounds(row);
+            if first - previous > GAP as u32 {
+                break;
+            }
+            previous = last;
+            let (events, price) = aggregate(row, catsum, touched);
+            day.events += events;
+            revenue += price;
+            i += 1;
+        }
+        day.revenue += revenue;
+        credit(start, session_day, revenue);
+    }
+    write_day(&day, catsum, touched);
+}
+
+#[inline]
+fn add_purchase(payload: u32, sums: &mut [i64], touched: &mut Vec<u32>) -> i64 {
+    if payload == 0 {
+        return 0;
+    }
+    let price = i64::from(payload & 0xff_ffff);
+    let category = (payload >> 24) as usize;
+    if sums[category] == 0 {
+        touched.push(category as u32);
+    }
+    sums[category] += price;
+    price
+}
+
+const BUCKET_MIN_LEN: usize = 128;
+const MAX_EVENT_BUCKETS: usize = ((1u32 << 31) / GAP as u32) as usize + 1;
+
+#[derive(Default)]
+struct EventBucket {
+    first: u32,
+    last: u32,
+    count: i64,
+    /// One-based index of the most recent purchase in the bucket.
+    purchase: usize,
+}
+
+#[derive(Default)]
+struct EventBuckets {
+    by_time: Vec<EventBucket>,
+    used: Vec<usize>,
+    purchases: Vec<(u32, usize)>,
+}
+
+impl EventBuckets {
+    fn build(&mut self, events: &[u64]) {
+        for index in self.used.drain(..) {
+            self.by_time[index] = EventBucket::default();
+        }
+        self.by_time.resize_with(MAX_EVENT_BUCKETS, EventBucket::default);
+        self.purchases.clear();
+        for &event in events {
+            let time = (event >> 32) as u32;
+            // A half-hour bucket is connected for every input distribution.
+            // Only its endpoints matter when joining adjacent occupied buckets.
+            let index = (time / GAP as u32) as usize;
+            let bucket = &mut self.by_time[index];
+            if bucket.count == 0 {
+                bucket.first = time;
+                bucket.last = time;
+                self.used.push(index);
+            } else {
+                bucket.first = bucket.first.min(time);
+                bucket.last = bucket.last.max(time);
+            }
+            bucket.count += 1;
+            let payload = event as u32;
+            if payload != 0 {
+                self.purchases.push((payload, bucket.purchase));
+                bucket.purchase = self.purchases.len();
+            }
+        }
+        self.used.sort_unstable();
+    }
+
+    fn aggregate(&self, index: usize, sums: &mut [i64], touched: &mut Vec<u32>) -> (i64, i64) {
+        let bucket = &self.by_time[index];
+        let mut node = bucket.purchase;
+        let mut revenue = 0;
+        while node != 0 {
+            let (payload, previous) = self.purchases[node - 1];
+            revenue += add_purchase(payload, sums, touched);
+            node = previous;
+        }
+        (bucket.count, revenue)
+    }
+}
+
+/// Convert group sizes to write cursors, returning the total number of rows.
+fn prefix_starts(counts: &mut [usize]) -> usize {
+    let mut total = 0;
+    for count in counts {
+        total += std::mem::replace(count, total);
+    }
+    total
+}
+
+fn sort_timeline<T: Copy>(rows: &mut [T], scratch: &mut Vec<T>, time: impl Fn(T) -> u32 + Copy) {
+    if rows.len() <= RADIX_MIN_LEN {
+        rows.sort_unstable_by_key(|&row| time(row));
         return;
     }
-    // Only time/type needs sorting. Equal keys of the same type are
-    // interchangeable here, including tied clicks handled by their IDs.
-    const STEP: u32 = 11;
-    const BUCKETS: usize = 1 << STEP;
-    scratch.resize(rows.len(), 0);
-    let scatter = |input: &[u64], output: &mut [u64], shift: u32| {
-        let buckets = 1 << (64 - shift).min(STEP);
-        let mask = buckets - 1;
-        let mut counts = [0u32; BUCKETS];
-        let digit = |key: u64| (key >> shift) as usize & mask;
-        for &key in input {
-            counts[digit(key)] += 1;
-        }
-        let mut offset = 0;
-        for count in &mut counts[..buckets] {
-            let count = std::mem::replace(count, offset);
-            offset += count;
-        }
-        for &key in input {
-            let next = &mut counts[digit(key)];
-            output[*next as usize] = key;
+
+    scratch.resize(rows.len(), rows[0]);
+    radix_time(rows, scratch, time, 24);
+}
+
+const RADIX_MIN_LEN: usize = 96;
+
+/// Stable counting scatter on the significant timestamp bytes. Tied events
+/// and tied clicks can arrive in any order within their timestamp.
+fn radix_time<T: Copy>(rows: &mut [T], scratch: &mut [T], time: impl Fn(T) -> u32 + Copy, shift: u32) {
+    let digit = |row| ((time(row) >> shift) & 255) as usize;
+    let mut counts = [0usize; 256];
+    for &row in rows.iter() {
+        counts[digit(row)] += 1;
+    }
+    if !counts.contains(&rows.len()) {
+        let mut offsets = counts;
+        prefix_starts(&mut offsets);
+        for &row in rows.iter() {
+            let next = &mut offsets[digit(row)];
+            scratch[*next] = row;
             *next += 1;
         }
-    };
-    scatter(rows, scratch, 32);
-    scatter(scratch, rows, 43);
-    scatter(rows, scratch, 54);
-    rows.copy_from_slice(scratch);
+        rows.copy_from_slice(scratch);
+    }
+    if shift == 0 {
+        return;
+    }
+    let mut start = 0;
+    for count in counts {
+        let end = start + count;
+        if count > RADIX_MIN_LEN {
+            radix_time(&mut rows[start..end], &mut scratch[start..end], time, shift - 8);
+        } else if count > 1 {
+            rows[start..end].sort_unstable_by_key(|&row| time(row));
+        }
+        start = end;
+    }
 }
 
 /// Highest summed price; ties to the byte-wise smallest name. Resets the sums.
