@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+# generated datasets and run outputs (keep them out of git and out of Claude's searches)
+dev/
+big/
+seeds/
+out/
+generator/target/
+# reference answer from the track page; not needed in the repo
+dev-answer/
+_archive/
+# working copies: the other session edits solution/; only verified copies go to pipeline/
+solution/
+starter-duckdb/
+starter-polars/
+starter-pyspark/

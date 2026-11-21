@@ -1,0 +1,15 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+generator/
+reference/
+seeds/
+big/
+.venv/
+solution/
+starter-*/
+_archive/
+dev-answer/
+ship.sh
