@@ -1013,7 +1013,14 @@ fn dedup_sessions<E: EvT>(
                     emit(&ring[i % D], &mut st.ev);
                 }
                 st.kept += cnt;
+                // this task was the only reader of bucket b's records: their
+                // memory (faulted in, likely still cached) takes the next blocks
+                for p in parse_ref {
+                    unsafe { p.ev.recycle_bucket(b, &mut st.ev) };
+                }
             } else {
+                // event tasks all come first: leftover recycled memory goes to clicks
+                st.ev.give_free(&mut st.ck);
                 let (t, s) = ck_tasks[task - ne];
                 let v = &parse_ref[t].ck;
                 let part = &v[s..(s + ck_task).min(v.len())];

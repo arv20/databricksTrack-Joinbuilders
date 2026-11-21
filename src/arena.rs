@@ -10,6 +10,8 @@ const CHUNK: usize = 64 << 20;
 pub struct Arena {
     cur: usize,
     end: usize,
+    /// recycled memory (start, end) that is no longer read, used before new slabs
+    free: Vec<(usize, usize)>,
 }
 
 unsafe impl Send for Arena {}
@@ -66,12 +68,20 @@ fn slab(bytes: usize) -> (usize, usize) {
 
 impl Arena {
     pub fn new() -> Self {
-        Arena { cur: 0, end: 0 }
+        Arena { cur: 0, end: 0, free: Vec::new() }
     }
     #[inline]
     pub fn alloc(&mut self, bytes: usize, align: usize) -> *mut u8 {
         let mut p = (self.cur + align - 1) & !(align - 1);
         if p + bytes > self.end {
+            while let Some((s, e)) = self.free.pop() {
+                let q = (s + align - 1) & !(align - 1);
+                if q + bytes <= e {
+                    self.cur = q + bytes;
+                    self.end = e;
+                    return q as *mut u8;
+                }
+            }
             let (s, e) = slab(bytes + align);
             self.cur = s;
             self.end = e;
@@ -94,6 +104,20 @@ unsafe impl<T: Copy + Send> Send for Scatter<T> {}
 unsafe impl<T: Copy + Sync> Sync for Scatter<T> {}
 
 impl<T: Copy> Scatter<T> {
+    /// Hands bucket `b`'s blocks to `to` for reuse. SAFETY: nothing may read
+    /// this bucket afterwards.
+    pub unsafe fn recycle_bucket<U: Copy>(&self, b: usize, to: &mut Scatter<U>) {
+        for &p in &self.lists[b] {
+            let s = p as usize;
+            to.arena.free.push((s, s + BLOCK * std::mem::size_of::<T>()));
+        }
+    }
+
+    /// Moves every recycled chunk of `self` to `to`.
+    pub fn give_free<U: Copy>(&mut self, to: &mut Scatter<U>) {
+        to.arena.free.append(&mut self.arena.free);
+    }
+
     pub fn new(nb: usize) -> Self {
         Scatter { arena: Arena::new(), cur: vec![(std::ptr::null_mut(), BLOCK as u32); nb], lists: vec![Vec::new(); nb] }
     }
