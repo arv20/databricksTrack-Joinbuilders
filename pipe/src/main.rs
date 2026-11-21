@@ -1,0 +1,395 @@
+#![allow(dead_code, static_mut_refs)]
+mod complex;
+mod core;
+mod events;
+mod iface;
+mod k_ref;
+mod keyrec;
+mod links;
+mod out;
+mod parse;
+mod pqw;
+mod setup;
+mod sys;
+
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::time::Instant;
+use sys::*;
+
+mod generic;
+mod k_free;
+#[cfg(feature = "ymm")]
+mod k_ymm;
+#[cfg(feature = "zmm")]
+mod k_zmm;
+#[cfg(feature = "ymm")]
+pub type K = k_ymm::Ymm;
+#[cfg(feature = "zmm")]
+pub type K = k_zmm::Zmm;
+#[cfg(feature = "free")]
+pub type K = k_free::Free;
+#[cfg(feature = "free256")]
+pub type K = k_free::Free256;
+#[cfg(feature = "freec256")]
+pub type K = k_free::FreeC256;
+#[cfg(not(any(feature = "ymm", feature = "zmm", feature = "free", feature = "free256", feature = "freec256")))]
+pub type K = k_free::FreeC;
+
+fn dirs(args: &[String], skip: usize) -> (String, String) {
+    if args.len() >= 3 + skip {
+        (args[args.len() - 2].clone(), args[args.len() - 1].clone())
+    } else {
+        (std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()), std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()))
+    }
+}
+
+pub fn ncpu_env() -> usize {
+    std::env::var("NCPU").ok().and_then(|s| s.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+}
+
+pub fn run_generic(data: &str, out: &str, ncpu: usize) -> ! {
+    match generic::run(std::path::Path::new(data), std::path::Path::new(out), ncpu) {
+        Ok(()) => unsafe { sys::_exit(0) },
+        Err(e) => {
+            eprintln!("[generic] error: {e}");
+            unsafe { sys::_exit(1) }
+        }
+    }
+}
+
+const fn env_u32(s: Option<&str>, d: u32) -> u32 {
+    match s {
+        None => d,
+        Some(s) => {
+            let b = s.as_bytes();
+            let (mut v, mut i) = (0u32, 0);
+            while i < b.len() {
+                v = v * 10 + (b[i] - b'0') as u32;
+                i += 1;
+            }
+            v
+        }
+    }
+}
+pub const BB: u32 = env_u32(option_env!("XL_BB"), 15);
+pub const BSIZE: usize = 1 << BB;
+pub const UB: u32 = env_u32(option_env!("XL_UB"), 12);
+pub const UBSIZE: usize = 1 << UB;
+pub const DAY_MS: i64 = 86_400_000;
+pub const WEEK_MS: u64 = 604_800_000;
+pub const GAP_MS: u64 = 1_800_000;
+pub const PBOUND: usize = 1 << 17;
+pub const CBOUND: usize = 1 << 14;
+pub const INVALID_TS: u64 = 0x7FFF_FFFF;
+pub const ING_MAX: u64 = (1 << 21) - 1;
+pub const COMPLEX: u16 = 0x8000;
+pub const EXTRA: u16 = 0x4000;
+pub const MASK: u16 = 0x3FFF;
+pub const NALIAS: u64 = 14;
+pub const RAW: u64 = 1 << 42;
+pub const ODDU: u64 = 1 << 26;
+pub const NSHARD: usize = 64;
+pub const TAG_UF: u64 = 1 << 62;
+pub const TAG_ODDC: u64 = 2 << 62;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Rec {
+    pub w0: u64,
+    pub w1: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct OddEv {
+    pub eid: u64,
+    pub ing: i64,
+    pub w0: u64,
+    pub user: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Ev,
+    Ck,
+    Lk,
+}
+pub struct FileInfo {
+    pub kind: Kind,
+    pub off: usize,
+    pub len: usize,
+    pub hdr: usize,
+}
+#[derive(Clone, Copy)]
+pub struct Chunk {
+    pub file: u32,
+    pub a: usize,
+    pub b: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Seg {
+    pub tid: u32,
+    pub off: u32,
+    pub len: u32,
+    pub user: u32,
+}
+#[derive(Clone, Copy, Default)]
+pub struct EdgeInfo {
+    pub n: u32,
+    pub first: Seg,
+    pub last: Seg,
+}
+
+pub struct TState {
+    pub ev: parse::Part,
+    pub us: parse::Part,
+    pub raws: Vec<(u64, u32)>,
+    pub odd_users: Vec<u64>,
+    pub odd_events: Vec<OddEv>,
+    pub odd_clicks: Vec<[u64; 3]>,
+    pub gen_edges: Vec<(u64, u64)>,
+    pub cx_edges: Vec<(u32, u8, u8)>,
+    pub cx_users: Vec<u32>,
+    pub mixed_users: Vec<u32>,
+    pub slots: Vec<Rec>,
+    pub edge: AVec<Rec>,
+    pub cx_raw: Vec<Rec>,
+    pub cx_ev: Vec<Vec<Rec>>,
+    pub cx_ck: Vec<Vec<[u64; 3]>>,
+    pub ck: Vec<[u64; 2]>,
+    pub runbuf: Vec<Rec>,
+    pub pend: Vec<(u32, u16)>,
+    pub cnt: Vec<u32>,
+    pub core: core::Core,
+    pub n_ev_rows: u64,
+    pub n_ck_rows: u64,
+    pub n_lk_rows: u64,
+    pub n_simple: u64,
+    pub n_complex: u64,
+    pub n_odd: u64,
+    pub n_runs: u64,
+    pub prof: [u64; 8],
+}
+
+pub struct G {
+    pub nt: usize,
+    pub check: bool,
+    pub ws: i64,
+    pub wlen: u64,
+    pub cbase: i64,
+    pub clen: u64,
+    pub ing_base: i64,
+    pub ws_mod: u64,
+    pub day0: i32,
+    pub nd: usize,
+    pub ukey: u64,
+    pub ekey: u64,
+    pub ecap: u64,
+    pub ucap: u64,
+    pub prod: Vec<u8>,
+    pub camp: Vec<u8>,
+    pub nc: usize,
+    pub cats: Vec<Vec<u8>>,
+    pub channels: Vec<Vec<u8>>,
+    pub region: *const u8,
+    pub files: Vec<FileInfo>,
+    pub queue: Vec<Chunk>,
+    pub qnext: AtomicUsize,
+    pub ev_bytes: usize,
+    pub row_cap: usize,
+    pub nb: usize,
+    pub nub: usize,
+    pub ev_arena: Arena,
+    pub us_arena: Arena,
+    pub t: Vec<UnsafeCell<TState>>,
+    pub utab: *mut u16,
+    pub claim: *const AtomicU64,
+    pub csr_off: *mut u32,
+    pub csr: *mut [u64; 2],
+    pub csr_base: Vec<usize>,
+    pub uf: links::Uf,
+    pub edges: *mut EdgeInfo,
+    pub joined: Vec<Vec<Seg>>,
+    pub cxu: Vec<u32>,
+    pub extra: std::collections::HashMap<u32, Vec<u64>>,
+    pub odd_kept: Vec<OddEv>,
+    pub next: AtomicUsize,
+    pub st2b_done: std::sync::atomic::AtomicBool,
+}
+unsafe impl Sync for G {}
+impl G {
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub fn t(&self, tid: usize) -> &mut TState {
+        unsafe { &mut *self.t[tid].get() }
+    }
+    #[inline(always)]
+    pub fn normal(&self, y: u64) -> Option<(u32, u32)> {
+        if y < (1 << 40) {
+            let w = keyrec::unscramble(y, self.ukey);
+            let u = w >> 9;
+            let a = w & 511;
+            if u < self.ucap && a < NALIAS {
+                return Some((u as u32, a as u32));
+            }
+        }
+        None
+    }
+    pub fn raw_bytes(&self, tok: u64) -> &[u8] {
+        let tid = ((tok >> 34) & 15) as usize;
+        let idx = (tok & ((1 << 34) - 1)) as usize;
+        let (off, len) = self.t(tid).raws[idx];
+        unsafe { std::slice::from_raw_parts(self.region.add(off as usize), len as usize) }
+    }
+    pub fn id_str(&self, tok: u64, prefix: u8, out: &mut Vec<u8>) {
+        out.clear();
+        if tok & RAW != 0 {
+            out.extend_from_slice(self.raw_bytes(tok));
+        } else {
+            let (v, len) = enc36(tok);
+            out.push(prefix);
+            out.extend_from_slice(&v.to_be_bytes()[..len]);
+        }
+    }
+    #[inline(always)]
+    pub fn csr_range(&self, u: u32) -> &[[u64; 2]] {
+        unsafe {
+            let i = u as usize + (u as usize >> UB);
+            let a = *self.csr_off.add(i) as usize;
+            let b = *self.csr_off.add(i + 1) as usize;
+            std::slice::from_raw_parts(self.csr.add(a), b - a)
+        }
+    }
+}
+
+static PAIR36: [u16; 1296] = {
+    let mut t = [0u16; 1296];
+    let d = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut i = 0;
+    while i < 1296 {
+        t[i] = d[i / 36] as u16 | (d[i % 36] as u16) << 8;
+        i += 1;
+    }
+    t
+};
+
+#[inline(always)]
+pub fn enc36(y: u64) -> (u64, usize) {
+    let hi = (y / 1_679_616) as u32;
+    let lo = (y % 1_679_616) as u32;
+    let p = |v: u32| PAIR36[v as usize] as u64;
+    let le = p(hi / 1296) | p(hi % 1296) << 16 | p(lo / 1296) << 32 | p(lo % 1296) << 48;
+    let be = le.swap_bytes();
+    let z = be ^ 0x3030_3030_3030_3030;
+    let lz = if z == 0 { 7 } else { (z.leading_zeros() / 8) as usize };
+    (be << (8 * lz), 8 - lz)
+}
+
+#[inline(always)]
+pub fn shard(pkey: u64) -> usize {
+    (pkey.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize
+}
+
+fn main() {
+    let t0 = Instant::now();
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--generic") {
+        let (data, outdir) = dirs(&args, 1);
+        run_generic(&data, &outdir, ncpu_env());
+    }
+    let (data, outdir) = dirs(&args, 0);
+    sys::exec_init(&args, &data, &outdir, ncpu_env());
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[v2b] panic: {info}");
+        sys::fallback("panic")
+    }));
+    let nt: usize = std::env::var("NCPU").ok().and_then(|s| s.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8).min(16);
+    let timing = std::env::var("XL_TIMING").is_ok_and(|v| v == "1");
+    let check = std::env::var("XL_CHECK").is_ok_and(|v| v == "1");
+    if std::env::var("XL_NOHUGE").is_ok_and(|v| v == "1") {
+        HUGE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    unsafe { sys::LAST = Some(t0) };
+    let knob = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v == "1");
+    unsafe {
+        parse::NT = knob("XL_NT", true);
+        parse::RELEASE = knob("XL_REL", true);
+        parse::NOSINK = knob("XL_NOSINK", false);
+        parse::PREFETCH = knob("XL_PF", false);
+        parse::SKIP = std::env::var("XL_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    }
+
+    if check {
+        let mut x = 0x9E37_79B9u64;
+        for i in 0..2_000_000u64 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let y = if i < 100_000 { i } else { (x >> 20) % 2_821_109_907_456 >> (i % 41) };
+            let mut s = Vec::new();
+            keyrec::base36_encode(y, &mut s);
+            let (v, len) = enc36(y);
+            if v.to_be_bytes()[..len] != s[..] || (len < 8 && v.to_be_bytes()[len] != 0) {
+                eprintln!("[v2b] CHECK FAILED: enc36({y})");
+                unsafe { sys::_exit(5) }
+            }
+        }
+    }
+    let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
+    lap("setup");
+    {
+        let gr: &G = g;
+        run_par(nt, |tid| parse::stage1(gr, tid));
+    }
+    lap("parse");
+    let uf = links::stage2(g);
+    lap("st2b");
+    events::stage3(g);
+    lap("ev3b");
+    g.uf = uf.join().unwrap_or_else(|_| sys::fallback("union-find thread"));
+    lap("ufjoin");
+    complex::stage4(g);
+    lap("complex");
+    out::stage5(g, &outdir);
+    lap("write");
+    if timing || check {
+        let mut s = String::new();
+        for (n, ms) in unsafe { sys::LAPS.iter() } {
+            s.push_str(&format!("{n}={ms:.1} "));
+        }
+        let (mut ev, mut ck, mut lk, mut si, mut cx, mut od, mut runs, mut rows, mut sess) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
+        for tid in 0..nt {
+            let t = g.t(tid);
+            ev += t.n_ev_rows;
+            ck += t.n_ck_rows;
+            lk += t.n_lk_rows;
+            si += t.n_simple;
+            cx += t.n_complex;
+            od += t.n_odd;
+            runs += t.n_runs;
+            rows += t.core.day.len();
+            sess += t.core.n_sess;
+        }
+        let hwm = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string())).unwrap_or_default();
+        eprintln!("[v2b] ms: {s}total={:.1} peak_rss_kb={hwm}", t0.elapsed().as_secs_f64() * 1e3);
+        let mut prof = [0u64; 8];
+        for tid in 0..nt {
+            for k in 0..8 {
+                if k == 4 {
+                    prof[k] = prof[k].max(g.t(tid).prof[k]);
+                } else {
+                    prof[k] += g.t(tid).prof[k];
+                }
+            }
+        }
+        eprintln!("[v2b] prof (thread-ms): scatter={:.1} compact={:.1} runs={:.1} st2b={:.1} st2b_max_bucket={:.1} st2b_pass1={:.1} st2b_pass2={:.1} st2b_sort={:.1}", prof[0] as f64 / 1e6, prof[1] as f64 / 1e6, prof[2] as f64 / 1e6, prof[3] as f64 / 1e6, prof[4] as f64 / 1e6, prof[5] as f64 / 1e6, (prof[6] - prof[5]) as f64 / 1e6, (prof[3] - prof[6]) as f64 / 1e6);
+        eprintln!(
+            "[v2b] rows: events={ev} clicks={ck} links={lk} | kept valid: simple={si} complex={cx} odd={od} | runs={runs} sessions={sess} user_rows={rows} uf_nodes={} cx_users={} joined={} nb={} nub={}",
+            g.uf.len(),
+            g.cxu.len(),
+            g.joined.len(),
+            g.nb,
+            g.nub
+        );
+    }
+    unsafe { sys::_exit(0) }
+}
