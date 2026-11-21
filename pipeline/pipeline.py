@@ -116,15 +116,18 @@ def dialect_fields(pattern, n, cols):
 
     A line is kept only if it has exactly n fields, and each field is either
     unquoted with no quote character, or wrapped in quotes with no quote inside.
-    Quotes are removed; an empty value becomes NULL.
+    Quotes are removed; an empty value becomes NULL. Fields are unquoted one at
+    a time, so no per-row list is rebuilt.
     """
-    selects = ", ".join(f"NULLIF(f[{i + 1}], '') AS {c}" for i, c in enumerate(cols))
+    def unq(i):
+        x = f"p[{i + 1}]"
+        return (f"NULLIF(CASE WHEN starts_with({x}, '\"') THEN substr({x}, 2, length({x}) - 2) "
+                f"ELSE {x} END, '')")
+    selects = ", ".join(f"{unq(i)} AS {c}" for i, c in enumerate(cols))
     return f"""
         SELECT {selects}
         FROM (
-            SELECT list_transform(p, x -> CASE WHEN starts_with(x, '"')
-                                               THEN substr(x, 2, length(x) - 2) ELSE x END) AS f
-            FROM (SELECT line, string_split(line, ',') AS p FROM ({line_source(pattern)}))
+            SELECT line, p FROM (SELECT line, string_split(line, ',') AS p FROM ({line_source(pattern)}))
             WHERE len(p) = {n}
               AND (strpos(line, '"') = 0 OR len(list_filter(p, x -> strpos(x, '"') > 0 AND NOT (
                       starts_with(x, '"') AND ends_with(x, '"') AND length(x) >= 2
@@ -176,20 +179,24 @@ events = dialect_fields(os.path.join(DATA, "events", "*.csv"), 7,
                         ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"])
 # Keep the copy with the smallest ingest_ts. arg_min keeps one row per event_id in
 # a hash aggregate, far cheaper than a window over every row.
-run(f"""CREATE TEMP TABLE ev_ded AS
+# Keep the copy with the smallest ingest_ts. arg_min keeps one row per event_id in
+# a hash aggregate. It is a subquery, not a table, so the deduplicated rows are never
+# written out before validation.
+ev_ded = f"""
+    SELECT event_id,
+           (r).user_id AS user_id, (r).ts AS ts_raw, (r).ingest_ms AS ingest_ms,
+           (r).event_type AS event_type, (r).product_id AS product_id, (r).price_cents AS price_cents
+    FROM (
         SELECT event_id,
-               (r).user_id AS user_id, (r).ts AS ts_raw, (r).ingest_ms AS ingest_ms,
-               (r).event_type AS event_type, (r).product_id AS product_id, (r).price_cents AS price_cents
-        FROM (
-            SELECT event_id,
-                   arg_min(struct_pack(user_id := user_id, ts := ts, ingest_ms := ts_ms(ingest_ts),
-                                       event_type := event_type, product_id := product_id,
-                                       price_cents := price_cents),
-                           ts_ms(ingest_ts)) AS r
-            FROM ({events})
-            WHERE event_id IS NOT NULL
-            GROUP BY event_id
-        )""")
+               arg_min(struct_pack(user_id := user_id, ts := ts, ingest_ms := ingest_ms,
+                                   event_type := event_type, product_id := product_id,
+                                   price_cents := price_cents),
+                       ingest_ms) AS r
+        FROM (SELECT event_id, user_id, ts, event_type, product_id, price_cents,
+                     ts_ms(ingest_ts) AS ingest_ms
+              FROM ({events}) WHERE event_id IS NOT NULL)
+        GROUP BY event_id
+    )"""
 
 # Validate the kept copy, then apply the window and the late-event rule.
 run(f"""CREATE TEMP TABLE ev_v AS
@@ -198,7 +205,7 @@ run(f"""CREATE TEMP TABLE ev_v AS
             SELECT user_id, ts_ms(ts_raw) AS ts, ingest_ms, event_type, product_id,
                    CASE WHEN event_type = 'purchase' THEN try_cast(price_cents AS BIGINT) END AS price,
                    CASE WHEN event_type = 'purchase' THEN price_cents END AS price_raw
-            FROM ev_ded
+            FROM ({ev_ded})
             WHERE user_id IS NOT NULL
               AND product_id IS NOT NULL
               AND event_type IN ('view', 'cart', 'purchase')
