@@ -1093,7 +1093,7 @@ fn dedup_sessions<E: EvT>(
             if n == 0 {
                 return;
             }
-            st.local.clear_for(n / 4 + 16);
+            st.local.clear_for(n / 32 + 16);
             st.names.clear();
             st.lids.clear();
             st.cnt.clear();
