@@ -1652,7 +1652,17 @@ fn fast(seed: u64) -> bool {
     }
     let ncat = cat_names.len();
     let cid_of = |line: u64| -> &[u8] { first_field(ck_lines.line(line)).0 };
-    let states: Vec<St> = pt((0..P).into_par_iter(),
+    // Start heavy partitions first so a whale group cannot land on an
+    // otherwise idle worker at the end of session processing.
+    let mut order: Vec<_> = (0..P).collect();
+    order.sort_unstable_by_key(|&p| {
+        let event_count: usize = paccs.iter().map(|fold| fold[p].len()).sum();
+        let click_count: usize = caccs.iter().map(|fold| fold[p].len()).sum();
+        std::cmp::Reverse(event_count + click_count)
+    });
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let partitions = (0..P).into_par_iter().map(|_| order[next.fetch_add(1, Relaxed)]);
+    let states: Vec<St> = pt(partitions,
             || St {
                 cd: vec![[0; 4]; ncs * ndays],
                 cnt: vec![0; ncamp],
