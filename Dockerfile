@@ -6,7 +6,10 @@
 # rebuild using the recorded profile. PGO changes only code layout, inlining
 # and branch weights, never what the program computes. Set PGO=0 to skip it.
 FROM rust:1-bookworm AS build
-ARG TARGET_CPU=x86-64-v3
+# x86: build for Cascade Lake (AVX-512) when the build machine has AVX-512BW,
+# else the AVX2 baseline. The scorers are Cascade Lake or newer; checking the
+# build machine keeps the PGO training run (and the build) safe if it differs.
+ARG TARGET_CPU=auto
 ARG PGO=1
 RUN rustup component add llvm-tools-preview
 COPY pgo/generator /gen
@@ -21,7 +24,14 @@ COPY fixtures ./fixtures
 RUN set -eux; \
     host=$(rustc -vV | sed -n 's/^host: //p'); \
     flags="-C target-feature=+crt-static"; \
-    case "$host" in x86_64-*) flags="$flags -C target-cpu=$TARGET_CPU";; esac; \
+    case "$host" in x86_64-*) \
+      cpu="$TARGET_CPU"; \
+      if [ "$cpu" = auto ]; then \
+        if grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo; then cpu=cascadelake; else cpu=x86-64-v3; fi; \
+      fi; \
+      echo "target-cpu: $cpu"; \
+      flags="$flags -C target-cpu=$cpu";; \
+    esac; \
     bin="target/$host/release/shopping-sessions"; \
     if [ "$PGO" = 1 ]; then \
       RUSTFLAGS="$flags -C profile-generate=/tmp/pgo" cargo build --release --locked --target "$host"; \
