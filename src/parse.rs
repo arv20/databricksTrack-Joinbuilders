@@ -40,7 +40,7 @@ pub struct Part {
     blk_end: *mut u8,
     popw: bool,
     pend: Vec<Line>,
-    pb: Vec<u32>,
+    pb: Vec<u64>,
 }
 const NOCHUNK: usize = LINK_OFF;
 unsafe impl Send for Part {}
@@ -70,43 +70,44 @@ impl Part {
             let fp = self.fill.as_mut_ptr().add(b);
             let f = *fp as usize;
             let l = self.lines.as_mut_ptr().add(b) as *mut u64;
-            *l.add(2 * f) = w0;
-            *l.add(2 * f + 1) = w1;
-            if f == 3 {
+            *l.byte_add(f) = w0;
+            *l.byte_add(f + 8) = w1;
+            if f == 48 {
                 *fp = 0;
                 self.flush(b, l);
             } else {
-                *fp = (f + 1) as u8;
+                *fp = (f + 16) as u8;
             }
         }
     }
+    pub fn lines_ptr(&self) -> *const u8 {
+        self.lines.as_ptr() as *const u8
+    }
     #[inline(always)]
-    pub unsafe fn push_many(&mut self, mut m: u64, ob: *const u64, o0: *const u64, o1: *const u64) {
+    pub unsafe fn push_many(&mut self, mut m: u64, ob: *const u64, lp: *const u64, rec: *const [u64; 2]) {
         use std::arch::x86_64::*;
         let fill = self.fill.as_mut_ptr();
-        let lines = self.lines.as_mut_ptr() as *mut u64;
         let pend = self.pend.as_mut_ptr() as *mut __m512i;
-        let pb = self.pb.as_mut_ptr();
-        let mut k = 0usize;
+        let pb = self.pb.as_mut_ptr() as *mut u8;
+        let mut k8 = 0usize;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
             m &= m - 1;
+            let l = *lp.add(i) as *mut u8;
             let b = *ob.add(i) as usize;
-            let w0 = *o0.add(i);
-            let w1 = *o1.add(i);
             let f = *fill.add(b) as usize;
-            let l = lines.add(b * 8);
+            let r = _mm_load_si128(rec.add(i) as *const __m128i);
             let z = _mm512_load_si512(l as *const __m512i);
-            *fill.add(b) = ((f + 1) & 3) as u8;
-            *l.add(2 * f) = w0;
-            *l.add(2 * f + 1) = w1;
-            let z = _mm512_mask_broadcast_i64x2(z, 0xC0, _mm_set_epi64x(w1 as i64, w0 as i64));
-            _mm512_store_si512(pend.add(k), z);
-            *pb.add(k) = b as u32;
-            k += (f == 3) as usize;
+            _mm_store_si128(l.add(f) as *mut __m128i, r);
+            let t = f + 16;
+            *fill.add(b) = (t & 48) as u8;
+            _mm512_store_si512(pend.byte_add(k8 * 8), _mm512_inserti32x4::<3>(z, r));
+            *(pb.add(k8) as *mut u64) = b as u64;
+            k8 += (t >> 6) * 8;
         }
+        let k = k8 / 8;
         for j in 0..k {
-            let b = *pb.add(j) as usize;
+            let b = *(pb.add(j * 8) as *const u64) as usize;
             let cp = self.cur.as_mut_ptr().add(b);
             let mut c = *cp;
             if (c as usize & (CHUNK - 1)) == LINK_OFF {
@@ -157,14 +158,14 @@ impl Part {
     pub fn finish(&mut self) {
         unsafe {
             for b in 0..self.head.len() {
-                let f = self.fill[b] as usize;
+                let f = self.fill[b] as usize / 8;
                 if f > 0 {
                     let mut c = self.cur[b];
                     if (c as usize & (CHUNK - 1)) == LINK_OFF {
                         c = self.new_chunk(b, c);
                     }
-                    std::ptr::copy_nonoverlapping(self.lines.as_ptr().add(b) as *const u64, c, 2 * f);
-                    self.cur[b] = c.add(2 * f);
+                    std::ptr::copy_nonoverlapping(self.lines.as_ptr().add(b) as *const u64, c, f);
+                    self.cur[b] = c.add(f);
                     self.fill[b] = 0;
                 }
                 self.n[b] = if self.head[b].is_null() {
@@ -239,42 +240,14 @@ unsafe fn mulu32_8(a: std::arch::x86_64::__m512i, b: std::arch::x86_64::__m512i)
     _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
 }
 
-const NB: usize = 64;
-
 #[repr(C, align(64))]
-pub struct EvBatch {
-    eid: [u64; NB],
-    uid: [u64; NB],
-    ts: [i64; NB],
-    ing: [i64; NB],
-    pp: [u64; NB],
-    o0: [u64; NB],
-    o1: [u64; NB],
+pub struct Out {
+    rec: [[u64; 2]; NB],
     ob: [u64; NB],
-    n: usize,
+    lp: [u64; NB],
 }
-#[repr(C, align(64))]
-pub struct CkBatch {
-    cid: [u64; NB],
-    uid: [u64; NB],
-    ts: [i64; NB],
-    camp: [u64; NB],
-    o0: [u64; NB],
-    o1: [u64; NB],
-    ob: [u64; NB],
-    n: usize,
-}
-impl EvBatch {
-    fn new() -> Box<EvBatch> {
-        unsafe { Box::new(std::mem::zeroed()) }
-    }
-    fn row(&self, i: usize) -> EvRow {
-        let pp = self.pp[i];
-        EvRow { eid: self.eid[i], uid: self.uid[i], ts: self.ts[i], ingest: self.ing[i], kind: (pp >> 56) as u8, product: pp as u32, price: (pp >> 32) as u32 & 0xFF_FFFF }
-    }
-}
-impl CkBatch {
-    fn new() -> Box<CkBatch> {
+impl Out {
+    fn new() -> Box<Out> {
         unsafe { Box::new(std::mem::zeroed()) }
     }
 }
@@ -299,6 +272,7 @@ struct Ctx<'a> {
     t: &'a mut TState,
     eb: &'a mut EvBatch,
     cb: &'a mut CkBatch,
+    out: &'a mut Out,
     tabs: &'static Tabs,
     tid: u64,
     base: u64,
@@ -406,16 +380,16 @@ impl<'a> Ctx<'a> {
             return;
         }
         let g = self.g;
-        let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap: g.ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr() };
-        let (okb, spb, bad) = unsafe { ev_vec(&mut *self.eb, n, &p) };
+        let p = EvP { ing_base: g.ing_base, ws: g.ws, wlen: g.wlen, ukey: g.ukey, ekey: g.ekey, ucap: g.ucap, ecap: g.ecap, ptab: self.tabs.prod.as_ptr(), lines: self.t.ev.lines_ptr() };
+        let (okb, spb, bad) = unsafe { ev_vec(&*self.eb, &mut *self.out, n, &p) };
         if bad {
             fallback("ingest_ts bad or out of range");
         }
         if unsafe { SKIP } & 2048 != 0 {
-            self.t.prof[7] = self.t.prof[7].wrapping_add(okb ^ spb ^ self.eb.o0[3] ^ self.eb.o1[5] ^ self.eb.ob[7]);
+            self.t.prof[7] = self.t.prof[7].wrapping_add(okb ^ spb ^ self.out.rec[3][0] ^ self.out.rec[5][1] ^ self.out.ob[7]);
             return;
         }
-        unsafe { self.t.ev.push_many(okb, self.eb.ob.as_ptr(), self.eb.o0.as_ptr(), self.eb.o1.as_ptr()) };
+        unsafe { self.t.ev.push_many(okb, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
@@ -464,15 +438,14 @@ impl<'a> Ctx<'a> {
             return;
         }
         let g = self.g;
-        let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ctab: self.tabs.camp.as_ptr() };
-        let (okb, spb) = unsafe { ck_vec(&mut *self.cb, n, &p) };
-        unsafe { self.t.us.push_many(okb, self.cb.ob.as_ptr(), self.cb.o0.as_ptr(), self.cb.o1.as_ptr()) };
+        let p = CkP { cbase: g.cbase, clen: g.clen, ukey: g.ukey, ucap: g.ucap, ctab: self.tabs.camp.as_ptr(), lines: self.t.us.lines_ptr() };
+        let (okb, spb) = unsafe { ck_vec(&*self.cb, &mut *self.out, n, &p) };
+        unsafe { self.t.us.push_many(okb, self.out.ob.as_ptr(), self.out.lp.as_ptr(), self.out.rec.as_ptr()) };
         let mut m = spb;
         while m != 0 {
             let i = m.trailing_zeros() as usize;
             m &= m - 1;
-            let cb = &*self.cb;
-            let r = ClRow { cid: cb.cid[i], uid: cb.uid[i], campaign: cb.camp[i] as u32, ts: cb.ts[i] };
+            let r = self.cb.row(i);
             self.ck_one(&r);
         }
     }
@@ -487,13 +460,15 @@ struct EvP {
     ucap: u64,
     ecap: u64,
     ptab: *const u8,
+    lines: *const u8,
 }
 
 #[inline(always)]
-unsafe fn ev_vec(eb: &mut EvBatch, n: usize, p: &EvP) -> (u64, u64, bool) {
+unsafe fn ev_vec(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP) -> (u64, u64, bool) {
     use std::arch::x86_64::*;
     let mut okb = 0u64;
     let mut spb = 0u64;
+    let mut pmb = 0u64;
     let mut badm = 0u32;
     let s = |v: u64| _mm512_set1_epi64(v as i64);
     let m40 = s(crate::keyrec::MASK);
@@ -513,21 +488,19 @@ unsafe fn ev_vec(eb: &mut EvBatch, n: usize, p: &EvP) -> (u64, u64, bool) {
     let ws = s(p.ws as u64);
     let wlen = s(p.wlen);
     let empty = s(ID_EMPTY);
-    let two = s(2);
     let zero = _mm512_setzero_si512();
-    let lo32 = s(0xFFFF_FFFF);
     let p24 = s(0xFF_FFFF);
-    let pempty = s(PROD_EMPTY as u64);
-    let pbound = s(PBOUND as u64);
     let day = s(DAY_MS as u64);
     let ucap = s(p.ucap);
     let nal = s(NALIAS);
     let ecap = s(p.ecap);
     let m511 = s(511);
-    let mff = s(255);
     let slotm = s(BSIZE as u64 - 1);
     let magic = s(274_877_907);
     let ones = s(u64::MAX);
+    let lines = s(p.lines as u64);
+    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
     let mut j = 0;
     while j < n {
         let lm: __mmask8 = if n - j >= 8 { 0xFF } else { ((1u32 << (n - j)) - 1) as u8 };
@@ -537,41 +510,41 @@ unsafe fn ev_vec(eb: &mut EvBatch, n: usize, p: &EvP) -> (u64, u64, bool) {
         let ing_s = _mm512_srli_epi64::<38>(mulu32_8(ing, magic));
         let ts = _mm512_load_si512(eb.ts.as_ptr().add(j) as *const __m512i);
         let rel = _mm512_sub_epi64(ts, ws);
+        let eid = _mm512_load_si512(eb.eid.as_ptr().add(j) as *const __m512i);
         let uid = _mm512_load_si512(eb.uid.as_ptr().add(j) as *const __m512i);
         let pp = _mm512_load_si512(eb.pp.as_ptr().add(j) as *const __m512i);
-        let kind = _mm512_srli_epi64::<56>(pp);
-        let prod = _mm512_and_si512(pp, lo32);
         let price = _mm512_and_si512(_mm512_srli_epi64::<32>(pp), p24);
         let valid = lm
             & _mm512_cmpneq_epi64_mask(uid, empty)
             & _mm512_cmplt_epu64_mask(rel, wlen)
-            & _mm512_cmple_epu64_mask(kind, two)
-            & _mm512_cmpneq_epi64_mask(prod, pempty)
-            & (_mm512_cmpneq_epi64_mask(kind, two) | _mm512_cmpneq_epi64_mask(price, zero))
+            & !_mm512_movepi64_mask(pp)
             & _mm512_cmple_epi64_mask(_mm512_sub_epi64(ingr, ts), day);
         let w = unscr(uid, ukey);
         let user = _mm512_srli_epi64::<9>(w);
         let alias = _mm512_and_si512(w, m511);
         let normal = _mm512_cmplt_epu64_mask(uid, lim40) & _mm512_cmplt_epu64_mask(user, ucap) & _mm512_cmplt_epu64_mask(alias, nal);
-        let pm = valid & _mm512_cmpneq_epi64_mask(price, zero);
-        let cat = _mm512_and_si512(_mm512_mask_i64gather_epi64::<1>(zero, pm, _mm512_min_epu64(prod, pbound), p.ptab as *const i64), mff);
-        let w0v = _mm512_or_si512(
-            _mm512_or_si512(_mm512_slli_epi64::<33>(rel), _mm512_slli_epi64::<9>(price)),
-            _mm512_or_si512(_mm512_slli_epi64::<4>(cat), alias),
-        );
+        pmb |= ((valid & _mm512_cmpneq_epi64_mask(price, zero)) as u64) << j;
+        let w0v = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi64::<33>(rel), _mm512_slli_epi64::<9>(price)), alias);
         let w0v = _mm512_mask_blend_epi64(valid, ones, w0v);
         let userv = _mm512_maskz_mov_epi64(valid, user);
-        let eid = _mm512_load_si512(eb.eid.as_ptr().add(j) as *const __m512i);
         let v = unscr(eid, ekey);
         let evok = _mm512_cmplt_epu64_mask(eid, lim40) & _mm512_cmplt_epu64_mask(v, ecap);
         let w1v = _mm512_or_si512(_mm512_and_si512(v, slotm), _mm512_or_si512(_mm512_slli_epi64::<16>(ing_s), _mm512_slli_epi64::<37>(userv)));
         let ok = lm & evok & !(valid & !normal);
-        _mm512_store_si512(eb.o0.as_mut_ptr().add(j) as *mut __m512i, w0v);
-        _mm512_store_si512(eb.o1.as_mut_ptr().add(j) as *mut __m512i, w1v);
-        _mm512_store_si512(eb.ob.as_mut_ptr().add(j) as *mut __m512i, _mm512_srli_epi64::<BB>(v));
+        let bv = _mm512_srli_epi64::<BB>(v);
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j) as *mut __m512i, _mm512_permutex2var_epi64(w0v, ix_lo, w1v));
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4) as *mut __m512i, _mm512_permutex2var_epi64(w0v, ix_hi, w1v));
+        _mm512_store_si512(out.ob.as_mut_ptr().add(j) as *mut __m512i, bv);
+        _mm512_store_si512(out.lp.as_mut_ptr().add(j) as *mut __m512i, _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
         okb |= (ok as u64) << j;
         spb |= ((lm & !ok) as u64) << j;
         j += 8;
+    }
+    while pmb != 0 {
+        let i = pmb.trailing_zeros() as usize;
+        pmb &= pmb - 1;
+        let prod = (*eb.pp.get_unchecked(i) as u32 as usize).min(PBOUND);
+        out.rec.get_unchecked_mut(i)[0] |= (*p.ptab.add(prod) as u64) << 4;
     }
     (okb, spb, badm != 0)
 }
@@ -582,10 +555,11 @@ struct CkP {
     ukey: u64,
     ucap: u64,
     ctab: *const u8,
+    lines: *const u8,
 }
 
 #[inline(always)]
-unsafe fn ck_vec(cb: &mut CkBatch, n: usize, p: &CkP) -> (u64, u64) {
+unsafe fn ck_vec(cb: &CkBatch, out: &mut Out, n: usize, p: &CkP) -> (u64, u64) {
     use std::arch::x86_64::*;
     let mut okb = 0u64;
     let mut spb = 0u64;
@@ -604,11 +578,15 @@ unsafe fn ck_vec(cb: &mut CkBatch, n: usize, p: &CkP) -> (u64, u64) {
     let nal = s(NALIAS);
     let m511 = s(511);
     let ulo = s(UBSIZE as u64 - 1);
+    let lines = s(p.lines as u64);
+    let ix_lo = _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11);
+    let ix_hi = _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15);
     let mut j = 0;
     while j < n {
         let lm: __mmask8 = if n - j >= 8 { 0xFF } else { ((1u32 << (n - j)) - 1) as u8 };
         let ts = _mm512_load_si512(cb.ts.as_ptr().add(j) as *const __m512i);
         let rel = _mm512_sub_epi64(ts, cbase);
+        let cid = _mm512_load_si512(cb.cid.as_ptr().add(j) as *const __m512i);
         let uid = _mm512_load_si512(cb.uid.as_ptr().add(j) as *const __m512i);
         let camp = _mm512_load_si512(cb.camp.as_ptr().add(j) as *const __m512i);
         let inb = lm & _mm512_cmplt_epu64_mask(camp, cbound);
@@ -620,15 +598,16 @@ unsafe fn ck_vec(cb: &mut CkBatch, n: usize, p: &CkP) -> (u64, u64) {
         let u = _mm512_srli_epi64::<9>(w);
         let alias = _mm512_and_si512(w, m511);
         let normal = _mm512_cmplt_epu64_mask(uid, lim40) & _mm512_cmplt_epu64_mask(u, ucap) & _mm512_cmplt_epu64_mask(alias, nal);
-        let cid = _mm512_load_si512(cb.cid.as_ptr().add(j) as *const __m512i);
         let cidok = _mm512_cmplt_epu64_mask(cid, lim40);
         let key = _mm512_or_si512(_mm512_slli_epi64::<32>(rel), _mm512_slli_epi64::<4>(camp));
         let o0 = _mm512_or_si512(cid, _mm512_slli_epi64::<43>(_mm512_and_si512(u, ulo)));
         let o1 = _mm512_or_si512(key, alias);
         let ok = keep & normal & cidok;
-        _mm512_store_si512(cb.o0.as_mut_ptr().add(j) as *mut __m512i, o0);
-        _mm512_store_si512(cb.o1.as_mut_ptr().add(j) as *mut __m512i, o1);
-        _mm512_store_si512(cb.ob.as_mut_ptr().add(j) as *mut __m512i, _mm512_srli_epi64::<UB>(u));
+        let bv = _mm512_srli_epi64::<UB>(u);
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j) as *mut __m512i, _mm512_permutex2var_epi64(o0, ix_lo, o1));
+        _mm512_store_si512(out.rec.as_mut_ptr().add(j + 4) as *mut __m512i, _mm512_permutex2var_epi64(o0, ix_hi, o1));
+        _mm512_store_si512(out.ob.as_mut_ptr().add(j) as *mut __m512i, bv);
+        _mm512_store_si512(out.lp.as_mut_ptr().add(j) as *mut __m512i, _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
         okb |= (ok as u64) << j;
         spb |= ((keep & !ok) as u64) << j;
         j += 8;
@@ -638,38 +617,23 @@ unsafe fn ck_vec(cb: &mut CkBatch, n: usize, p: &CkP) -> (u64, u64) {
 
 impl<'a> EventSink for Ctx<'a> {
     #[inline(always)]
-    fn event(&mut self, r: &EvRow) {
-        let b = &mut *self.eb;
-        let i = b.n;
-        unsafe {
-            *b.eid.get_unchecked_mut(i) = r.eid;
-            *b.uid.get_unchecked_mut(i) = r.uid;
-            *b.ts.get_unchecked_mut(i) = r.ts;
-            *b.ing.get_unchecked_mut(i) = r.ingest;
-            *b.pp.get_unchecked_mut(i) = r.product as u64 | (r.price as u64) << 32 | (r.kind as u64) << 56;
-        }
-        b.n = i + 1;
-        if i + 1 == NB {
-            self.ev_batch();
-        }
+    fn ev(&mut self) -> *mut EvBatch {
+        &mut *self.eb
+    }
+    #[inline(always)]
+    fn ev_flush(&mut self) {
+        self.ev_batch();
     }
 }
 
 impl<'a> ClickSink for Ctx<'a> {
     #[inline(always)]
-    fn click(&mut self, r: &ClRow) {
-        let b = &mut *self.cb;
-        let i = b.n;
-        unsafe {
-            *b.cid.get_unchecked_mut(i) = r.cid;
-            *b.uid.get_unchecked_mut(i) = r.uid;
-            *b.ts.get_unchecked_mut(i) = r.ts;
-            *b.camp.get_unchecked_mut(i) = r.campaign as u64;
-        }
-        b.n = i + 1;
-        if i + 1 == NB {
-            self.ck_batch();
-        }
+    fn ck(&mut self) -> *mut CkBatch {
+        &mut *self.cb
+    }
+    #[inline(always)]
+    fn ck_flush(&mut self) {
+        self.ck_batch();
     }
 }
 
@@ -920,6 +884,7 @@ mod tests {
             *x = r.below(31) as u8;
         }
         let mut eb = EvBatch::new();
+        let mut out = Out::new();
         let (mut n_ok, mut n_sp, mut n_bad) = (0, 0, 0);
         for round in 0..40_000 {
             let ws = (r.below(1 << 41) as i64) + 8 * DAY_MS;
@@ -933,6 +898,7 @@ mod tests {
                 ucap: 1 + r.below(1 << 26),
                 ecap: 1 + r.below(1 << 28),
                 ptab: prod.as_ptr(),
+                lines: (r.below(1 << 40) << 6) as *const u8,
             };
             let n = 1 + r.below(64) as usize;
             let mut rows = Vec::new();
@@ -980,7 +946,7 @@ mod tests {
                     3 => PBOUND as u32,
                     _ => r.below(PBOUND as u64) as u32,
                 };
-                let price = if kind == 2 || r.below(50) == 0 { [0, 1, 10_000_000, r.below(10_000_000) as u32 + 1][r.below(4) as usize] } else { 0 };
+                let price = if kind == 2 { [0, 1, 10_000_000, r.below(10_000_000) as u32 + 1][r.below(4) as usize] } else { 0 };
                 rows.push(EvRow { eid, uid, ts, ingest, kind, product, price });
             }
             for (i, row) in rows.iter().enumerate() {
@@ -988,18 +954,22 @@ mod tests {
                 eb.uid[i] = row.uid;
                 eb.ts[i] = row.ts;
                 eb.ing[i] = row.ingest;
-                eb.pp[i] = row.product as u64 | (row.price as u64) << 32 | (row.kind as u64) << 56;
+                eb.pp[i] = ev_pp(row.kind, row.product, row.price);
             }
             for i in n..NB {
                 eb.ing[i] = TS_BAD;
                 eb.eid[i] = r.next();
+                eb.uid[i] = r.next();
+                eb.pp[i] = r.next();
             }
-            let (okb, spb, bad) = unsafe { ev_vec(&mut eb, n, &p) };
+            let (okb, spb, bad) = unsafe { ev_vec(&eb, &mut out, n, &p) };
             assert_eq!(okb & spb, 0);
             assert_eq!((okb | spb).count_ones() as usize, n, "round {round}");
             let mut any_bad = false;
             for (i, row) in rows.iter().enumerate() {
-                assert_eq!(eb.row(i), *row);
+                let back = eb.row(i);
+                let want_prod = if row.kind == 2 || row.product == PROD_EMPTY { row.product } else { PROD_ODD };
+                assert_eq!(back, EvRow { product: want_prod, ..*row });
                 let ing = row.ingest.wrapping_sub(p.ing_base) as u64;
                 if row.ingest == TS_BAD || ing >= ING_MAX * 1000 {
                     any_bad = true;
@@ -1043,7 +1013,8 @@ mod tests {
                     n_sp += 1;
                 } else {
                     assert!(okb >> i & 1 == 1, "round {round} row {i}: {row:?}");
-                    assert_eq!(Some((eb.ob[i], eb.o0[i], eb.o1[i])), pushed, "round {round} row {i}: {row:?}");
+                    assert_eq!(Some((out.ob[i], out.rec[i][0], out.rec[i][1])), pushed, "round {round} row {i}: {row:?}");
+                    assert_eq!(out.lp[i], p.lines as u64 + 64 * out.ob[i]);
                     n_ok += 1;
                 }
             }
@@ -1062,11 +1033,12 @@ mod tests {
             *x = if r.below(4) == 0 { 255 } else { r.below(6) as u8 };
         }
         let mut cb = CkBatch::new();
+        let mut out = Out::new();
         let (mut n_ok, mut n_sp, mut n_drop) = (0, 0, 0);
         for round in 0..40_000 {
             let ws = (r.below(1 << 41) as i64) + 8 * DAY_MS;
             let we = ws + ((1 + r.below(24)) * DAY_MS as u64) as i64;
-            let p = CkP { cbase: ws - 7 * DAY_MS, clen: (we - ws + 7 * DAY_MS) as u64, ukey: r.next(), ucap: 1 + r.below(1 << 26), ctab: camp.as_ptr() };
+            let p = CkP { cbase: ws - 7 * DAY_MS, clen: (we - ws + 7 * DAY_MS) as u64, ukey: r.next(), ucap: 1 + r.below(1 << 26), ctab: camp.as_ptr(), lines: (r.below(1 << 40) << 6) as *const u8 };
             let n = 1 + r.below(64) as usize;
             let mut rows = Vec::new();
             for _ in 0..n {
@@ -1108,9 +1080,10 @@ mod tests {
             for i in n..NB {
                 cb.camp[i] = r.below(CBOUND as u64);
                 cb.ts[i] = p.cbase;
+                cb.cid[i] = r.below(1 << 40);
                 cb.uid[i] = r.below(1 << 40);
             }
-            let (okb, spb) = unsafe { ck_vec(&mut cb, n, &p) };
+            let (okb, spb) = unsafe { ck_vec(&cb, &mut out, n, &p) };
             assert_eq!(okb & spb, 0);
             assert_eq!((okb | spb).checked_shr(n as u32).unwrap_or(0), 0);
             for (i, row) in rows.iter().enumerate() {
@@ -1133,7 +1106,8 @@ mod tests {
                 match pushed {
                     Some(x) => {
                         assert!(okb >> i & 1 == 1, "round {round} row {i}");
-                        assert_eq!((cb.ob[i], cb.o0[i], cb.o1[i]), x);
+                        assert_eq!((out.ob[i], out.rec[i][0], out.rec[i][1]), x);
+                        assert_eq!(out.lp[i], p.lines as u64 + 64 * out.ob[i]);
                         n_ok += 1;
                     }
                     None => {
@@ -1154,23 +1128,21 @@ mod tests {
             let a2 = Arena::new(64 << 20);
             let mut p1 = Part::new(&a1, nb);
             let mut p2 = Part::new(&a2, nb);
-            let mut ob = [0u64; 64];
-            let mut o0 = [0u64; 64];
-            let mut o1 = [0u64; 64];
+            let mut out = Out::new();
             for _ in 0..3000 {
                 let m = if r.below(3) == 0 { r.next() } else { u64::MAX >> r.below(64) };
                 for i in 0..64 {
-                    ob[i] = r.below(nb as u64);
-                    o0[i] = r.next();
-                    o1[i] = r.next();
+                    out.ob[i] = r.below(nb as u64);
+                    out.lp[i] = p2.lines_ptr() as u64 + 64 * out.ob[i];
+                    out.rec[i] = [r.next(), r.next()];
                 }
                 let mut mm = m;
                 while mm != 0 {
                     let i = mm.trailing_zeros() as usize;
                     mm &= mm - 1;
-                    p1.push(ob[i] as usize, o0[i], o1[i]);
+                    p1.push(out.ob[i] as usize, out.rec[i][0], out.rec[i][1]);
                 }
-                unsafe { p2.push_many(m, ob.as_ptr(), o0.as_ptr(), o1.as_ptr()) };
+                unsafe { p2.push_many(m, out.ob.as_ptr(), out.lp.as_ptr(), out.rec.as_ptr()) };
                 let b = r.below(nb as u64) as usize;
                 let (x, y) = (r.next(), r.next());
                 p1.push(b, x, y);
@@ -1328,8 +1300,8 @@ fn work_queue(g: &G) -> &'static Vec<Chunk> {
 }
 
 #[inline(always)]
-fn parse_buf(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, tb: &'static Tabs, tid: usize, f: &FileInfo, buf: &[u8], s: usize) {
-    let mut ctx = Ctx { g, t, eb, cb, tabs: tb, tid: tid as u64, base: (f.off + s) as u64, fend: (f.off + f.len) as u64 };
+fn parse_buf(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, out: &mut Out, tb: &'static Tabs, tid: usize, f: &FileInfo, buf: &[u8], s: usize) {
+    let mut ctx = Ctx { g, t, eb, cb, out, tabs: tb, tid: tid as u64, base: (f.off + s) as u64, fend: (f.off + f.len) as u64 };
     match f.kind {
         Kind::Ev => {
             if unsafe { SKIP } & 16384 == 0 {
@@ -1352,7 +1324,7 @@ fn parse_buf(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, tb: &'st
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, tb: &'static Tabs, tid: usize, f: &FileInfo, c: &Chunk, fd: i32, rb: *mut u8, rd: usize) {
+unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, out: &mut Out, tb: &'static Tabs, tid: usize, f: &FileInfo, c: &Chunk, fd: i32, rb: *mut u8, rd: usize) {
     let flen = f.len;
     let lim = c.b.min(flen);
     let mut pos = c.a - 1;
@@ -1390,12 +1362,12 @@ unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, tb
                 None => {
                     let data = std::slice::from_raw_parts(g.region.add(f.off), flen);
                     let e = if c.b >= flen { flen } else { next_line_start(data, c.b - 1) };
-                    parse_buf(g, t, eb, cb, tb, tid, f, &data[st..e], st);
+                    parse_buf(g, t, eb, cb, out, tb, tid, f, &data[st..e], st);
                     return;
                 }
             },
         };
-        parse_buf(g, t, eb, cb, tb, tid, f, &s[o..cut], st);
+        parse_buf(g, t, eb, cb, out, tb, tid, f, &s[o..cut], st);
         if done {
             return;
         }
@@ -1425,6 +1397,7 @@ pub fn stage1(g: &G, tid: usize) {
     t.core = crate::core::Core::new(g.nc, g.nd, g.row_cap, g.ws_mod, g.day0);
     let mut eb = EvBatch::new();
     let mut cb = CkBatch::new();
+    let mut out = Out::new();
     let tb = tabs(g);
     let rd = d.rd;
     #[allow(static_mut_refs)]
@@ -1440,7 +1413,7 @@ pub fn stage1(g: &G, tid: usize) {
         let c = q[i];
         let f = &g.files[c.file as usize];
         if use_rd && fds[c.file as usize] >= 0 {
-            unsafe { chunk_rd(g, &mut *t, &mut eb, &mut cb, tb, tid, f, &c, fds[c.file as usize], rb, rd) };
+            unsafe { chunk_rd(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, &c, fds[c.file as usize], rb, rd) };
             continue;
         }
         let data = unsafe { std::slice::from_raw_parts(g.region.add(f.off), f.len) };
@@ -1459,7 +1432,7 @@ pub fn stage1(g: &G, tid: usize) {
             }
             t.prof[7] = t.prof[7].wrapping_add(x);
         } else {
-            parse_buf(g, &mut *t, &mut eb, &mut cb, tb, tid, f, buf, s);
+            parse_buf(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, buf, s);
         }
         if unsafe { RELEASE } {
             let a = (f.off + s + 4095) & !4095;

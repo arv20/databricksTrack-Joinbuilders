@@ -631,7 +631,7 @@ fn heavy_scatter(g: &G, t: &mut TState, h: &Heavy, th: usize) {
 }
 
 fn heavy_sort(g: &G, p: &Plan, tid: usize) {
-    g.us_arena.release_part(tid, g.nt);
+    let _ = tid;
     let mut tmp = Scratch::default();
     let per = 64 + UBSIZE / 64 - 1;
     let units = per * p.heavy.len();

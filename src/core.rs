@@ -28,13 +28,47 @@ pub enum Name<'a> {
     Bytes(&'a [u8]),
 }
 
+pub struct Tab<T> {
+    p: *mut T,
+    n: usize,
+}
+unsafe impl<T> Send for Tab<T> {}
+impl<T: Copy> Tab<T> {
+    pub fn new(n: usize) -> Tab<T> {
+        Tab { p: anon(n.max(1) * std::mem::size_of::<T>()) as *mut T, n }
+    }
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.p
+    }
+}
+impl<T> std::ops::Index<usize> for Tab<T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &T {
+        assert!(i < self.n);
+        unsafe { &*self.p.add(i) }
+    }
+}
+impl<T> std::ops::IndexMut<usize> for Tab<T> {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        assert!(i < self.n);
+        unsafe { &mut *self.p.add(i) }
+    }
+}
+
 pub struct Core {
     ws_mod: u64,
     day0: i32,
     pub nd: usize,
     pub organic: usize,
-    pub agg: Vec<[u32; 2]>,
-    pub aggp: Vec<[u64; 2]>,
+    pub agg: Tab<[u32; 2]>,
+    pub aggp: Tab<[u64; 2]>,
     pub names_off: AVec<u32>,
     pub names: AVec<u8>,
     pub keys: AVec<u32>,
@@ -82,8 +116,8 @@ impl Core {
             day0,
             nd,
             organic: nc,
-            agg: vec![[0; 2]; (nc + 2) * nd],
-            aggp: vec![[0; 2]; (nc + 2) * nd],
+            agg: Tab::new((nc + 2) * nd),
+            aggp: Tab::new((nc + 2) * nd),
             names_off,
             names: AVec::new(row_cap * 10),
             keys: AVec::new(row_cap),
