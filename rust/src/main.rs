@@ -290,13 +290,15 @@ fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
     }
     let mut expected = 0;
     let values = std::array::from_fn(|i| {
-        let field = unsafe { line.get_unchecked(cuts[i]..cuts[i + 1] - 1) };
-        if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
-            expected += 2;
-            &field[1..field.len() - 1]
-        } else {
-            field
-        }
+        let start = cuts[i];
+        let end = cuts[i + 1] - 1;
+        // Both endpoint reads are in bounds even for empty edge fields.
+        // An empty or single-byte field can never satisfy the length check.
+        let first = unsafe { *line.get_unchecked(start.min(line.len() - 1)) };
+        let last = unsafe { *line.get_unchecked(end.saturating_sub(1)) };
+        let wrapped = ((end - start >= 2) & (first == b'"') & (last == b'"')) as usize;
+        expected += 2 * wrapped as u32;
+        unsafe { line.get_unchecked(start + wrapped..end - wrapped) }
     });
     (quotes.count_ones() == expected).then_some(values)
 }
@@ -330,7 +332,12 @@ fn event_row_masks_match_scalar_at_simd_and_tail_boundaries() {
             data.extend_from_slice(row.as_bytes());
         }
     }
-    data.extend_from_slice(b"\ne,u,t,i,view,p,");
+    // Exercise endpoint clamping with quotes elsewhere in the row, as well
+    // as a single quote at the first or last field and an unterminated row.
+    data.extend_from_slice(b"\n,u,\"2027-12-13T18:12:18Z\",i,view,p,\n");
+    data.extend_from_slice(b"\",u,2027-12-13T18:12:18Z,i,view,p,\n");
+    data.extend_from_slice(b"e,u,2027-12-13T18:12:18Z,i,view,p,\"\n");
+    data.extend_from_slice(b"e,u,\"2027-12-13T18:12:18Z\",i,view,p,");
 
     let mut expected = Vec::new();
     for_lines(&data, |line| {
