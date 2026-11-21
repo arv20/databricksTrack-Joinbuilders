@@ -185,12 +185,19 @@ fn for_lines<const N: usize>(data: &[u8], s: usize, e: usize, mut f: impl FnMut(
     }
 }
 
-fn read_lookup(path: &Path) -> Vec<(Key, Vec<u8>)> {
+/// Rows of a two-column lookup file: (key, raw key bytes, value bytes). The
+/// slices point into a leaked buffer, so no row allocates.
+fn read_lookup(path: &Path) -> Vec<(Key, &'static [u8], &'static [u8])> {
     let data = io::read_small(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let mut out = Vec::new();
     for_lines::<2>(data, 0, data.len(), |f| {
         if !f[0].is_empty() {
-            out.push((key(f[0]), f[1].to_vec()));
+            // re-borrow the fields from `data` itself to keep its 'static lifetime
+            let at = |x: &[u8]| -> &'static [u8] {
+                let o = x.as_ptr() as usize - data.as_ptr() as usize;
+                &data[o..o + x.len()]
+            };
+            out.push((key(f[0]), at(f[0]), at(f[1])));
         }
     });
     out
@@ -555,70 +562,77 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     let day0 = ws.div_euclid(DAY);
     let ndays = if we > ws { ((we - 1).div_euclid(DAY) - day0 + 1) as usize } else { 1 };
 
-    let prod_rows = read_lookup(&data_dir.join("products.csv"));
-    let mut cat_set: HashMap<Vec<u8>, u32> = HashMap::new();
-    for (_, c) in &prod_rows {
-        cat_set.entry(c.clone()).or_insert(0);
-    }
-    cat_set.entry(b"unknown".to_vec()).or_insert(0);
-    let mut cat_names: Vec<Vec<u8>> = cat_set.keys().cloned().collect();
-    cat_names.sort();
-    for (i, c) in cat_names.iter().enumerate() {
-        cat_set.insert(c.clone(), i as u32);
-    }
-    let unknown_cat = cat_set[&b"unknown"[..]];
-    let mut products = KeyMap::with_capacity(prod_rows.len());
-    for (k, c) in &prod_rows {
-        products.insert(*k, cat_set[c]);
-    }
-    // the most common first byte of product IDs gets the array fast path
-    let mut first = [0usize; 256];
-    for (k, _) in &prod_rows {
-        let b = ids::bytes(*k);
-        first[b[0] as usize] += 1;
-    }
-    let pfx = (0..256).max_by_key(|&i| first[i]).unwrap() as u8;
-    let mut pnum: Vec<u32> = Vec::new();
-    for (k, c) in &prod_rows {
-        // later rows win, as in the map
-        if let Some(n) = canonical_num(&ids::bytes(*k), pfx) {
-            if n < (1 << 22) {
-                if pnum.len() <= n {
-                    pnum.resize(n + 1, NO_CAT);
+    // products and campaigns are built on a helper thread while the main
+    // thread maps the input files and parses the links
+    let ctx_thread = std::thread::spawn({
+        let data_dir = data_dir.to_path_buf();
+        move || -> Ctx {
+            let data_dir = data_dir.as_path();
+            let prod_rows = read_lookup(&data_dir.join("products.csv"));
+            let mut cat_set: HashMap<&'static [u8], u32> = HashMap::new();
+            for &(_, _, c) in &prod_rows {
+                cat_set.entry(c).or_insert(0);
+            }
+            cat_set.entry(&b"unknown"[..]).or_insert(0);
+            let mut cat_names: Vec<Vec<u8>> = cat_set.keys().map(|c| c.to_vec()).collect();
+            cat_names.sort();
+            for (i, c) in cat_names.iter().enumerate() {
+                *cat_set.get_mut(&c[..]).unwrap() = i as u32;
+            }
+            let unknown_cat = cat_set[&b"unknown"[..]];
+            let mut products = KeyMap::with_capacity(prod_rows.len());
+            // the most common first byte of product IDs gets the array fast path
+            let mut first = [0usize; 256];
+            let mut row_cat: Vec<u32> = Vec::with_capacity(prod_rows.len());
+            for &(k, raw, c) in &prod_rows {
+                let cat = cat_set[c];
+                row_cat.push(cat);
+                products.insert(k, cat);
+                first[raw[0] as usize] += 1;
+            }
+            let pfx = (0..256).max_by_key(|&i| first[i]).unwrap() as u8;
+            let mut pnum: Vec<u32> = Vec::new();
+            for (&(_, raw, _), &cat) in prod_rows.iter().zip(&row_cat) {
+                // later rows win, as in the map
+                if let Some(n) = canonical_num(raw, pfx) {
+                    if n < (1 << 22) {
+                        if pnum.len() <= n {
+                            pnum.resize(n + 1, NO_CAT);
+                        }
+                        pnum[n] = cat;
+                    }
                 }
-                pnum[n] = cat_set[c];
+            }
+            let camp_rows = read_lookup(&data_dir.join("campaigns.csv"));
+            let mut campaigns: KeyMap<u32> = KeyMap::with_capacity(camp_rows.len());
+            let mut camp_names = Vec::new();
+            let mut camp_channels: Vec<Vec<u8>> = Vec::new();
+            for (k, _, ch) in camp_rows {
+                let idx = campaigns.get_or_insert(k, || {
+                    camp_names.push(k);
+                    camp_channels.push(Vec::new());
+                    (camp_names.len() - 1) as u32
+                });
+                camp_channels[idx as usize] = ch.to_vec();
+            }
+            Ctx {
+                ws,
+                we,
+                cws: ws - LOOKBACK,
+                day0,
+                ndays,
+                products,
+                pfx,
+                pnum,
+                unknown_cat,
+                cat_names,
+                campaigns,
+                camp_names,
+                camp_channels,
+                nthreads,
             }
         }
-    }
-    let camp_rows = read_lookup(&data_dir.join("campaigns.csv"));
-    let mut campaigns: KeyMap<u32> = KeyMap::with_capacity(camp_rows.len());
-    let mut camp_names = Vec::new();
-    let mut camp_channels: Vec<Vec<u8>> = Vec::new();
-    for (k, ch) in camp_rows {
-        let idx = campaigns.get_or_insert(k, || {
-            camp_names.push(k);
-            camp_channels.push(Vec::new());
-            (camp_names.len() - 1) as u32
-        });
-        camp_channels[idx as usize] = ch;
-    }
-    let ctx = Ctx {
-        ws,
-        we,
-        cws: ws - LOOKBACK,
-        day0,
-        ndays,
-        products,
-        pfx,
-        pnum,
-        unknown_cat,
-        cat_names,
-        campaigns,
-        camp_names,
-        camp_channels,
-        nthreads,
-    };
-    let ctx = &ctx;
+    });
 
     // ---- map inputs
     let map_all = |dir: &str| -> Vec<&'static [u8]> {
@@ -653,6 +667,8 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             });
         },
     );
+    let ctx = ctx_thread.join().expect("setup thread");
+    let ctx = &ctx;
     tm.lap("links");
 
     // ---- events + clicks parse (and persons built alongside)
