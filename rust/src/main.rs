@@ -200,6 +200,7 @@ fn hash_bytes(b: &[u8]) -> u64 {
 // ------------------------------------------------------------------ main
 #[derive(Clone, Copy)]
 struct RawEv<'a> {
+    #[allow(dead_code)]
     id: &'a [u8],
     user: &'a [u8],
     ts: &'a [u8],
@@ -337,19 +338,26 @@ fn main() {
     let nlinkp = pname.len();
     lap(&format!("links: {} edges, {} ids, {} persons", edges.len(), ids.len(), nlinkp));
 
-    // events: parse into shards by hash(event_id)
+    // events: parse into shards by hash(event_id). Shards keep only (id, ingest, line)
+    // to cut memory traffic; the other fields are reparsed for the kept copy only.
+    #[derive(Clone, Copy)]
+    struct Lite<'a> {
+        id: &'a [u8],
+        ingest: i64,
+        line: &'a [u8],
+    }
     let ech = chunks(evb, 1 << 19);
-    let shards: Vec<Vec<Vec<RawEv>>> = ech
+    let shards: Vec<Vec<Vec<Lite>>> = ech
         .par_iter()
         .map(|c| {
-            let mut sh: Vec<Vec<RawEv>> = (0..SH).map(|_| Vec::with_capacity(c.len() / 80 / SH + 4)).collect();
+            let mut sh: Vec<Vec<Lite>> = (0..SH).map(|_| Vec::with_capacity(c.len() / 80 / SH + 4)).collect();
             for_lines(c, |l| {
-                if let Some([id, user, ts, ing, et, pr, pc]) = fields::<7>(l) {
+                if let Some([id, _, _, ing, _, _, _]) = fields::<7>(l) {
                     if id.is_empty() {
                         return;
                     }
                     let ingest = parse_ts(ing).unwrap_or(i64::MAX);
-                    sh[(hash_bytes(id) as usize) & (SH - 1)].push(RawEv { id, user, ts, ingest, etype: et, product: pr, price: pc });
+                    sh[(hash_bytes(id) as usize) & (SH - 1)].push(Lite { id, ingest, line: l });
                 }
             });
             sh
@@ -358,25 +366,34 @@ fn main() {
     lap("events parsed");
     // dedup + validate per shard
     let nded = std::sync::atomic::AtomicUsize::new(0);
-    let valid: Vec<Vec<(RawEv, i64, i64)>> = (0..SH)
+    // validated events keep only what later stages read: user, ts, price, category
+    let valid: Vec<Vec<(&[u8], i64, i64, u32)>> = (0..SH)
         .into_par_iter()
         .map(|s| {
             let cap: usize = shards.iter().map(|x| x[s].len()).sum();
-            let mut m: HashMap<&[u8], RawEv> = HashMap::with_capacity(cap);
+            let mut m: HashMap<&[u8], u32> = HashMap::with_capacity(cap);
+            let mut recs: Vec<Lite> = Vec::with_capacity(cap);
             for part in &shards {
                 for r in &part[s] {
-                    m.entry(r.id)
-                        .and_modify(|e| {
+                    match m.get(r.id) {
+                        Some(&i) => {
+                            let e = &mut recs[i as usize];
                             if r.ingest < e.ingest {
-                                *e = *r
+                                *e = *r;
                             }
-                        })
-                        .or_insert(*r);
+                        }
+                        None => {
+                            m.insert(r.id, recs.len() as u32);
+                            recs.push(*r);
+                        }
+                    }
                 }
             }
-            nded.fetch_add(m.len(), std::sync::atomic::Ordering::Relaxed);
-            let mut v = Vec::with_capacity(m.len());
-            for (_, r) in m {
+            nded.fetch_add(recs.len(), std::sync::atomic::Ordering::Relaxed);
+            let mut v = Vec::with_capacity(recs.len());
+            for lr in recs {
+                let Some([id, user, ts, _, et, pr, pc]) = fields::<7>(lr.line) else { continue };
+                let r = RawEv { id, user, ts, ingest: lr.ingest, etype: et, product: pr, price: pc };
                 if r.user.is_empty() || r.product.is_empty() {
                     continue;
                 }
@@ -409,7 +426,8 @@ fn main() {
                     }
                     price = v;
                 }
-                v.push((r, ts, price));
+                let cat = if purchase { *prod.get(r.product).unwrap_or(&unknown) } else { 0 };
+                v.push((r.user, ts, price, cat));
             }
             v
         })
@@ -465,7 +483,7 @@ fn main() {
     let ub = |u: &[u8]| ((hash_bytes(u) >> 20) as usize) & (U - 1);
     let ev_users = valid.par_iter().map(|v| {
         let mut sets: Vec<ahash::AHashSet<&[u8]>> = (0..U).map(|_| Default::default()).collect();
-        for (r, _, _) in v { if !lid.contains_key(r.user) { sets[ub(r.user)].insert(r.user); } }
+        for (u, _, _, _) in v { if !lid.contains_key(u) { sets[ub(u)].insert(u); } }
         sets
     });
     let ck_users = cvalid.par_iter().map(|v| {
@@ -488,9 +506,8 @@ fn main() {
     let pid_of = |u: &[u8]| -> u32 {
         match lid.get(u) { Some(&i) => link_person[i as usize], None => bucket_maps[ub(u)][u] }
     };
-    let evs: Vec<Ev> = valid.par_iter().flat_map_iter(|v| v.iter().map(|(r, ts, price)| {
-        let cat = if *price >= 0 { *prod.get(r.product).unwrap_or(&unknown) } else { 0 };
-        Ev { pid: pid_of(r.user), ts: *ts, price: *price, cat }
+    let evs: Vec<Ev> = valid.par_iter().flat_map_iter(|v| v.iter().map(|&(u, ts, price, cat)| {
+        Ev { pid: pid_of(u), ts, price, cat }
     })).collect();
     let mut evs = evs;
     let mut cks: Vec<(u32, i64, &[u8], u32)> = cvalid.par_iter().flat_map_iter(|v| v.iter().map(|c| (pid_of(c.1), c.3, c.0, c.2))).collect();
