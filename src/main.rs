@@ -20,6 +20,8 @@ use arena::Scatter;
 use table::KeyMap;
 use ts::DAY;
 
+/// How many records ahead person-map lookups are prefetched.
+const PF_DIST: usize = 32;
 const GAP: i64 = 30 * ts::MIN;
 const LATE: i64 = DAY;
 const LOOKBACK: i64 = 7 * DAY;
@@ -783,17 +785,15 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                         }
                     }
                 }
-                let mut pend: [(Key, i64, u32, u32); 16] = [(0, 0, 0, 0); 16];
-                let mut np_pend = 0usize;
-                let flush = |pend: &[(Key, i64, u32, u32)], st_ev: &mut Scatter<PEv>| {
-                    for x in pend {
-                        persons.map.prefetch(x.0);
-                    }
-                    for x in pend {
-                        let person = persons.name(x.0);
-                        let pb = (hash(person) >> np_shift) as usize;
-                        st_ev.push(pb, PEv { person, ts: x.1, cat: x.2, price: x.3 });
-                    }
+                // software pipeline: prefetch each survivor's person slot D
+                // records before it is looked up (FIFO, so order is kept)
+                const D: usize = PF_DIST;
+                let mut ring: [(Key, i64, u32, u32); D] = [(0, 0, 0, 0); D];
+                let mut cnt = 0usize;
+                let emit = |x: &(Key, i64, u32, u32), st_ev: &mut Scatter<PEv>| {
+                    let person = persons.name(x.0);
+                    let pb = (hash(person) >> np_shift) as usize;
+                    st_ev.push(pb, PEv { person, ts: x.1, cat: x.2, price: x.3 });
                 };
                 for &s in st.table.iter() {
                     if s == 0 {
@@ -803,28 +803,32 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                     if r.cat == INVALID {
                         continue;
                     }
-                    pend[np_pend] = (r.user, r.ts, r.cat, r.price);
-                    np_pend += 1;
-                    if np_pend == pend.len() {
-                        flush(&pend, &mut st.ev);
-                        st.kept += np_pend;
-                        np_pend = 0;
+                    let x = (r.user, r.ts, r.cat, r.price);
+                    persons.map.prefetch(x.0);
+                    if cnt >= D {
+                        emit(&ring[cnt % D], &mut st.ev);
                     }
+                    ring[cnt % D] = x;
+                    cnt += 1;
                 }
-                flush(&pend[..np_pend], &mut st.ev);
-                st.kept += np_pend;
+                for i in cnt.saturating_sub(D)..cnt {
+                    emit(&ring[i % D], &mut st.ev);
+                }
+                st.kept += cnt;
             } else {
                 let (t, s) = ck_tasks[task - ne];
                 let v = &parse_ref[t].ck;
-                for blk in v[s..(s + ck_task).min(v.len())].chunks(16) {
-                    for r in blk {
-                        persons.map.prefetch(r.user);
+                let part = &v[s..(s + ck_task).min(v.len())];
+                for r in part.iter().take(PF_DIST) {
+                    persons.map.prefetch(r.user);
+                }
+                for (i, r) in part.iter().enumerate() {
+                    if let Some(a) = part.get(i + PF_DIST) {
+                        persons.map.prefetch(a.user);
                     }
-                    for r in blk {
-                        let person = persons.name(r.user);
-                        let pb = (hash(person) >> np_shift) as usize;
-                        st.ck.push(pb, PCk { person, cid: r.cid, ts: r.ts, camp: r.camp });
-                    }
+                    let person = persons.name(r.user);
+                    let pb = (hash(person) >> np_shift) as usize;
+                    st.ck.push(pb, PCk { person, cid: r.cid, ts: r.ts, camp: r.camp });
                 }
             }
         },
