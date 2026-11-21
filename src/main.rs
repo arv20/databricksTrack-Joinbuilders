@@ -53,14 +53,17 @@ struct CkRec {
     camp: u32,
 }
 
+struct ParseOut {
+    ev: Scatter<EvRec>,
+    ck: Vec<CkRec>,
+}
+
 /// A surviving event, keyed by person.
 #[repr(C, packed(8))]
 #[derive(Clone, Copy)]
-struct PEv {
+struct PEv<E: Copy> {
     person: Key,
-    ts: i64,
-    cat: u32,
-    price: u32,
+    ev: E,
 }
 
 /// A valid click, keyed by person.
@@ -73,11 +76,60 @@ struct PCk {
     camp: u32,
 }
 
-#[derive(Clone, Copy, Default)]
-struct Ev {
-    ts: i64,
-    cat: u32,
-    price: u32,
+/// A surviving event in memory: its `ts - window_start`, category and price
+/// packed into one integer whose order is `ts` order first, so a person's
+/// events sort as plain integers.
+trait EvT: Copy + Default + Ord + Send + Sync + 'static {
+    fn make(rel: u64, cat: u32, price: u32) -> Self;
+    fn rel(self) -> u64;
+    fn cat(self) -> u32;
+    fn price(self) -> u32;
+}
+
+/// `rel << 32 | price << 8 | cat`: needs `rel < 2^32` (a window under ~49
+/// days), at most 256 categories, and price < 2^24 (it is at most 10^7).
+impl EvT for u64 {
+    #[inline(always)]
+    fn make(rel: u64, cat: u32, price: u32) -> Self {
+        (rel << 32) | ((price as u64) << 8) | cat as u64
+    }
+    #[inline(always)]
+    fn rel(self) -> u64 {
+        self >> 32
+    }
+    #[inline(always)]
+    fn cat(self) -> u32 {
+        self as u8 as u32
+    }
+    #[inline(always)]
+    fn price(self) -> u32 {
+        (self as u32) >> 8
+    }
+}
+
+/// `rel << 64 | price << 32 | cat`: the general fallback.
+impl EvT for u128 {
+    #[inline(always)]
+    fn make(rel: u64, cat: u32, price: u32) -> Self {
+        ((rel as u128) << 64) | ((price as u128) << 32) | cat as u128
+    }
+    #[inline(always)]
+    fn rel(self) -> u64 {
+        (self >> 64) as u64
+    }
+    #[inline(always)]
+    fn cat(self) -> u32 {
+        self as u32
+    }
+    #[inline(always)]
+    fn price(self) -> u32 {
+        (self >> 32) as u32
+    }
+}
+
+/// Whether every surviving event fits the `u64` packing.
+fn packed_fits(ctx: &Ctx) -> bool {
+    ctx.cat_names.len() <= 256 && ctx.we - ctx.ws <= u32::MAX as i64
 }
 
 #[derive(Clone, Copy, Default)]
@@ -377,17 +429,17 @@ struct Scratch {
 }
 
 #[inline]
-fn process_person(
+fn process_person<E: EvT>(
     ctx: &Ctx,
     name: Key,
-    evs: &mut [Ev],
+    evs: &mut [E],
     cks: &mut [Ck],
     sc: &mut Scratch,
     ud: &mut Vec<UdRow>,
     cd: &mut CampAcc,
 ) {
     if evs.len() > 1 {
-        evs.sort_unstable_by_key(|e| e.ts);
+        evs.sort_unstable();
     }
     let organic = ctx.camp_names.len() as u32;
     // sessions
@@ -395,15 +447,16 @@ fn process_person(
     let mut i = 0usize;
     let n = evs.len();
     while i < n {
-        let start = evs[i].ts;
+        let srel = evs[i].rel();
         let lo = i;
-        let mut prev = start;
+        let mut prev = srel;
         let mut rev = 0u64;
-        while i < n && evs[i].ts - prev <= GAP {
-            prev = evs[i].ts;
-            rev += evs[i].price as u64;
+        while i < n && evs[i].rel() - prev <= GAP as u64 {
+            prev = evs[i].rel();
+            rev += evs[i].price() as u64;
             i += 1;
         }
+        let start = ctx.ws + srel as i64;
         let day = (start.div_euclid(DAY) - ctx.day0) as u32;
         sc.sess.push(Sess { start, day, n: (i - lo) as u32, rev, lo: lo as u32, hi: i as u32 });
     }
@@ -423,8 +476,8 @@ fn process_person(
             if s.rev > 0 {
                 rev += s.rev;
                 for e in &evs[s.lo as usize..s.hi as usize] {
-                    if e.price > 0 {
-                        sc.cats.push((e.cat, e.price));
+                    if e.price() > 0 {
+                        sc.cats.push((e.cat(), e.price()));
                     }
                 }
             }
@@ -680,10 +733,6 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     let n_ev_chunks = chunks.len();
     plan_chunks(&click_files, 4 << 20, &mut chunks);
 
-    struct ParseOut {
-        ev: Scatter<EvRec>,
-        ck: Vec<CkRec>,
-    }
     let persons_slot: Mutex<Option<Persons>> = Mutex::new(None);
     let parse_out: Vec<ParseOut> = std::thread::scope(|sc| {
         sc.spawn(|| {
@@ -725,6 +774,65 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
         }
     });
 
+    let agg: Vec<(Vec<UdRow>, CampAcc)> = if packed_fits(ctx) {
+        dedup_sessions::<u64>(ctx, persons, &parse_out, ne, nthreads, &mut tm)
+    } else {
+        dedup_sessions::<u128>(ctx, persons, &parse_out, ne, nthreads, &mut tm)
+    };
+
+    // ---- write outputs
+    let ud_dir = out_dir.join("user_daily");
+    let cd_dir = out_dir.join("campaign_daily");
+    std::fs::create_dir_all(&ud_dir).expect("create user_daily");
+    std::fs::create_dir_all(&cd_dir).expect("create campaign_daily");
+    let total_ud: usize = agg.iter().map(|a| a.0.len()).sum();
+    let agg_ref = &agg;
+    let accs: Vec<&CampAcc> = agg.iter().map(|a| &a.1).collect();
+    let accs = &accs;
+    let ud_dir_ref = &ud_dir;
+    parallel(
+        nthreads,
+        agg.len() + 1,
+        |_| (),
+        |_, i| {
+            if i == agg_ref.len() {
+                write_campaign_daily(ctx, accs, &cd_dir);
+                return;
+            }
+            let rows = &agg_ref[i].0;
+            if rows.is_empty() && !(i == 0 && total_ud == 0) {
+                return;
+            }
+            write_user_daily(ctx, rows, &ud_dir_ref.join(format!("part-{i:05}.parquet")));
+        },
+    );
+    log(&format!("  user_daily rows {total_ud}"));
+    tm.lap("write");
+    if std::env::var_os("SS_DEBUG").is_some() {
+        if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+            for l in t.lines().filter(|l| l.starts_with("Rss") || l.contains("Huge") || l.starts_with("Anonymous")) {
+                eprintln!("  {l}");
+            }
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        eprintln!("  exit at {} ms", now.as_millis());
+    }
+    // exit without dropping the big buffers: the kernel reclaims them at once
+    std::process::exit(0);
+}
+
+/// Dedup (events by event_id, clicks and events mapped to persons and
+/// scattered by person), then sessions per person. `E` is the in-memory event.
+fn dedup_sessions<E: EvT>(
+    ctx: &Ctx,
+    persons: &Persons,
+    parse_out: &[ParseOut],
+    ne: usize,
+    nthreads: usize,
+    tm: &mut Timer,
+) -> Vec<(Vec<UdRow>, CampAcc)> {
+    let ws = ctx.ws;
+    let ndays = ctx.ndays;
     // ---- dedup events by event_id, map to persons; scatter by person
     let total_ev: usize = parse_out.iter().map(|p| (0..ne).map(|b| p.ev.len(b)).sum::<usize>()).sum();
     let total_ck: usize = parse_out.iter().map(|p| p.ck.len()).sum();
@@ -739,18 +847,18 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             s += ck_task;
         }
     }
-    struct DedupOut {
-        ev: Scatter<PEv>,
+    struct DedupOut<E: Copy> {
+        ev: Scatter<PEv<E>>,
         ck: Scatter<PCk>,
         table: Vec<u64>,
         win: Vec<u64>,
         blks: Vec<*const EvRec>,
         kept: usize,
     }
-    unsafe impl Send for DedupOut {}
-    unsafe impl Sync for DedupOut {}
-    let parse_ref = &parse_out;
-    let dd: Vec<DedupOut> = parallel(
+    unsafe impl<E: Copy> Send for DedupOut<E> {}
+    unsafe impl<E: Copy> Sync for DedupOut<E> {}
+    let parse_ref = parse_out;
+    let dd: Vec<DedupOut<E>> = parallel(
         nthreads,
         ne + ck_tasks.len(),
         |_| DedupOut {
@@ -761,7 +869,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             blks: Vec::new(),
             kept: 0,
         },
-        |st: &mut DedupOut, task| {
+        |st: &mut DedupOut<E>, task| {
             if task < ne {
                 let b = task;
                 let n: usize = parse_ref.iter().map(|p| p.ev.len(b)).sum();
@@ -828,12 +936,12 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                 // software pipeline: prefetch each survivor's person slot D
                 // records before it is looked up (FIFO, so order is kept)
                 const D: usize = PF_DIST;
-                let mut ring: [(Key, i64, u32, u32); D] = [(0, 0, 0, 0); D];
+                let mut ring: [(Key, E); D] = [(0, E::default()); D];
                 let mut cnt = 0usize;
-                let emit = |x: &(Key, i64, u32, u32), st_ev: &mut Scatter<PEv>| {
+                let emit = |x: &(Key, E), st_ev: &mut Scatter<PEv<E>>| {
                     let person = persons.name(x.0);
                     let pb = (hash(person) >> np_shift) as usize;
-                    st_ev.push(pb, PEv { person, ts: x.1, cat: x.2, price: x.3 });
+                    st_ev.push(pb, PEv { person, ev: x.1 });
                 };
                 for (wi, &w0) in st.win.iter().enumerate() {
                     let mut w = w0;
@@ -841,7 +949,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                         let rf = (wi << 6) | w.trailing_zeros() as usize;
                         w &= w - 1;
                         let r = unsafe { &*blks[rf >> 7].add(rf & 127) };
-                        let x = (r.user, r.ts, r.cat, r.price);
+                        let x = (r.user, E::make((r.ts - ws) as u64, r.cat, r.price));
                         persons.map.prefetch(x.0);
                         if cnt >= D {
                             emit(&ring[cnt % D], &mut st.ev);
@@ -879,14 +987,14 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     tm.lap("dedup");
 
     // ---- per person: sessions, credit, assists, aggregates
-    struct AggOut {
+    struct AggOut<E> {
         ud: Vec<UdRow>,
         cd: CampAcc,
         local: KeyMap<u32>,
         names: Vec<Key>,
         lids: Vec<u32>,
         cnt: Vec<u32>,
-        evs: Vec<Ev>,
+        evs: Vec<E>,
         ck_lids: Vec<u32>,
         ck_cnt: Vec<u32>,
         cks: Vec<Ck>,
@@ -901,7 +1009,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
     order.sort_unstable_by(|a, b| b.cmp(a));
     let order: Vec<usize> = order.into_iter().map(|(_, p)| p as usize).collect();
     let order = &order;
-    let agg: Vec<AggOut> = parallel(
+    let agg: Vec<AggOut<E>> = parallel(
         nthreads,
         np,
         |_| AggOut {
@@ -917,7 +1025,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
             cks: Vec::new(),
             sc: Scratch { sess: Vec::new(), cats: Vec::new(), starts: Vec::new(), run_end: Vec::new(), cp: Vec::new() },
         },
-        |st: &mut AggOut, task| {
+        |st: &mut AggOut<E>, task| {
             let p = order[task];
             let n: usize = dd_ref.iter().map(|d| d.ev.len(p)).sum();
             if n == 0 {
@@ -948,14 +1056,14 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
                 off[i + 1] = off[i] + st.cnt[i];
             }
             st.evs.clear();
-            st.evs.resize(n, Ev::default());
+            st.evs.resize(n, E::default());
             let mut pos: Vec<u32> = off[..np_].to_vec();
             let mut k = 0;
             for d in dd_ref {
                 for e in d.ev.blocks(p).flatten() {
                     let lid = st.lids[k] as usize;
                     k += 1;
-                    st.evs[pos[lid] as usize] = Ev { ts: e.ts, cat: e.cat, price: e.price };
+                    st.evs[pos[lid] as usize] = e.ev;
                     pos[lid] += 1;
                 }
             }
@@ -1001,46 +1109,7 @@ fn run(data_dir: &Path, out_dir: &Path, nthreads: usize) {
         },
     );
     tm.lap("sessions");
-
-    // ---- write outputs
-    let ud_dir = out_dir.join("user_daily");
-    let cd_dir = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&ud_dir).expect("create user_daily");
-    std::fs::create_dir_all(&cd_dir).expect("create campaign_daily");
-    let total_ud: usize = agg.iter().map(|a| a.ud.len()).sum();
-    let agg_ref = &agg;
-    let accs: Vec<&CampAcc> = agg.iter().map(|a| &a.cd).collect();
-    let accs = &accs;
-    let ud_dir_ref = &ud_dir;
-    parallel(
-        nthreads,
-        agg.len() + 1,
-        |_| (),
-        |_, i| {
-            if i == agg_ref.len() {
-                write_campaign_daily(ctx, accs, &cd_dir);
-                return;
-            }
-            let rows = &agg_ref[i].ud;
-            if rows.is_empty() && !(i == 0 && total_ud == 0) {
-                return;
-            }
-            write_user_daily(ctx, rows, &ud_dir_ref.join(format!("part-{i:05}.parquet")));
-        },
-    );
-    log(&format!("  user_daily rows {total_ud}"));
-    tm.lap("write");
-    if std::env::var_os("SS_DEBUG").is_some() {
-        if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
-            for l in t.lines().filter(|l| l.starts_with("Rss") || l.contains("Huge") || l.starts_with("Anonymous")) {
-                eprintln!("  {l}");
-            }
-        }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-        eprintln!("  exit at {} ms", now.as_millis());
-    }
-    // exit without dropping the big buffers: the kernel reclaims them at once
-    std::process::exit(0);
+    agg.into_iter().map(|a| (a.ud, a.cd)).collect()
 }
 
 #[inline(always)]
