@@ -191,7 +191,7 @@ impl Pending {
 // The common event row spans three AVX2 vectors. Read each vector once for
 // newlines, commas, and quote syntax. Every load stays inside the mapped chunk.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[target_feature(enable = "avx2,pclmulqdq")]
+#[target_feature(enable = "avx2,bmi2")]
 unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
     use std::arch::x86_64::*;
 
@@ -234,26 +234,32 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8]
         let commas = join(b',' as i8);
         if commas.count_ones() == 6 {
             let quotes = join(b'"' as i8);
-            let terminal = 1u128 << line.len();
-            // Prefix XOR pairs every opening quote with its closing quote.
-            // A quote pair must cover a whole field and cannot cross a comma.
-            let quote_syntax = if quotes == 0 {
-                true
+            let quote_flags = if quotes == 0 {
+                Some(0)
+            } else if commas & 1 != 0 {
+                // The first field ends before the start mask when it is empty.
+                if let Some(fields) = crate::event_fields(line) {
+                    row(line, fields);
+                }
+                None
             } else {
-                let parity = |bits: u64| {
-                    let x = _mm_set_epi64x(0, bits as i64);
-                    _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(x, _mm_set_epi64x(0, -1))) as u64
-                };
-                let lo = parity(quotes as u64);
-                let hi = parity((quotes >> 64) as u64) ^ 0u64.wrapping_sub(lo >> 63);
-                let inside = (u128::from(hi) << 64) | u128::from(lo);
                 let opens = (commas << 1) | 1;
-                let closes = (commas | terminal) >> 1;
-                inside & (commas | terminal) == 0
-                    && quotes & inside & !opens == 0
-                    && quotes & !inside & !closes == 0
+                let closes = (commas | (1u128 << line.len())) >> 1;
+                let extract = |positions: u128| {
+                    let lo = positions as u64;
+                    let hi = (positions >> 64) as u64;
+                    _pext_u64(quotes as u64, lo)
+                        | (_pext_u64((quotes >> 64) as u64, hi) << lo.count_ones())
+                };
+                let wrapped = extract(opens);
+                // Matching field flags enforce pairs. Counting both endpoints
+                // rejects a lone quote in a one-byte field.
+                (quotes & !(opens | closes) == 0
+                    && wrapped == extract(closes)
+                    && quotes.count_ones() == wrapped.count_ones() * 2)
+                    .then_some(wrapped)
             };
-            if quote_syntax {
+            if let Some(wrapped) = quote_flags {
                 let mut cuts = [0; 8];
                 let mut remaining = commas;
                 for cut in &mut cuts[1..7] {
@@ -264,9 +270,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8]
                 let fields = std::array::from_fn(|i| {
                     let start = cuts[i];
                     let end = cuts[i + 1] - 1;
-                    // A valid quoted field consumes both endpoints. `get` also covers
-                    // an empty final field whose start equals the newline offset.
-                    let quoted = (line.get(start) == Some(&b'"')) as usize;
+                    let quoted = ((wrapped >> i) & 1) as usize;
                     unsafe { line.get_unchecked(start + quoted..end - quoted) }
                 });
                 row(line, fields);
@@ -283,8 +287,8 @@ fn scan_event_rows<'a, const FUSED: bool>(
     row: impl FnMut(&'a [u8], [&'a [u8]; 7]),
 ) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if FUSED && std::is_x86_feature_detected!("pclmulqdq") {
-        // AVX2 is required by this compilation and PCLMULQDQ was checked above.
+    if FUSED && std::is_x86_feature_detected!("bmi2") {
+        // AVX2 is required by this compilation and BMI2 was checked above.
         return unsafe { fused_event_rows(bytes, row) };
     }
     event_rows(bytes, row);
@@ -306,43 +310,72 @@ fn swar_value(word: u64) -> u64 {
     low.wrapping_add(high) >> 32
 }
 
+/// Decode six ASCII digits and two colons with a single eight-byte load.
+#[inline]
+fn clock_seconds(s: &[u8]) -> Option<i64> {
+    const SEPARATORS: u64 = 0x0000_ff00_00ff_0000;
+    const COLONS: u64 = 0x0000_3a00_003a_0000;
+    const ZEROS: u64 = 0x0000_3000_0030_0000;
+    let word = crate::rd8(s, 11);
+    if word & SEPARATORS != COLONS || !swar_digits((word & !SEPARATORS) | ZEROS) {
+        return None;
+    }
+    let digits = word & 0x0f0f_0f0f_0f0f_0f0f;
+    let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8);
+    let h = pairs as u8;
+    let m = (pairs >> 24) as u8;
+    let seconds = (pairs >> 48) as u8;
+    (h <= 23 && m <= 59 && seconds <= 59)
+        .then_some(i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(seconds))
+}
+
 #[derive(Default)]
 struct Dates([([u8; 10], i64); 32]);
 
 impl Dates {
     #[inline]
-    fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
-        if s.len() != 20
-            || s[4] != b'-'
-            || s[10] != b'T'
-            || s[13] != b':'
-            || s[16] != b':'
-            || s[19] != b'Z'
-        {
+    fn with_offset(&mut self, s: &[u8], adjustment: i64) -> Option<i64> {
+        if s[4] != b'-' || s[10] != b'T' {
             return None;
         }
+        let time = clock_seconds(s)?;
         let date: [u8; 10] = s[..10].try_into().unwrap();
         let index = (date[8] as usize * 10 + date[9] as usize) & 31;
         let entry = &mut self.0[index];
-        let h = crate::d2(s, 11)?;
-        let m = crate::d2(s, 14)?;
-        let sec = crate::d2(s, 17)?;
-        if h > 23 || m > 59 || sec > 59 {
-            return None;
-        }
-        let time = h * 3600 + m * 60 + sec;
         if entry.0 == date {
-            return Some(entry.1 + time);
+            return Some(entry.1 + time - adjustment);
         }
         let seconds = crate::parse_ts(s)? / 1000;
-        *entry = (date, seconds - time);
+        *entry = (date, seconds + adjustment - time);
         Some(seconds)
+    }
+
+    #[inline]
+    fn utc_seconds(&mut self, s: &[u8]) -> Option<i64> {
+        if s.len() != 20 || s[19] != b'Z' {
+            return None;
+        }
+        self.with_offset(s, 0)
     }
 
     #[inline]
     fn parse(&mut self, s: &[u8]) -> Option<i64> {
         if s.len() == 20 && s[19] == b'Z' {
             return self.utc_seconds(s).map(|t| t * 1000);
+        }
+        if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+            let hours = crate::d2(s, 20)?;
+            let minutes = crate::d2(s, 23)?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            let adjustment = (hours * 60 + minutes) * 60;
+            let adjustment = if s[19] == b'+' {
+                adjustment
+            } else {
+                -adjustment
+            };
+            return self.with_offset(s, adjustment).map(|t| t * 1000);
         }
         if s.len() == 13 {
             let leading = (crate::rd8(s, 0) << 24) | 0x30_3030;
@@ -642,6 +675,15 @@ mod tests {
             b"2027-02-29T23:59:59Z",
             b"2028-02-29T24:00:00Z",
             b"2028-02-29T18:14:09-05:45",
+            b"2028-02-29T23:55:59+00:30",
+            b"2028-02-29T23:55:59-00:30",
+            b"2028-02-29T23:59:60Z",
+            b"2028-02-29T23:59:59+23:59",
+            b"2028-02-29T23:59:59+24:00",
+            b"2028-02-29T23:59:59-23:60",
+            b"2028-02-29T12;59:59Z",
+            b"2028-02-29T12:59;59Z",
+            b"2028-02-29T12:59:xxZ",
             b"1791071890000",
             b"0000000000000",
             b"9999999999999",
