@@ -216,6 +216,133 @@ fn csv_rows<'a, const N: usize>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [
     });
 }
 
+/// Fixed-arity event rows already separated by the newline iterator.
+/// Collect two masks for the whole row, then decode exactly six cuts.
+#[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn event_fields(line: &[u8]) -> Option<[&[u8]; 7]> {
+    #[cfg(target_arch = "aarch64")]
+    const WIDTH: usize = 16;
+    #[cfg(target_arch = "x86_64")]
+    const WIDTH: usize = 32;
+
+    if !(WIDTH..=128).contains(&line.len()) {
+        return fields::<7>(line);
+    }
+    let masks = |offset: usize| {
+        // The caller loads full vectors inside the row, overlapping the last
+        // one when needed and discarding the overlapping lanes.
+        unsafe {
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::*;
+                const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+                let w = vld1q_u8(WEIGHTS.as_ptr());
+                let v = vld1q_u8(line.as_ptr().add(offset));
+                let comma = vandq_u8(w, vceqq_u8(v, vdupq_n_u8(b',')));
+                let quote = vandq_u8(w, vceqq_u8(v, vdupq_n_u8(b'"')));
+                let pairs = vpaddq_u8(comma, quote);
+                let groups = vpaddq_u8(pairs, pairs);
+                let bytes = vpaddq_u8(groups, groups);
+                let both = vgetq_lane_u32::<0>(vreinterpretq_u32_u8(bytes));
+                (both as u16 as u32, both >> 16)
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                let v = _mm256_loadu_si256(line.as_ptr().add(offset).cast());
+                let comma = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8)));
+                let quote = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8)));
+                (comma as u32, quote as u32)
+            }
+        }
+    };
+    let mut commas = 0u128;
+    let mut quotes = 0u128;
+    let mut offset = 0;
+    while offset + WIDTH <= line.len() {
+        let (c, q) = masks(offset);
+        commas |= u128::from(c) << offset;
+        quotes |= u128::from(q) << offset;
+        offset += WIDTH;
+    }
+    if offset < line.len() {
+        let start = line.len() - WIDTH;
+        let (c, q) = masks(start);
+        let overlap = offset - start;
+        commas |= u128::from(c >> overlap) << offset;
+        quotes |= u128::from(q >> overlap) << offset;
+    }
+    if commas.count_ones() != 6 {
+        return None;
+    }
+    let mut cuts = [0; 8];
+    for cut in &mut cuts[1..7] {
+        *cut = commas.trailing_zeros() as usize + 1;
+        commas &= commas - 1;
+    }
+    cuts[7] = line.len() + 1;
+    if quotes == 0 {
+        return Some(std::array::from_fn(|i| {
+            // Six distinct cuts precede the terminal offset.
+            unsafe { line.get_unchecked(cuts[i]..cuts[i + 1] - 1) }
+        }));
+    }
+    let mut expected = 0;
+    let values = std::array::from_fn(|i| {
+        let field = unsafe { line.get_unchecked(cuts[i]..cuts[i + 1] - 1) };
+        if field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+            expected += 2;
+            &field[1..field.len() - 1]
+        } else {
+            field
+        }
+    });
+    (quotes.count_ones() == expected).then_some(values)
+}
+
+#[inline]
+fn event_rows<'a>(bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+    #[cfg(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2")))]
+    for_lines(bytes, |line| {
+        if let Some(values) = event_fields(line) {
+            row(line, values);
+        }
+    });
+    #[cfg(not(any(all(target_arch = "aarch64", target_endian = "little"), all(target_arch = "x86_64", target_feature = "avx2"))))]
+    csv_rows(bytes, row);
+}
+
+#[cfg(test)]
+#[test]
+fn event_row_masks_match_scalar_at_simd_and_tail_boundaries() {
+    let mut data = Vec::new();
+    for width in 0..=145 {
+        let text = "x".repeat(width);
+        for row in [
+            format!("{text},u,t,i,view,p,\n"),
+            format!("\"{text}\",u,\"t\",i,view,p,\"7\"\n"),
+            format!("e,u,t,i,view,p,{text}\"\n"),
+            format!("e,\"{text}\"x,t,i,view,p,\n"),
+            format!("e,u,t,i,view,p,{text},\n"),
+            format!("e,u,{text},i,view,\n"),
+        ] {
+            data.extend_from_slice(row.as_bytes());
+        }
+    }
+    data.extend_from_slice(b"\ne,u,t,i,view,p,");
+
+    let mut expected = Vec::new();
+    for_lines(&data, |line| {
+        if let Some(values) = fields::<7>(line) {
+            expected.push((line, values));
+        }
+    });
+    let mut actual = Vec::new();
+    event_rows(&data, |line, values| actual.push((line, values)));
+    assert_eq!(actual, expected);
+}
+
 /// Address ranges of the mapped files, to recover a whole line from a pointer into it.
 struct Lines {
     ranges: Vec<(usize, usize)>,
@@ -1374,7 +1501,7 @@ fn fast(seed: u64) -> bool {
                         }
                     }
                 };
-                csv_rows(c, |line, [id, user, ts, ing, et, pr, pc]| {
+                event_rows(c, |line, [id, user, ts, ing, et, pr, pc]| {
                     if id.is_empty() {
                         return;
                     }
