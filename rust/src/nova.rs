@@ -188,11 +188,56 @@ impl Pending {
     };
 }
 
+trait Fields<'a> {
+    fn field<const I: usize>(&self) -> &'a [u8];
+
+    #[inline]
+    fn empty<const I: usize>(&self) -> bool {
+        self.field::<I>().is_empty()
+    }
+}
+
+impl<'a> Fields<'a> for [&'a [u8]; 7] {
+    #[inline]
+    fn field<const I: usize>(&self) -> &'a [u8] {
+        self[I]
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+struct RowLayout<'a> {
+    line: &'a [u8],
+    cuts: [u8; 8],
+    wrapped: u8,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl<'a> Fields<'a> for RowLayout<'a> {
+    #[inline]
+    fn field<const I: usize>(&self) -> &'a [u8] {
+        let start = self.cuts[I] as usize;
+        let end = self.cuts[I + 1] as usize - 1;
+        let trim = ((self.wrapped >> I) & 1) as usize;
+        // The scanner produced distinct checked cuts and exact endpoint flags.
+        unsafe { self.line.get_unchecked(start + trim..end - trim) }
+    }
+
+    #[inline]
+    fn empty<const I: usize>(&self) -> bool {
+        let raw = self.cuts[I + 1] - self.cuts[I] - 1;
+        raw == 2 * ((self.wrapped >> I) & 1)
+    }
+}
+
+trait EventSink<'a> {
+    fn row(&mut self, source: &'a [u8], fields: impl Fields<'a>);
+}
+
 // The common event row spans three AVX2 vectors. Read each vector once for
 // newlines, commas, and quote syntax. Every load stays inside the mapped chunk.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2,bmi2")]
-unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8], [&'a [u8]; 7])) {
+unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     use std::arch::x86_64::*;
 
     let mask =
@@ -208,7 +253,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8]
         if mask(a, b'\n' as i8) | mask(b, b'\n' as i8) != 0 {
             let n = memchr::memchr(b'\n', &bytes[..64]).unwrap();
             if let Some(fields) = crate::event_fields(&bytes[..n]) {
-                row(&bytes[..n], fields);
+                sink.row(&bytes[..n], fields);
             }
             bytes = &bytes[n + 1..];
             continue;
@@ -218,7 +263,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8]
         if newline == 0 {
             let n = memchr::memchr(b'\n', &bytes[96..]).map_or(bytes.len(), |n| n + 96);
             if let Some(fields) = crate::event_fields(&bytes[..n]) {
-                row(&bytes[..n], fields);
+                sink.row(&bytes[..n], fields);
             }
             bytes = &bytes[(n + 1).min(bytes.len())..];
             continue;
@@ -239,7 +284,7 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8]
             } else if commas & 1 != 0 {
                 // The first field ends before the start mask when it is empty.
                 if let Some(fields) = crate::event_fields(line) {
-                    row(line, fields);
+                    sink.row(line, fields);
                 }
                 None
             } else {
@@ -260,38 +305,36 @@ unsafe fn fused_event_rows<'a>(mut bytes: &'a [u8], mut row: impl FnMut(&'a [u8]
                     .then_some(wrapped)
             };
             if let Some(wrapped) = quote_flags {
-                let mut cuts = [0; 8];
+                let mut cuts = [0u8; 8];
                 let mut remaining = commas;
                 for cut in &mut cuts[1..7] {
-                    *cut = remaining.trailing_zeros() as usize + 1;
+                    *cut = remaining.trailing_zeros() as u8 + 1;
                     remaining &= remaining - 1;
                 }
-                cuts[7] = line.len() + 1;
-                let fields = std::array::from_fn(|i| {
-                    let start = cuts[i];
-                    let end = cuts[i + 1] - 1;
-                    let quoted = ((wrapped >> i) & 1) as usize;
-                    unsafe { line.get_unchecked(start + quoted..end - quoted) }
-                });
-                row(line, fields);
+                cuts[7] = line.len() as u8 + 1;
+                sink.row(
+                    line,
+                    RowLayout {
+                        line,
+                        cuts,
+                        wrapped: wrapped as u8,
+                    },
+                );
             }
         }
         bytes = &bytes[line.len() + 1..];
     }
-    event_rows(bytes, row);
+    event_rows(bytes, |line, fields| sink.row(line, fields));
 }
 
 #[inline]
-fn scan_event_rows<'a, const FUSED: bool>(
-    bytes: &'a [u8],
-    row: impl FnMut(&'a [u8], [&'a [u8]; 7]),
-) {
+fn scan_event_rows<'a>(bytes: &'a [u8], sink: &mut impl EventSink<'a>) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if FUSED && std::is_x86_feature_detected!("bmi2") {
+    if std::is_x86_feature_detected!("bmi2") {
         // AVX2 is required by this compilation and BMI2 was checked above.
-        return unsafe { fused_event_rows(bytes, row) };
+        return unsafe { fused_event_rows(bytes, sink) };
     }
-    event_rows(bytes, row);
+    event_rows(bytes, |line, fields| sink.row(line, fields));
 }
 
 #[inline]
@@ -415,6 +458,113 @@ fn event_hash(key: u64) -> u64 {
     }
 }
 
+struct Parser<'a, 'catalog, 'table> {
+    input: &'a EventInput<'catalog>,
+    users: &'a Users<'table>,
+    declined: &'a AtomicBool,
+    window_seconds: i64,
+    window_ms: u64,
+    dates: Dates,
+    ids: (u32, u32),
+    batch: [Pending; 16],
+    count: usize,
+    streams: Streams<Event, SHARDS>,
+}
+
+impl Parser<'_, '_, '_> {
+    fn parse_chunk(&mut self, bytes: &[u8]) {
+        scan_event_rows(bytes, self);
+    }
+
+    #[inline]
+    fn flush(&mut self) {
+        for pending in &self.batch[..self.count] {
+            let mut row = pending.row;
+            if row.ts != INVALID {
+                row.person =
+                    self.users
+                        .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
+            }
+            self.streams
+                .push((event_hash(row.key) >> 55) as u8 as usize, row);
+        }
+        self.count = 0;
+    }
+}
+
+impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
+    #[inline]
+    fn row(&mut self, _: &'a [u8], fields: impl Fields<'a>) {
+        let id = fields.field::<0>();
+        if id.is_empty() {
+            return;
+        }
+        let key = match short_key(id, b'e') {
+            Some(key) => permute_short(key),
+            None => {
+                let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0) else {
+                    self.declined.store(true, Relaxed);
+                    return;
+                };
+                name
+            }
+        };
+        let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
+            self.declined.store(true, Relaxed);
+            return;
+        };
+        let Ok(order) = i32::try_from(seconds - self.window_seconds) else {
+            self.declined.store(true, Relaxed);
+            return;
+        };
+        let mut pending = Pending::EMPTY;
+        pending.row.key = key;
+        pending.row.ingest = order;
+        'valid: {
+            let user = fields.field::<1>();
+            if user.is_empty() || fields.empty::<5>() {
+                break 'valid;
+            }
+            let purchase = match fields.field::<4>() {
+                b"purchase" => true,
+                b"view" | b"cart" => false,
+                _ => break 'valid,
+            };
+            let Some(time) = self.dates.parse(fields.field::<2>()) else {
+                break 'valid;
+            };
+            let relative = time.wrapping_sub(self.input.start) as u64;
+            if relative >= self.window_ms || seconds * 1000 - time > DAY {
+                break 'valid;
+            }
+            if purchase {
+                let Some(value) = parse_price(fields.field::<6>()) else {
+                    break 'valid;
+                };
+                let category = *self
+                    .input
+                    .products
+                    .get(fields.field::<5>())
+                    .unwrap_or(&self.input.unknown);
+                pending.row.price = value | (category << 24);
+            }
+            let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
+                self.declined.store(true, Relaxed);
+                break 'valid;
+            };
+            self.users.prefetch(uid);
+            pending.row.ts = relative as u32;
+            pending.uid = uid;
+            pending.name = name;
+        }
+        self.batch[self.count] = pending;
+        self.count += 1;
+        if self.count == self.batch.len() {
+            self.flush();
+        }
+    }
+}
+
 fn events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
@@ -423,21 +573,18 @@ fn events(
     declined: &AtomicBool,
 ) -> Vec<Streams<Event, SHARDS>> {
     let next = AtomicUsize::new(0);
-    let window_seconds = input.start.div_euclid(1000);
     rayon::broadcast(|_| {
-        let mut streams = Streams::new();
-        let mut dates = Dates::default();
-        let mut ids = (0, 0);
-        let mut batch = [Pending::EMPTY; 16];
-        let mut len = 0;
-        let mut flush = |rows: &[Pending]| {
-            for pending in rows {
-                let mut row = pending.row;
-                if row.ts != INVALID {
-                    row.person = users.person(pending.uid, 0, pending.name, &mut ids, declined);
-                }
-                streams.push((event_hash(row.key) >> 55) as u8 as usize, row);
-            }
+        let mut parser = Parser {
+            input,
+            users,
+            declined,
+            window_seconds: input.start.div_euclid(1000),
+            window_ms: (input.end - input.start) as u64,
+            dates: Dates::default(),
+            ids: (0, 0),
+            batch: [Pending::EMPTY; 16],
+            count: 0,
+            streams: Streams::new(),
         };
         loop {
             let index = next.fetch_add(1, Relaxed);
@@ -445,73 +592,10 @@ fn events(
                 break;
             }
             read_ahead.wait(work.raw(index));
-            let chunk = work.get(index);
-            scan_event_rows::<true>(chunk, |_, [id, user, ts, ingest, kind, product, price]| {
-                if id.is_empty() {
-                    return;
-                }
-                let key = match short_key(id, b'e') {
-                    Some(key) => permute_short(key),
-                    None => {
-                        let Some(name) = pack_ref(id).filter(|name| name & SHORT_KEY == 0) else {
-                            declined.store(true, Relaxed);
-                            return;
-                        };
-                        name
-                    }
-                };
-                let Some(seconds) = dates.utc_seconds(ingest) else {
-                    declined.store(true, Relaxed);
-                    return;
-                };
-                let Ok(order) = i32::try_from(seconds - window_seconds) else {
-                    declined.store(true, Relaxed);
-                    return;
-                };
-                let mut pending = Pending::EMPTY;
-                pending.row.key = key;
-                pending.row.ingest = order;
-                'valid: {
-                    if user.is_empty() || product.is_empty() {
-                        break 'valid;
-                    }
-                    let purchase = match kind {
-                        b"purchase" => true,
-                        b"view" | b"cart" => false,
-                        _ => break 'valid,
-                    };
-                    let Some(time) = dates.parse(ts) else {
-                        break 'valid;
-                    };
-                    if time < input.start || time >= input.end || seconds * 1000 - time > DAY {
-                        break 'valid;
-                    }
-                    if purchase {
-                        let Some(value) = parse_price(price) else {
-                            break 'valid;
-                        };
-                        let category = *input.products.get(product).unwrap_or(&input.unknown);
-                        pending.row.price = value | (category << 24);
-                    }
-                    let (Some(uid), Some(name)) = (user_key(user), pack_ref(user)) else {
-                        declined.store(true, Relaxed);
-                        break 'valid;
-                    };
-                    users.prefetch(uid);
-                    pending.row.ts = (time - input.start) as u32;
-                    pending.uid = uid;
-                    pending.name = name;
-                }
-                batch[len] = pending;
-                len += 1;
-                if len == batch.len() {
-                    flush(&batch);
-                    len = 0;
-                }
-            });
+            parser.parse_chunk(work.get(index));
         }
-        flush(&batch[..len]);
-        streams
+        parser.flush();
+        parser.streams
     })
 }
 
@@ -736,8 +820,25 @@ mod tests {
                 expected.push((line, values));
             }
         });
-        let mut actual = Vec::new();
-        scan_event_rows::<true>(&input, |line, values| actual.push((line, values)));
-        assert_eq!(actual, expected);
+        struct Collect<'a>(Vec<(&'a [u8], [&'a [u8]; 7])>);
+        impl<'a> EventSink<'a> for Collect<'a> {
+            fn row(&mut self, line: &'a [u8], values: impl Fields<'a>) {
+                self.0.push((
+                    line,
+                    [
+                        values.field::<0>(),
+                        values.field::<1>(),
+                        values.field::<2>(),
+                        values.field::<3>(),
+                        values.field::<4>(),
+                        values.field::<5>(),
+                        values.field::<6>(),
+                    ],
+                ));
+            }
+        }
+        let mut actual = Collect(Vec::new());
+        scan_event_rows(&input, &mut actual);
+        assert_eq!(actual.0, expected);
     }
 }
