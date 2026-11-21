@@ -2273,6 +2273,10 @@ struct PartitionState {
     click_ends: Vec<usize>,
     events: Vec<u64>,
     clicks: Vec<Click>,
+    /// One pass over the shared EvP records extracts (local person, packed
+    /// payload) once; the scatter then reads this cache-resident buffer
+    /// instead of traversing the folds and atomically reloading each EvP.
+    gather: Vec<(u32, u64)>,
     event_scratch: Vec<u64>,
     click_scratch: Vec<Click>,
     buckets: EventBuckets,
@@ -2293,6 +2297,7 @@ impl PartitionState {
             click_ends: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
+            gather: Vec::new(),
             event_scratch: Vec::new(),
             click_scratch: Vec::new(),
             buckets: EventBuckets::default(),
@@ -2308,7 +2313,7 @@ impl PartitionState {
         event_folds: &[People],
         click_folds: &[Vec<Vec<Click>>],
     ) {
-        let Self { event_ends, click_ends, events, clicks, .. } = self;
+        let Self { event_ends, click_ends, events, clicks, gather, .. } = self;
         event_ends.clear();
         event_ends.resize(people as usize, 0);
         click_ends.clear();
@@ -2318,8 +2323,14 @@ impl PartitionState {
             .flatten()
             .filter_map(EvP::session_input);
         let click_rows = || click_folds.iter().flat_map(|fold| &fold[partition]);
-        for (person, _) in event_rows() {
-            event_ends[(person >> PB) as usize] += 1;
+        // Count and capture the payload in one traversal of the EvP records.
+        // The old code walked those records twice (once to count, once to
+        // scatter), reloading each atomic timestamp on both passes.
+        gather.clear();
+        for (person, payload) in event_rows() {
+            let person = (person >> PB) as u32;
+            gather.push((person, payload));
+            event_ends[person as usize] += 1;
         }
         for click in click_rows() {
             let person = (click.person >> PB) as usize;
@@ -2339,8 +2350,9 @@ impl PartitionState {
             }
         }
         events.resize(prefix_starts(event_ends), 0);
-        for (person, payload) in event_rows() {
-            let next = &mut event_ends[(person >> PB) as usize];
+        // The prefix sums in event_ends are now exclusive write cursors.
+        for &(person, payload) in gather.iter() {
+            let next = &mut event_ends[person as usize];
             events[*next] = payload;
             *next += 1;
         }
@@ -2358,7 +2370,7 @@ impl PartitionState {
     ) {
         let Self {
             cd, counts, in_active, active, catsum, touched_categories,
-            event_ends, click_ends, events, clicks, event_scratch, click_scratch, buckets,
+            event_ends, click_ends, events, clicks, gather: _, event_scratch, click_scratch, buckets,
             user, user_rows,
         } = self;
         let (mut event_start, mut click_start) = (0, 0);
@@ -2423,7 +2435,7 @@ impl PartitionState {
             };
 
             if events.len() < BUCKET_MIN_LEN {
-                sort_timeline(events, event_scratch, |event| (event >> 32) as u32);
+                sort_events(events, event_scratch);
                 aggregate_sessions(
                     events, origin, catsum, touched_categories,
                     |event| {
@@ -2582,6 +2594,36 @@ fn prefix_starts(counts: &mut [usize]) -> usize {
     }
     total
 }
+
+/// Events are packed as `(timestamp << 32) | payload`, so ordering the whole
+/// word orders by timestamp. Timestamp ties may be broken by payload: session
+/// bounds read only the timestamp and category sums are commutative, so any
+/// order within a timestamp produces the same output. Small runs use a direct
+/// insertion sort without a comparator closure, medium runs use the library
+/// primitive sort, and larger runs keep the byte radix.
+#[inline]
+fn sort_events(events: &mut [u64], scratch: &mut Vec<u64>) {
+    if events.len() <= INSERTION_MAX_LEN {
+        for i in 1..events.len() {
+            let value = events[i];
+            let mut j = i;
+            while j > 0 && events[j - 1] > value {
+                events[j] = events[j - 1];
+                j -= 1;
+            }
+            events[j] = value;
+        }
+        return;
+    }
+    if events.len() <= RADIX_MIN_LEN {
+        events.sort_unstable();
+        return;
+    }
+    scratch.resize(events.len(), events[0]);
+    radix_time(events, scratch, |event| (event >> 32) as u32, 24);
+}
+
+const INSERTION_MAX_LEN: usize = 32;
 
 fn sort_timeline<T: Copy>(rows: &mut [T], scratch: &mut Vec<T>, time: impl Fn(T) -> u32 + Copy) {
     if rows.len() <= RADIX_MIN_LEN {
