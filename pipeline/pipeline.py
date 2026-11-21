@@ -116,9 +116,12 @@ def dialect_fields(pattern, n, cols):
 
     A line is kept only if it has exactly n fields, and each field is either
     unquoted with no quote character, or wrapped in quotes with no quote inside.
-    Quotes are removed; an empty value becomes NULL. Fields are unquoted one at
-    a time, so no per-row list is rebuilt.
+    One regex checks the whole line, so malformed lines are rejected before any
+    split. Quotes are removed; an empty value becomes NULL.
     """
+    field = '([^",]*|"[^",]*")'
+    line_re = field + "," + ",".join([field] * (n - 1))
+
     def unq(i):
         x = f"p[{i + 1}]"
         return (f"NULLIF(CASE WHEN starts_with({x}, '\"') THEN substr({x}, 2, length({x}) - 2) "
@@ -127,11 +130,9 @@ def dialect_fields(pattern, n, cols):
     return f"""
         SELECT {selects}
         FROM (
-            SELECT line, p FROM (SELECT line, string_split(line, ',') AS p FROM ({line_source(pattern)}))
-            WHERE len(p) = {n}
-              AND (strpos(line, '"') = 0 OR len(list_filter(p, x -> strpos(x, '"') > 0 AND NOT (
-                      starts_with(x, '"') AND ends_with(x, '"') AND length(x) >= 2
-                      AND strpos(substr(x, 2, length(x) - 2), '"') = 0))) = 0)
+            SELECT string_split(line, ',') AS p
+            FROM ({line_source(pattern)})
+            WHERE regexp_full_match(line, '{line_re}')
         )"""
 
 
