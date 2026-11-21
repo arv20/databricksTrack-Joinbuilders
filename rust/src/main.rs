@@ -661,7 +661,7 @@ impl D {
         if self.loc < NO_EVENT {
             let partition = (self.loc >> 32) as usize;
             let index = self.loc as u32 as usize;
-            fold.people[partition][index].ts.store(TOMBSTONE, Relaxed);
+            fold.people.get(partition, index).ts.store(TOMBSTONE, Relaxed);
         }
     }
 }
@@ -802,10 +802,74 @@ impl ShortWriter<'_> {
     }
 }
 
+/// Valid event copies of one worker, by person partition. Each partition owns an initialized
+/// prefix of one anonymous mapping (huge pages on Linux, so the 1,024 write streams share a few
+/// TLB entries and fault in 2 MB steps) plus a growable overflow.
+struct People {
+    storage: Option<memmap2::MmapMut>,
+    stride: usize,
+    lengths: Vec<usize>,
+    overflow: Vec<Vec<EvP>>,
+}
+
+// The mapping is only written through &mut self; shared access reads initialized prefixes.
+unsafe impl Send for People {}
+unsafe impl Sync for People {}
+
+impl People {
+    fn new(reservation: usize) -> Self {
+        let storage = if reservation == 0 || std::env::var_os("BLUE2_NO_PEOPLE_MAP").is_some() {
+            None
+        } else {
+            memmap2::MmapMut::map_anon(reservation * P * std::mem::size_of::<EvP>()).ok()
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(mapping) = &storage {
+            let _ = mapping.advise(memmap2::Advice::HugePage);
+        }
+        let stride = if storage.is_some() { reservation } else { 0 };
+        let overflow = (0..P).map(|_| if stride == 0 { Vec::with_capacity(reservation) } else { Vec::new() }).collect();
+        Self { storage, stride, lengths: vec![0; P], overflow }
+    }
+
+    #[inline]
+    fn len(&self, part: usize) -> usize {
+        self.lengths[part] + self.overflow[part].len()
+    }
+
+    #[inline]
+    fn push(&mut self, part: usize, row: EvP) {
+        let len = self.lengths[part];
+        if len < self.stride {
+            let base = self.storage.as_mut().unwrap().as_mut_ptr().cast::<EvP>();
+            // This partition's next prefix slot is in the mapping and not yet initialized.
+            unsafe { base.add(part * self.stride + len).write(row) };
+            self.lengths[part] = len + 1;
+        } else {
+            self.overflow[part].push(row);
+        }
+    }
+
+    #[inline]
+    fn records(&self, part: usize) -> [&[EvP]; 2] {
+        let prefix = self.storage.as_ref().map_or(&[][..], |mapping| {
+            // Only the recorded prefix is initialized; no writes occur through &self.
+            unsafe { std::slice::from_raw_parts(mapping.as_ptr().cast::<EvP>().add(part * self.stride), self.lengths[part]) }
+        });
+        [prefix, &self.overflow[part]]
+    }
+
+    #[inline]
+    fn get(&self, part: usize, index: usize) -> &EvP {
+        let [prefix, overflow] = self.records(part);
+        prefix.get(index).unwrap_or_else(|| &overflow[index - prefix.len()])
+    }
+}
+
 struct EventFold {
     copies: Vec<Vec<D>>,
     short_copies: ShortArena,
-    people: Vec<Vec<EvP>>,
+    people: People,
 }
 
 impl EventFold {
@@ -814,7 +878,7 @@ impl EventFold {
         Self {
             copies: (0..SH).map(|_| Vec::new()).collect(),
             short_copies: ShortArena::new(shard_capacity),
-            people: (0..P).map(|_| Vec::with_capacity(person_capacity)).collect(),
+            people: People::new(person_capacity),
         }
     }
 }
@@ -943,8 +1007,8 @@ mod single_scatter_tests {
 
     fn copy(fold: &mut EventFold, ingest: i32, partition: Option<usize>) {
         let loc = if let Some(p) = partition {
-            let index = fold.people[p].len();
-            fold.people[p].push(EvP {
+            let index = fold.people.len(p);
+            fold.people.push(p, EvP {
                 person: 0,
                 ts: AtomicU32::new(1),
                 price: 0,
@@ -969,8 +1033,8 @@ mod single_scatter_tests {
         copy(&mut folds[0], 3, Some(5));
         copy(&mut folds[1], 1, None);
         dedup(&folds);
-        assert!(folds[0].people[3][0].live().is_none());
-        assert!(folds[0].people[5][0].live().is_none());
+        assert!(folds[0].people.get(3, 0).live().is_none());
+        assert!(folds[0].people.get(5, 0).live().is_none());
     }
 
     #[test]
@@ -979,8 +1043,8 @@ mod single_scatter_tests {
         copy(&mut folds[0], 2, Some(1000));
         copy(&mut folds[1], 1, Some(1));
         dedup(&folds);
-        assert!(folds[0].people[1000][0].live().is_none());
-        assert!(folds[1].people[1][0].live().is_some());
+        assert!(folds[0].people.get(1000, 0).live().is_none());
+        assert!(folds[1].people.get(1, 0).live().is_some());
     }
 
     #[test]
@@ -990,7 +1054,7 @@ mod single_scatter_tests {
         copy(&mut folds[1], 1, Some(3));
         copy(&mut folds[1], 1, Some(3));
         dedup(&folds);
-        assert_eq!(folds.iter().flat_map(|f| &f.people[3]).filter_map(EvP::live).count(), 1);
+        assert_eq!(folds.iter().flat_map(|f| f.people.records(3).into_iter().flatten()).filter_map(EvP::live).count(), 1);
     }
 
     #[test]
@@ -999,7 +1063,7 @@ mod single_scatter_tests {
         folds[0].copies[0].push(D { hid: 7, hchk: 9, ingest: i32::MAX, loc: NO_EVENT | UNPARSED_INGEST });
         copy(&mut folds[0], i32::MAX, Some(3));
         dedup(&folds);
-        assert!(folds[0].people[3][0].live().is_some());
+        assert!(folds[0].people.get(3, 0).live().is_some());
         assert_eq!(compact_ingest(i64::from(i32::MAX) * 1000, 0), Some(i32::MAX));
         assert_eq!(compact_ingest(i64::from(i32::MAX) * 1000 + 1000, 0), None);
         assert_eq!(compact_ingest(1001, 0), None);
@@ -1028,8 +1092,8 @@ mod single_scatter_tests {
         let coll = AtomicBool::new(false);
         Dedup::default().shard(&folds, 0, &coll, |f, s| f.short_copies.records(s));
         assert!(!coll.load(Relaxed));
-        assert!(folds[0].people[P - 1][0].live().is_none());
-        assert!(folds[1].people[1][0].live().is_some());
+        assert!(folds[0].people.get(P - 1, 0).live().is_none());
+        assert!(folds[1].people.get(1, 0).live().is_some());
     }
 
     #[test]
@@ -1472,12 +1536,12 @@ fn fast(seed: u64) -> bool {
                     for mut r in batch.drain(..) {
                         if r.ts != TOMBSTONE {
                             let (partition, person) = resolve_person(r.pkey, r.pchk, r.name_ref);
-                            let events = &mut acc.people[partition];
-                            let Ok(index) = u32::try_from(events.len()) else {
+                            let events = &mut acc.people;
+                            let Ok(index) = u32::try_from(events.len(partition)) else {
                                 coll.store(true, Relaxed);
                                 continue;
                             };
-                            events.push(EvP {
+                            events.push(partition, EvP {
                                 person,
                                 ts: AtomicU32::new(r.ts),
                                 price: r.price,
@@ -1659,7 +1723,7 @@ fn fast(seed: u64) -> bool {
     let ncs = ncamp + 1;
     let mut order = Vec::with_capacity(P);
     for partition in 0..P {
-        let events: usize = paccs.iter().map(|fold| fold[partition].len()).sum();
+        let events: usize = paccs.iter().map(|fold| fold.len(partition)).sum();
         let clicks: usize = caccs.iter().map(|fold| fold[partition].len()).sum();
         if events > (u32::MAX - linked_count) as usize || clicks > u32::MAX as usize {
             return false;
@@ -1836,7 +1900,7 @@ impl PartitionState {
         &mut self,
         partition: usize,
         linked_count: u32,
-        events: &[Vec<Vec<EvP>>],
+        events: &[People],
         clicks: &[Vec<Vec<Click>>],
     ) {
         self.unlinked.clear();
@@ -1851,7 +1915,7 @@ impl PartitionState {
         // exact-name interning for unlinked people is the bridge until the
         // all-UID table supplies their dense IDs at ingest.
         for fold in events {
-            for event in &fold[partition] {
+            for event in fold.records(partition).into_iter().flatten() {
                 if let Some((token, _)) = event.session_input() {
                     let person = dense_person(token, linked_count, &mut self.unlinked, &mut self.names)
                         .expect("partition row bound checked");
@@ -1893,7 +1957,7 @@ impl PartitionState {
         };
         let mut people = self.event_people.iter().copied();
         for fold in events {
-            for event in &fold[partition] {
+            for event in fold.records(partition).into_iter().flatten() {
                 if let Some((_, payload)) = event.session_input() {
                     let ts = (payload >> 32) as u32 + LOOK as u32;
                     emit(people.next().unwrap(), timeline_payload(ts, true, payload as u32));
