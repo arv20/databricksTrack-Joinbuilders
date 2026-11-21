@@ -55,12 +55,17 @@ pub struct Core {
 
 #[inline]
 pub fn simple_name(g: &G, u: u32, class: u32) -> (u64, usize) {
+    simple_name_key(g.ukey, u, class)
+}
+
+#[inline]
+pub fn simple_name_key(ukey: u64, u: u32, class: u32) -> (u64, usize) {
     let mut m = class;
     let mut best = (u64::MAX, 0usize);
     while m != 0 {
         let a = m.trailing_zeros() as u64;
         m &= m - 1;
-        let e = enc36(scramble((u as u64) << 9 | a, g.ukey));
+        let e = enc36(scramble((u as u64) << 9 | a, ukey));
         if e.0 < best.0 {
             best = e;
         }
@@ -77,8 +82,8 @@ impl Core {
             day0,
             nd,
             organic: nc,
-            agg: vec![[0; 2]; (nc + 1) * nd],
-            aggp: vec![[0; 2]; (nc + 1) * nd],
+            agg: vec![[0; 2]; (nc + 2) * nd],
+            aggp: vec![[0; 2]; (nc + 2) * nd],
             names_off,
             names: AVec::new(row_cap * 10),
             keys: AVec::new(row_cap),
