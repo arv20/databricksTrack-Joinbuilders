@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Instant;
 use sys::*;
 
+#[global_allocator]
+static ALLOC: sys::Alloc = sys::Alloc;
+
 mod generic;
 mod k_free;
 pub type K = k_free::Free;
@@ -43,7 +46,7 @@ pub fn run_generic(data: &str, out: &str, ncpu: usize) -> ! {
     }
 }
 
-const fn env_u32(s: Option<&str>, d: u32) -> u32 {
+pub const fn env_u32(s: Option<&str>, d: u32) -> u32 {
     match s {
         None => d,
         Some(s) => {
@@ -193,6 +196,7 @@ pub struct G {
     pub csr_off: *mut u32,
     pub csr: *mut [u64; 2],
     pub csr_base: Vec<usize>,
+    pub ncsr: usize,
     pub uf: links::Uf,
     pub edges: *mut EdgeInfo,
     pub joined: Vec<Vec<Seg>>,
@@ -295,7 +299,14 @@ fn main() {
     if std::env::var("XL_NOHUGE").is_ok_and(|v| v == "1") {
         HUGE.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+    sys::detect_pages();
     unsafe { sys::LAST = Some(t0) };
+    if std::env::var("XL_ALLOC").map_or(true, |v| v == "1") {
+        sys::alloc_enable();
+    }
+    if std::env::var("XL_POOL").map_or(true, |v| v == "1") {
+        sys::pool_start(nt);
+    }
     let knob = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v == "1");
     unsafe {
         parse::NT = knob("XL_NT", true);
@@ -323,19 +334,25 @@ fn main() {
             }
         }
     }
+    if std::env::var("XL_MEMTEST").is_ok() {
+        eprintln!("[memtest] {}", if sys::mem_test() { "OK" } else { "FAILED" });
+        unsafe { sys::_exit(0) };
+    }
     let g: &'static mut G = Box::leak(Box::new(setup::setup(&data, nt, check)));
     lap("setup");
+    if std::env::var("XL_SORTBENCH").is_ok() {
+        links::sort_bench(g);
+        unsafe { sys::_exit(0) };
+    }
     {
         let gr: &G = g;
         run_par(nt, |tid| parse::stage1(gr, tid));
     }
     lap("parse");
-    let uf = links::stage2(g);
+    links::stage2(g);
     lap("st2sort");
     events::stage3(g);
     lap("ev3b");
-    g.uf = uf.join().unwrap_or_else(|_| sys::fallback("union-find thread"));
-    lap("ufjoin");
     complex::stage4(g);
     lap("complex");
     out::stage5(g, &outdir);
@@ -379,6 +396,62 @@ fn main() {
             g.nb,
             g.nub
         );
+    }
+    if sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) && std::env::var("XL_ENDREL").map_or(true, |v| v == "1") {
+        let nt = g.nt;
+        let mut r = [[(0usize, 0usize); 12]; 16];
+        for tid in 0..nt {
+            let t = g.t(tid);
+            let c = &t.core;
+            let v = |p: *const u8, n: usize| (p as usize, n);
+            r[tid] = [
+                v(c.names.as_ptr(), c.names.len()),
+                v(c.names_off.as_ptr() as *const u8, c.names_off.len() * 4),
+                v(c.keys.as_ptr() as *const u8, c.keys.len() * 4),
+                v(c.day.as_ptr() as *const u8, c.day.len() * 4),
+                v(c.ses.as_ptr() as *const u8, c.ses.len() * 4),
+                v(c.evs.as_ptr() as *const u8, c.evs.len() * 4),
+                v(c.rev.as_ptr() as *const u8, c.rev.len() * 4),
+                v(c.cat.as_ptr(), c.cat.len()),
+                v(t.edge.as_ptr() as *const u8, t.edge.len() * 16),
+                if g.csr.is_null() { (0, 0) } else { v((g.csr as *const u8).wrapping_add(g.ncsr * 16 * tid / nt), g.ncsr * 16 * (tid + 1) / nt - g.ncsr * 16 * tid / nt) },
+                (0, 0),
+                (0, 0),
+            ];
+        }
+        let rr = &r;
+        run_par(nt, |tid| unsafe {
+            for &(p, n) in &rr[tid] {
+                if n > 0 {
+                    sys::release(p as *const u8, n);
+                }
+            }
+            sys::release_heap_part(tid, nt);
+        });
+    }
+    if timing {
+        eprintln!("[v2b] exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    if std::env::var("XL_DBG").is_ok() {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for l in s.lines().filter(|l| l.starts_with("Rss") || l.starts_with("VmPTE") || l.starts_with("VmRSS")) {
+                eprintln!("[dbg] end {l}");
+            }
+        }
+        if let Ok(s) = std::fs::read_to_string("/proc/self/smaps") {
+            let mut v: Vec<(u64, String)> = Vec::new();
+            let mut cur = String::new();
+            for l in s.lines() {
+                if l.starts_with("Rss:") {
+                    let kb: u64 = l.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+                    if kb > 1024 { v.push((kb, cur.clone())); }
+                } else if !l.contains(':') || l.split_whitespace().next().map_or(false, |w| w.contains('-')) {
+                    cur = l.to_string();
+                }
+            }
+            v.sort();
+            for (kb, n) in v.iter().rev().take(12) { eprintln!("[dbg] rss {kb} kB {n}"); }
+        }
     }
     unsafe { sys::_exit(0) }
 }

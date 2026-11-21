@@ -21,6 +21,30 @@ pub const MADV_NOHUGEPAGE: i32 = 15;
 const HP: usize = 2 << 20;
 
 pub static HUGE: AtomicBool = AtomicBool::new(true);
+pub static SMALLPAGES: AtomicBool = AtomicBool::new(false);
+
+pub fn detect_pages() {
+    let never = std::fs::read("/sys/kernel/mm/transparent_hugepage/enabled").map_or(false, |s| s.windows(7).any(|w| w == b"[never]"));
+    SMALLPAGES.store(!HUGE.load(Ordering::Relaxed) || never, Ordering::Relaxed);
+}
+
+pub unsafe fn release(p: *const u8, bytes: usize) {
+    let a = (p as usize + 4095) & !4095;
+    let b = (p as usize + bytes) & !4095;
+    if b > a {
+        madvise(a as *mut u8, b - a, MADV_DONTNEED);
+    }
+}
+
+pub unsafe fn release_heap_part(tid: usize, nt: usize) {
+    let base = A_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let used = (A_NEXT.load(Ordering::Relaxed) - base) / HP + 1;
+    let (a, b) = (used * tid / nt * HP, used * (tid + 1) / nt * HP);
+    release((base + a) as *const u8, b - a);
+}
 pub static RELEASE: AtomicBool = AtomicBool::new(true);
 
 pub static WORKERS: AtomicBool = AtomicBool::new(false);
@@ -164,31 +188,122 @@ impl<T: Copy> AVec<T> {
     pub fn clear(&mut self) {
         self.len = 0;
     }
+    pub fn release(&self) {
+        unsafe { release(self.p as *const u8, self.len * std::mem::size_of::<T>()) };
+    }
     pub fn truncate(&mut self, n: usize) {
         self.len = n;
     }
 }
 
-pub fn run_par<F: Fn(usize) + Sync>(nt: usize, f: F) {
+static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static DONE: AtomicUsize = AtomicUsize::new(0);
+static SLEEPERS: AtomicUsize = AtomicUsize::new(0);
+static POOL_N: AtomicUsize = AtomicUsize::new(0);
+static mut JOB: Option<&'static (dyn Fn(usize) + Sync)> = None;
+static mut JOB_NT: usize = 0;
+
+extern "C" {
+    fn syscall(n: i64, ...) -> i64;
+}
+const SYS_FUTEX: i64 = 202;
+const FUTEX_WAIT_PRIVATE: i64 = 128;
+const FUTEX_WAKE_PRIVATE: i64 = 129;
+
+#[inline(always)]
+fn rdtsc() -> u64 {
+    unsafe { std::arch::x86_64::_rdtsc() }
+}
+
+pub fn pool_start(nt: usize) {
+    if nt < 2 || POOL_N.load(Ordering::SeqCst) != 0 {
+        return;
+    }
     WORKERS.store(true, Ordering::SeqCst);
-    std::thread::scope(|s| {
-        for t in 1..nt {
-            let f = &f;
-            s.spawn(move || f(t));
+    POOL_N.store(nt - 1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        for t in 2..nt {
+            std::thread::spawn(move || worker(t));
         }
-        f(0);
+        worker(1)
     });
 }
 
+fn worker(tid: usize) -> ! {
+    let mut seen = 0u32;
+    loop {
+        let t0 = rdtsc();
+        loop {
+            let g = GEN.load(Ordering::Acquire);
+            if g != seen {
+                seen = g;
+                break;
+            }
+            if rdtsc() - t0 < 100_000 {
+                std::hint::spin_loop();
+                continue;
+            }
+            SLEEPERS.fetch_add(1, Ordering::SeqCst);
+            unsafe { syscall(SYS_FUTEX, GEN.as_ptr(), FUTEX_WAIT_PRIVATE, g, 0usize, 0usize, 0usize) };
+            SLEEPERS.fetch_sub(1, Ordering::SeqCst);
+        }
+        unsafe {
+            #[allow(static_mut_refs)]
+            if let Some(f) = JOB {
+                if tid < JOB_NT {
+                    f(tid);
+                }
+            }
+        }
+        DONE.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub fn run_par<F: Fn(usize) + Sync>(nt: usize, f: F) {
+    WORKERS.store(true, Ordering::SeqCst);
+    let n = POOL_N.load(Ordering::SeqCst);
+    if n == 0 || nt > n + 1 {
+        std::thread::scope(|s| {
+            for t in 1..nt {
+                let f = &f;
+                s.spawn(move || f(t));
+            }
+            f(0);
+        });
+        return;
+    }
+    unsafe {
+        let r: &(dyn Fn(usize) + Sync) = &f;
+        JOB = Some(std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(r));
+        JOB_NT = nt;
+    }
+    DONE.store(0, Ordering::SeqCst);
+    GEN.fetch_add(1, Ordering::SeqCst);
+    if SLEEPERS.load(Ordering::SeqCst) != 0 {
+        unsafe { syscall(SYS_FUTEX, GEN.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX as i64, 0usize, 0usize, 0usize) };
+    }
+    f(0);
+    while DONE.load(Ordering::Acquire) != n {
+        std::hint::spin_loop();
+    }
+    unsafe { JOB = None };
+}
+
 pub struct U64Map {
-    keys: Vec<u64>,
-    vals: Vec<u32>,
+    slots: Vec<[u64; 2]>,
     mask: usize,
     len: usize,
 }
 impl U64Map {
     pub fn new() -> U64Map {
-        U64Map { keys: vec![0; 1024], vals: vec![0; 1024], mask: 1023, len: 0 }
+        U64Map::with_capacity(0)
+    }
+    pub fn cap(&self) -> usize {
+        self.slots.len()
+    }
+    pub fn with_capacity(n: usize) -> U64Map {
+        let m = (2 * n).next_power_of_two().max(1024);
+        U64Map { slots: vec![[0; 2]; m], mask: m - 1, len: 0 }
     }
     #[inline(always)]
     fn h(k: u64, mask: usize) -> usize {
@@ -199,29 +314,30 @@ impl U64Map {
         let k1 = k + 1;
         let mut i = Self::h(k, self.mask);
         loop {
-            let s = unsafe { *self.keys.get_unchecked(i) };
-            if s == k1 {
-                return Some(unsafe { *self.vals.get_unchecked(i) });
+            let s = unsafe { *self.slots.get_unchecked(i) };
+            if s[0] == k1 {
+                return Some(s[1] as u32);
             }
-            if s == 0 {
+            if s[0] == 0 {
                 return None;
             }
             i = (i + 1) & self.mask;
         }
     }
+    #[inline]
     pub fn get_or_insert(&mut self, k: u64, v: u32) -> u32 {
-        if self.len * 2 >= self.keys.len() {
+        if self.len * 2 >= self.slots.len() {
             self.grow();
         }
         let k1 = k + 1;
         let mut i = Self::h(k, self.mask);
         loop {
-            if self.keys[i] == k1 {
-                return self.vals[i];
+            let s = unsafe { self.slots.get_unchecked_mut(i) };
+            if s[0] == k1 {
+                return s[1] as u32;
             }
-            if self.keys[i] == 0 {
-                self.keys[i] = k1;
-                self.vals[i] = v;
+            if s[0] == 0 {
+                *s = [k1, v as u64];
                 self.len += 1;
                 return v;
             }
@@ -229,20 +345,175 @@ impl U64Map {
         }
     }
     fn grow(&mut self) {
-        let n = self.keys.len() * 2;
-        let ok = std::mem::replace(&mut self.keys, vec![0; n]);
-        let ov = std::mem::replace(&mut self.vals, vec![0; n]);
+        let n = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![[0; 2]; n]);
         self.mask = n - 1;
-        for (k1, v) in ok.into_iter().zip(ov) {
-            if k1 != 0 {
-                let mut i = Self::h(k1 - 1, self.mask);
-                while self.keys[i] != 0 {
+        for s in old {
+            if s[0] != 0 {
+                let mut i = Self::h(s[0] - 1, self.mask);
+                while self.slots[i][0] != 0 {
                     i = (i + 1) & self.mask;
                 }
-                self.keys[i] = k1;
-                self.vals[i] = v;
+                self.slots[i] = s;
             }
         }
+    }
+}
+
+#[repr(C)]
+struct Timespec {
+    s: i64,
+    ns: i64,
+}
+extern "C" {
+    fn clock_gettime(clk: i32, ts: *mut Timespec) -> i32;
+}
+pub fn thread_cpu_ms() -> f64 {
+    let mut t = Timespec { s: 0, ns: 0 };
+    unsafe { clock_gettime(3, &mut t) };
+    t.s as f64 * 1e3 + t.ns as f64 / 1e6
+}
+
+pub struct Alloc;
+static A_BASE: AtomicUsize = AtomicUsize::new(0);
+static A_END: AtomicUsize = AtomicUsize::new(0);
+static A_NEXT: AtomicUsize = AtomicUsize::new(0);
+const A_SMALL_MAX: usize = 16;
+const A_CHUNK: usize = 4 << 20;
+const A_REGION: usize = 64 << 30;
+
+struct Tl {
+    cur: usize,
+    end: usize,
+    free: [usize; 64],
+}
+thread_local! {
+    static TL: std::cell::UnsafeCell<Tl> = const { std::cell::UnsafeCell::new(Tl { cur: 0, end: 0, free: [0; 64] }) };
+}
+
+pub fn alloc_enable() {
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), A_REGION + HP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if p as isize == -1 {
+            return;
+        }
+        let a = (p as usize + HP - 1) & !(HP - 1);
+        madvise(a as *mut u8, A_REGION, if HUGE.load(Ordering::Relaxed) { MADV_HUGEPAGE } else { MADV_NOHUGEPAGE });
+        A_NEXT.store(a, Ordering::SeqCst);
+        A_END.store(a + A_REGION, Ordering::SeqCst);
+        A_BASE.store(a, Ordering::SeqCst);
+    }
+}
+
+#[inline(always)]
+fn a_class(size: usize, align: usize) -> usize {
+    let s = size.max(align).max(16);
+    (usize::BITS - (s - 1).leading_zeros()) as usize
+}
+
+#[inline(always)]
+fn a_mine(p: *mut u8) -> bool {
+    let base = A_BASE.load(Ordering::Relaxed);
+    base != 0 && p as usize >= base && (p as usize) < A_END.load(Ordering::Relaxed)
+}
+
+fn a_region(sz: usize, align: usize) -> usize {
+    let end = A_END.load(Ordering::Relaxed);
+    let mut cur = A_NEXT.load(Ordering::Relaxed);
+    loop {
+        let a = (cur + align - 1) & !(align - 1);
+        if a + sz > end {
+            return 0;
+        }
+        match A_NEXT.compare_exchange_weak(cur, a + sz, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return a,
+            Err(x) => cur = x,
+        }
+    }
+}
+
+impl Alloc {
+    #[inline(always)]
+    unsafe fn get(&self, l: std::alloc::Layout, zero: bool) -> *mut u8 {
+        use std::alloc::GlobalAlloc;
+        if A_BASE.load(Ordering::Relaxed) == 0 || l.align() > 4096 {
+            return if zero { std::alloc::System.alloc_zeroed(l) } else { std::alloc::System.alloc(l) };
+        }
+        let c = a_class(l.size(), l.align());
+        let sz = 1usize << c;
+        let p = TL.with(|t| {
+            let t = &mut *t.get();
+            let h = t.free[c];
+            if h != 0 {
+                t.free[c] = *(h as *const usize);
+                if zero {
+                    std::ptr::write_bytes(h as *mut u8, 0, l.size());
+                }
+                return h;
+            }
+            if c <= A_SMALL_MAX {
+                let al = sz.min(4096);
+                let mut a = (t.cur + al - 1) & !(al - 1);
+                if t.cur == 0 || a + sz > t.end {
+                    let ch = a_region(A_CHUNK, A_CHUNK);
+                    if ch == 0 {
+                        return 0;
+                    }
+                    t.cur = ch;
+                    t.end = ch + A_CHUNK;
+                    a = ch;
+                }
+                t.cur = a + sz;
+                return a;
+            }
+            a_region(sz, if sz >= HP { HP } else { 4096 })
+        });
+        if p == 0 {
+            return if zero { std::alloc::System.alloc_zeroed(l) } else { std::alloc::System.alloc(l) };
+        }
+        p as *mut u8
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for Alloc {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        self.get(l, false)
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        self.get(l, true)
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if a_mine(p) {
+            let c = a_class(l.size(), l.align());
+            TL.with(|t| {
+                let t = &mut *t.get();
+                *(p as *mut usize) = t.free[c];
+                t.free[c] = p as usize;
+            });
+        } else {
+            std::alloc::System.dealloc(p, l)
+        }
+    }
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if !a_mine(p) {
+            return std::alloc::System.realloc(p, l, new_size);
+        }
+        let c = a_class(l.size(), l.align());
+        let nc = a_class(new_size, l.align());
+        if nc <= c {
+            return p;
+        }
+        let nl = std::alloc::Layout::from_size_align_unchecked(new_size, l.align());
+        let q = self.get(nl, false);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size());
+            self.dealloc(p, l);
+        }
+        q
     }
 }
 
@@ -257,4 +528,162 @@ pub fn lap(name: &'static str) {
         }
         LAST = Some(now);
     }
+}
+
+#[inline(always)]
+unsafe fn cp_small(d: *mut u8, s: *const u8, n: usize) {
+    use std::arch::x86_64::*;
+    if n <= 16 {
+        if n >= 8 {
+            let a = (s as *const u64).read_unaligned();
+            let b = (s.add(n - 8) as *const u64).read_unaligned();
+            (d as *mut u64).write_unaligned(a);
+            (d.add(n - 8) as *mut u64).write_unaligned(b);
+        } else if n >= 4 {
+            let a = (s as *const u32).read_unaligned();
+            let b = (s.add(n - 4) as *const u32).read_unaligned();
+            (d as *mut u32).write_unaligned(a);
+            (d.add(n - 4) as *mut u32).write_unaligned(b);
+        } else if n >= 2 {
+            let a = (s as *const u16).read_unaligned();
+            let b = (s.add(n - 2) as *const u16).read_unaligned();
+            (d as *mut u16).write_unaligned(a);
+            (d.add(n - 2) as *mut u16).write_unaligned(b);
+        } else if n == 1 {
+            *d = *s;
+        }
+    } else if n <= 32 {
+        let a = _mm_loadu_si128(s as *const __m128i);
+        let b = _mm_loadu_si128(s.add(n - 16) as *const __m128i);
+        _mm_storeu_si128(d as *mut __m128i, a);
+        _mm_storeu_si128(d.add(n - 16) as *mut __m128i, b);
+    } else if n <= 64 {
+        let a = _mm256_loadu_si256(s as *const __m256i);
+        let b = _mm256_loadu_si256(s.add(n - 32) as *const __m256i);
+        _mm256_storeu_si256(d as *mut __m256i, a);
+        _mm256_storeu_si256(d.add(n - 32) as *mut __m256i, b);
+    } else if n <= 128 {
+        let a = _mm256_loadu_si256(s as *const __m256i);
+        let b = _mm256_loadu_si256(s.add(32) as *const __m256i);
+        let c = _mm256_loadu_si256(s.add(n - 64) as *const __m256i);
+        let e = _mm256_loadu_si256(s.add(n - 32) as *const __m256i);
+        _mm256_storeu_si256(d as *mut __m256i, a);
+        _mm256_storeu_si256(d.add(32) as *mut __m256i, b);
+        _mm256_storeu_si256(d.add(n - 64) as *mut __m256i, c);
+        _mm256_storeu_si256(d.add(n - 32) as *mut __m256i, e);
+    } else {
+        let a = _mm256_loadu_si256(s as *const __m256i);
+        let b = _mm256_loadu_si256(s.add(32) as *const __m256i);
+        let c = _mm256_loadu_si256(s.add(64) as *const __m256i);
+        let e = _mm256_loadu_si256(s.add(96) as *const __m256i);
+        let f = _mm256_loadu_si256(s.add(n - 128) as *const __m256i);
+        let g = _mm256_loadu_si256(s.add(n - 96) as *const __m256i);
+        let h = _mm256_loadu_si256(s.add(n - 64) as *const __m256i);
+        let i = _mm256_loadu_si256(s.add(n - 32) as *const __m256i);
+        _mm256_storeu_si256(d as *mut __m256i, a);
+        _mm256_storeu_si256(d.add(32) as *mut __m256i, b);
+        _mm256_storeu_si256(d.add(64) as *mut __m256i, c);
+        _mm256_storeu_si256(d.add(96) as *mut __m256i, e);
+        _mm256_storeu_si256(d.add(n - 128) as *mut __m256i, f);
+        _mm256_storeu_si256(d.add(n - 96) as *mut __m256i, g);
+        _mm256_storeu_si256(d.add(n - 64) as *mut __m256i, h);
+        _mm256_storeu_si256(d.add(n - 32) as *mut __m256i, i);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(d: *mut std::ffi::c_void, s: *const std::ffi::c_void, n: usize) -> *mut std::ffi::c_void {
+    let (d, s) = (d as *mut u8, s as *const u8);
+    if n <= 256 {
+        cp_small(d, s, n);
+    } else {
+        std::arch::asm!("rep movsb", inout("rcx") n => _, inout("rdi") d => _, inout("rsi") s => _, options(nostack, preserves_flags));
+    }
+    d as *mut std::ffi::c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(d: *mut std::ffi::c_void, s: *const std::ffi::c_void, n: usize) -> *mut std::ffi::c_void {
+    let (d, s) = (d as *mut u8, s as *const u8);
+    if n <= 256 {
+        cp_small(d, s, n);
+    } else if (d as usize).wrapping_sub(s as usize) >= n {
+        std::arch::asm!("rep movsb", inout("rcx") n => _, inout("rdi") d => _, inout("rsi") s => _, options(nostack, preserves_flags));
+    } else {
+        std::arch::asm!("std", "rep movsb", "cld", inout("rcx") n => _, inout("rdi") d.add(n - 1) => _, inout("rsi") s.add(n - 1) => _, options(nostack));
+    }
+    d as *mut std::ffi::c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(d: *mut std::ffi::c_void, c: i32, n: usize) -> *mut std::ffi::c_void {
+    use std::arch::x86_64::*;
+    let d = d as *mut u8;
+    let b = c as u8;
+    if n <= 32 {
+        let v = 0x0101_0101_0101_0101u64 * b as u64;
+        if n >= 16 {
+            (d as *mut u64).write_unaligned(v);
+            (d.add(8) as *mut u64).write_unaligned(v);
+            (d.add(n - 16) as *mut u64).write_unaligned(v);
+            (d.add(n - 8) as *mut u64).write_unaligned(v);
+        } else if n >= 8 {
+            (d as *mut u64).write_unaligned(v);
+            (d.add(n - 8) as *mut u64).write_unaligned(v);
+        } else if n >= 4 {
+            (d as *mut u32).write_unaligned(v as u32);
+            (d.add(n - 4) as *mut u32).write_unaligned(v as u32);
+        } else if n >= 2 {
+            (d as *mut u16).write_unaligned(v as u16);
+            (d.add(n - 2) as *mut u16).write_unaligned(v as u16);
+        } else if n == 1 {
+            *d = b;
+        }
+    } else if n <= 128 {
+        let v = _mm256_set1_epi8(b as i8);
+        _mm256_storeu_si256(d as *mut __m256i, v);
+        _mm256_storeu_si256(d.add(n - 32) as *mut __m256i, v);
+        if n > 64 {
+            _mm256_storeu_si256(d.add(32) as *mut __m256i, v);
+            _mm256_storeu_si256(d.add(n - 64) as *mut __m256i, v);
+        }
+    } else {
+        std::arch::asm!("rep stosb", inout("rcx") n => _, inout("rdi") d => _, in("al") b, options(nostack, preserves_flags));
+    }
+    d as *mut std::ffi::c_void
+}
+
+pub fn mem_test() -> bool {
+    let mut src = vec![0u8; 4096];
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = (i * 131 % 251) as u8 + 1;
+    }
+    let mut ok = true;
+    for n in 0..1100usize {
+        for off in 0..9usize {
+            let mut d = vec![0u8; 1200 + 16];
+            unsafe { memcpy(d.as_mut_ptr().add(off) as *mut _, src.as_ptr().add(3) as *const _, std::hint::black_box(n)) };
+            for i in 0..d.len() {
+                let want = if i >= off && i < off + n { src[3 + i - off] } else { 0 };
+                ok &= d[i] == want;
+            }
+            let mut d = vec![7u8; 1200 + 16];
+            unsafe { memset(d.as_mut_ptr().add(off) as *mut _, 0x5A, std::hint::black_box(n)) };
+            for i in 0..d.len() {
+                ok &= d[i] == if i >= off && i < off + n { 0x5A } else { 7 };
+            }
+            for dir in 0..2 {
+                let mut a = src[..2400].to_vec();
+                let r = a.clone();
+                let (s0, d0) = if dir == 0 { (100, 100 + off) } else { (100 + off, 100) };
+                unsafe { memmove(a.as_mut_ptr().add(d0) as *mut _, a.as_ptr().add(s0) as *const _, std::hint::black_box(n)) };
+                let mut e = r.clone();
+                for i in 0..n {
+                    e[d0 + i] = r[s0 + i];
+                }
+                ok &= a == e;
+            }
+        }
+    }
+    ok
 }

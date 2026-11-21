@@ -7,21 +7,26 @@ fn die(what: &str) -> ! {
     unsafe { sys::_exit(1) }
 }
 
-fn write_user(g: &G, tid: usize, dir: &Path, cats_off: &[u32], cats_data: &[u8]) {
-    let c = &g.t(tid).core;
-    if c.day.len() == 0 && tid != 0 {
-        return;
+fn write_piece(g: &G, t: usize, a: usize, b: usize, path: &Path, cats_off: &[u32], cats_data: &[u8], kbuf: &mut Vec<u32>) {
+    let c = &g.t(t).core;
+    let keys = &c.keys.as_slice()[a..b];
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    for &k in keys {
+        lo = lo.min(k);
+        hi = hi.max(k);
     }
-    let no: &[u32] = if c.day.len() == 0 { &[] } else { c.names_off.as_slice() };
+    kbuf.clear();
+    kbuf.extend(keys.iter().map(|&k| k - lo));
+    let no: &[u32] = if a == b { &[] } else { &c.names_off.as_slice()[lo as usize..hi as usize + 2] };
     let cols = [
-        Column { name: "user_id", data: Data::Dict { dict: StrCol { offsets: no, data: c.names.as_slice() }, keys: Keys::U32(c.keys.as_slice()), nullable: false, plain: false } },
-        Column { name: "day", data: Data::Date(c.day.as_slice(), IntEnc::Dense) },
-        Column { name: "sessions", data: Data::I32(c.ses.as_slice(), IntEnc::Dense) },
-        Column { name: "events", data: Data::I32(c.evs.as_slice(), IntEnc::Auto) },
-        Column { name: "revenue_cents", data: Data::I32(c.rev.as_slice(), IntEnc::Plain) },
-        Column { name: "top_category", data: Data::Dict { dict: StrCol { offsets: cats_off, data: cats_data }, keys: Keys::U8(c.cat.as_slice()), nullable: true, plain: false } },
+        Column { name: "user_id", data: Data::Dict { dict: StrCol { offsets: no, data: c.names.as_slice() }, keys: Keys::U32(kbuf), nullable: false, plain: false } },
+        Column { name: "day", data: Data::Date(&c.day.as_slice()[a..b], IntEnc::Dense) },
+        Column { name: "sessions", data: Data::I32(&c.ses.as_slice()[a..b], IntEnc::Dense) },
+        Column { name: "events", data: Data::I32(&c.evs.as_slice()[a..b], IntEnc::Auto) },
+        Column { name: "revenue_cents", data: Data::I32(&c.rev.as_slice()[a..b], IntEnc::Plain) },
+        Column { name: "top_category", data: Data::Dict { dict: StrCol { offsets: cats_off, data: cats_data }, keys: Keys::U8(&c.cat.as_slice()[a..b]), nullable: true, plain: false } },
     ];
-    if write_file(&dir.join(format!("part-{tid}.parquet")), &cols, &Opts::default(), Method::Stream(1 << 20)).is_err() {
+    if write_file(path, &cols, &Opts::default(), Method::Stream(1 << 20)).is_err() {
         die("user_daily");
     }
 }
@@ -52,7 +57,20 @@ fn write_campaign(g: &G, dir: &Path) {
                 id_data.extend_from_slice(b"organic");
                 ch_data.extend_from_slice(b"organic");
             } else {
-                id_data.extend_from_slice(format!("c_{cn}").as_bytes());
+                let mut d = [0u8; 24];
+                let (mut i, mut x) = (d.len(), cn);
+                loop {
+                    i -= 1;
+                    d[i] = b'0' + (x % 10) as u8;
+                    x /= 10;
+                    if x == 0 {
+                        break;
+                    }
+                }
+                i -= 2;
+                d[i] = b'c';
+                d[i + 1] = b'_';
+                id_data.extend_from_slice(&d[i..]);
                 ch_data.extend_from_slice(&g.channels[g.camp[cn] as usize]);
             }
             id_off.push(id_data.len() as u32);
@@ -108,11 +126,41 @@ pub fn stage5(g: &mut G, outdir: &str) {
         cats_data.extend_from_slice(c);
         cats_off.push(cats_data.len() as u32);
     }
-    let gr: &G = g;
-    sys::run_par(gr.nt, |tid| {
-        if tid == 0 {
-            write_campaign(gr, &cd);
+    let nt = g.nt;
+    let mut base = vec![0usize; nt + 1];
+    for t in 0..nt {
+        base[t + 1] = base[t] + g.t(t).core.day.len();
+    }
+    let total = base[nt];
+    let np = (2 * nt).min(total).max(1);
+    let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+    for p in 0..np {
+        let (ga, gb) = (total * p / np, total * (p + 1) / np);
+        for t in 0..nt {
+            let (a, b) = (ga.max(base[t]), gb.min(base[t + 1]));
+            if a < b {
+                pieces.push((t, a - base[t], b - base[t]));
+            }
         }
-        write_user(gr, tid, &ud, &cats_off, &cats_data);
+    }
+    if pieces.is_empty() {
+        pieces.push((0, 0, 0));
+    }
+    let gr: &G = g;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (pr, nx) = (&pieces, &next);
+    sys::run_par(nt, |_| {
+        let mut kbuf = Vec::new();
+        loop {
+            let i = nx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i == 0 {
+                write_campaign(gr, &cd);
+            } else if i <= pr.len() {
+                let (t, a, b) = pr[i - 1];
+                write_piece(gr, t, a, b, &ud.join(format!("part-{}.parquet", i - 1)), &cats_off, &cats_data, &mut kbuf);
+            } else {
+                break;
+            }
+        }
     });
 }

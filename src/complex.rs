@@ -58,6 +58,7 @@ fn persons_b(g: &G, tid: usize) {
     let t = g.t(tid);
     let mut evs: Vec<Rec> = Vec::new();
     let mut cks: Vec<[u64; 3]> = Vec::new();
+    let mut dec: Vec<(u128, u64, [u64; 3])> = Vec::new();
     let mut name = Vec::new();
     loop {
         let s = g.next.fetch_add(1, Ordering::Relaxed);
@@ -73,8 +74,17 @@ fn persons_b(g: &G, tid: usize) {
         if evs.is_empty() {
             continue;
         }
-        evs.sort_unstable_by_key(|r| (r.w1, r.w0));
-        cks.sort_unstable_by(|a, b| (a[0], a[1] >> 32).cmp(&(b[0], b[1] >> 32)).then_with(|| cid_cmp(g, b[2], a[2])));
+        evs.sort_unstable_by_key(|r| (r.w1 as u128) << 64 | r.w0 as u128);
+        if cks.iter().all(|c| c[2] & RAW == 0) {
+            dec.clear();
+            dec.extend(cks.iter().map(|c| ((c[0] as u128) << 64 | (c[1] >> 32) as u128, !enc36(c[2]).0, *c)));
+            dec.sort_unstable_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+            for (d, x) in cks.iter_mut().zip(&dec) {
+                *d = x.2;
+            }
+        } else {
+            cks.sort_unstable_by(|a, b| (a[0], a[1] >> 32).cmp(&(b[0], b[1] >> 32)).then_with(|| cid_cmp(g, b[2], a[2])));
+        }
         let (mut i, mut j) = (0usize, 0usize);
         while i < evs.len() {
             let pk = evs[i].w1;
@@ -122,11 +132,13 @@ pub fn stage4(g: &mut G) {
         cxu.extend_from_slice(&g.t(tid).mixed_users);
     }
     g.cxu = cxu;
+    crate::sys::lap("c.pre");
     g.next.store(0, Ordering::Relaxed);
     {
         let gr: &G = g;
         sys::run_par(gr.nt, |tid| clicks_a(gr, tid));
     }
+    crate::sys::lap("c.a");
     g.next.store(0, Ordering::Relaxed);
     {
         let gr: &G = g;
