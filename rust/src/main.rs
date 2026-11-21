@@ -198,7 +198,7 @@ impl ReadAhead {
                         let i = next.fetch_add(1, Relaxed);
                         let Some(&(m, path, off, len)) = ranges.get(i) else { break };
                         let mut done = false;
-                        if !populate {
+                        if !populate && cfg!(target_os = "linux") {
                             if let Some(sink) = null.as_mut() {
                                 if open.as_ref().map(|o| o.0) != Some(path) {
                                     open = std::fs::File::open(path).ok().map(|f| (path, f));
