@@ -1,5 +1,5 @@
-// Research prototype: full Shopping Sessions pipeline in Rust (rayon + ahash + parquet).
-// Not the submitted pipeline. Env: DATA_DIR, OUTPUT_DIR, NCPU, TIMING.
+// Shopping Sessions pipeline in Rust (rayon + ahash + parquet). This is the submitted pipeline
+// (root Dockerfile). Env: DATA_DIR, OUTPUT_DIR, NCPU, TIMING.
 use ahash::AHashMap as HashMap;
 use rayon::prelude::*;
 use std::sync::Arc;
