@@ -259,6 +259,7 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
             Kind::Lk => lk_bytes += len,
         }
         files.push(FileInfo { kind: *kind, off, len: *len, hdr: usize::MAX });
+        unsafe { crate::parse::keep_fd(f) };
         off += ((len + pg - 1) & !(pg - 1)) + pg;
     }
     lap("s.mmap");

@@ -1199,7 +1199,226 @@ fn next_line_start(data: &[u8], from: usize) -> usize {
     }
 }
 
+struct Drv {
+    rd: usize,
+    pin: u32,
+    qord: u32,
+    ch: usize,
+}
+static DRV: std::sync::OnceLock<Drv> = std::sync::OnceLock::new();
+fn drv() -> &'static Drv {
+    DRV.get_or_init(|| {
+        let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        Drv { rd: n("XL_RD", RD_DEFAULT) << 10, pin: n("XL_PIN", PIN_DEFAULT) as u32, qord: n("XL_QORD", QORD_DEFAULT) as u32, ch: n("XL_CH", CH_DEFAULT) << 10 }
+    })
+}
+const RD_DEFAULT: usize = env_u32(option_env!("XL_RD_DEF"), 0) as usize;
+const PIN_DEFAULT: usize = env_u32(option_env!("XL_PIN_DEF"), 2) as usize;
+const QORD_DEFAULT: usize = env_u32(option_env!("XL_QORD_DEF"), 0) as usize;
+const CH_DEFAULT: usize = env_u32(option_env!("XL_CH_DEF"), 8192) as usize;
+
+pub static mut FDS: Vec<i32> = Vec::new();
+#[allow(static_mut_refs)]
+pub unsafe fn keep_fd(f: std::fs::File) {
+    if drv().rd > 0 {
+        if FDS.iter().filter(|&&x| x >= 0).count() < KEEP_FDS {
+            FDS.push(std::os::fd::IntoRawFd::into_raw_fd(f));
+            return;
+        }
+    }
+    FDS.push(-1);
+}
+const KEEP_FDS: usize = 40;
+extern "C" {
+    fn pread(fd: i32, buf: *mut u8, n: usize, off: i64) -> isize;
+    fn syscall(n: i64, ...) -> i64;
+}
+
+unsafe fn read_at(fd: i32, dst: *mut u8, n: usize, off: usize, flen: usize) -> usize {
+    let mut got = 0usize;
+    while got < n {
+        let r = pread(fd, dst.add(got), n - got, (off + got) as i64);
+        if r <= 0 {
+            if r < 0 || off + got < flen {
+                fallback("pread");
+            }
+            break;
+        }
+        got += r as usize;
+    }
+    got
+}
+
+fn cpu_order() -> &'static Vec<usize> {
+    static O: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    O.get_or_init(|| {
+        let mut m = [0u64; 16];
+        let r = unsafe { syscall(204, 0i32, 128usize, m.as_mut_ptr()) };
+        if r <= 0 {
+            return Vec::new();
+        }
+        let allowed: Vec<usize> = (0..1024).filter(|&c| m[c / 64] >> (c % 64) & 1 != 0).collect();
+        let mut seen = vec![false; 1024];
+        let mut out = Vec::new();
+        for &c in &allowed {
+            if seen[c] {
+                continue;
+            }
+            let sib = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).unwrap_or_default();
+            let mut grp: Vec<usize> = Vec::new();
+            for part in sib.trim().split(',') {
+                let mut it = part.split('-').filter_map(|x| x.parse::<usize>().ok());
+                if let Some(a) = it.next() {
+                    let b = it.next().unwrap_or(a);
+                    for x in a..=b.min(1023) {
+                        grp.push(x);
+                    }
+                }
+            }
+            if !grp.contains(&c) {
+                grp = vec![c];
+            }
+            for x in grp {
+                if x < 1024 && !seen[x] && allowed.contains(&x) {
+                    seen[x] = true;
+                    out.push(x);
+                }
+            }
+        }
+        out
+    })
+}
+
+fn work_queue(g: &G) -> &'static Vec<Chunk> {
+    static Q: std::sync::OnceLock<Vec<Chunk>> = std::sync::OnceLock::new();
+    Q.get_or_init(|| {
+        let d = drv();
+        let kind = |f: u32| match g.files[f as usize].kind {
+            Kind::Ev => 0,
+            Kind::Ck => 1,
+            Kind::Lk => 2,
+        };
+        if d.ch == 0 {
+            let mut v = g.queue.clone();
+            if d.qord == 1 {
+                v.sort_by_key(|c| kind(c.file));
+            }
+            return v;
+        }
+        let mut order: Vec<u32> = (0..g.files.len() as u32).collect();
+        if d.qord == 1 {
+            order.sort_by_key(|&f| kind(f));
+        }
+        let mut rem: usize = g.files.iter().map(|f| f.len).sum();
+        let mut v = Vec::new();
+        for &fi in &order {
+            let f = &g.files[fi as usize];
+            let mut a = 1;
+            while a < f.len {
+                let sz = (rem / (4 * g.nt)).clamp(256 << 10, d.ch.max(256 << 10));
+                let b = (a + sz).min(f.len);
+                v.push(Chunk { file: fi, a, b });
+                rem = rem.saturating_sub(b - a);
+                a = b;
+            }
+            rem = rem.saturating_sub(1);
+        }
+        v
+    })
+}
+
+#[inline(always)]
+fn parse_buf(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, tb: &'static Tabs, tid: usize, f: &FileInfo, buf: &[u8], s: usize) {
+    let mut ctx = Ctx { g, t, eb, cb, tabs: tb, tid: tid as u64, base: (f.off + s) as u64, fend: (f.off + f.len) as u64 };
+    match f.kind {
+        Kind::Ev => {
+            if unsafe { SKIP } & 16384 == 0 {
+                <K as Kernel>::events(buf, &mut ctx);
+            }
+            ctx.ev_batch();
+        }
+        Kind::Ck => {
+            if unsafe { SKIP } & 8192 == 0 {
+                <K as Kernel>::clicks(buf, &mut ctx);
+            }
+            ctx.ck_batch();
+        }
+        Kind::Lk => {
+            if unsafe { SKIP } & 1024 == 0 {
+                links_chunk(&mut ctx, buf)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn chunk_rd(g: &G, t: &mut TState, eb: &mut EvBatch, cb: &mut CkBatch, tb: &'static Tabs, tid: usize, f: &FileInfo, c: &Chunk, fd: i32, rb: *mut u8, rd: usize) {
+    let flen = f.len;
+    let lim = c.b.min(flen);
+    let mut pos = c.a - 1;
+    let mut n = read_at(fd, rb, rd, pos, flen);
+    let mut o = loop {
+        let s = std::slice::from_raw_parts(rb, n);
+        if let Some(i) = s.iter().position(|&x| x == b'\n') {
+            break i + 1;
+        }
+        if pos + n >= flen {
+            return;
+        }
+        pos += n;
+        n = read_at(fd, rb, rd, pos, flen);
+    };
+    loop {
+        let st = pos + o;
+        if st >= lim {
+            return;
+        }
+        let s = std::slice::from_raw_parts(rb, n);
+        let eof = pos + n >= flen;
+        let li = lim - pos;
+        let mut fin = None;
+        if li <= n {
+            if let Some(j) = s[li - 1..].iter().position(|&x| x == b'\n') {
+                fin = Some(li + j);
+            }
+        }
+        let (cut, done) = match fin {
+            Some(e) => (e, true),
+            None if eof => (n, true),
+            None => match s[o..].iter().rposition(|&x| x == b'\n') {
+                Some(j) => (o + j + 1, false),
+                None => {
+                    let data = std::slice::from_raw_parts(g.region.add(f.off), flen);
+                    let e = if c.b >= flen { flen } else { next_line_start(data, c.b - 1) };
+                    parse_buf(g, t, eb, cb, tb, tid, f, &data[st..e], st);
+                    return;
+                }
+            },
+        };
+        parse_buf(g, t, eb, cb, tb, tid, f, &s[o..cut], st);
+        if done {
+            return;
+        }
+        pos += cut;
+        o = 0;
+        n = read_at(fd, rb, rd, pos, flen);
+    }
+}
+
 pub fn stage1(g: &G, tid: usize) {
+    #[cfg(feature = "pmu")]
+    let pm = pmu::start();
+    let d = drv();
+    let mut saved = [0u64; 16];
+    let pinned = d.pin != 0 && {
+        let o = cpu_order();
+        !o.is_empty() && unsafe { syscall(204, 0i32, 128usize, saved.as_mut_ptr()) } > 0 && {
+            let cpu = o[tid % o.len()];
+            let mut m = [0u64; 16];
+            m[cpu / 64] |= 1 << (cpu % 64);
+            unsafe { syscall(203, 0i32, 128usize, m.as_ptr()) == 0 }
+        }
+    };
     let t = g.t(tid);
     t.ev = Part::new(&g.ev_arena, g.nb);
     t.us = Part::new(&g.us_arena, g.nub);
@@ -1207,13 +1426,23 @@ pub fn stage1(g: &G, tid: usize) {
     let mut eb = EvBatch::new();
     let mut cb = CkBatch::new();
     let tb = tabs(g);
+    let rd = d.rd;
+    #[allow(static_mut_refs)]
+    let fds: &[i32] = unsafe { &FDS };
+    let use_rd = rd > 0 && fds.len() == g.files.len() && unsafe { SKIP } & 512 == 0;
+    let rb = if use_rd { unsafe { anon(rd + 8192).add(4096) } } else { std::ptr::null_mut() };
+    let q = work_queue(g);
     loop {
         let i = g.qnext.fetch_add(1, Ordering::Relaxed);
-        if i >= g.queue.len() {
+        if i >= q.len() {
             break;
         }
-        let c = g.queue[i];
+        let c = q[i];
         let f = &g.files[c.file as usize];
+        if use_rd && fds[c.file as usize] >= 0 {
+            unsafe { chunk_rd(g, &mut *t, &mut eb, &mut cb, tb, tid, f, &c, fds[c.file as usize], rb, rd) };
+            continue;
+        }
         let data = unsafe { std::slice::from_raw_parts(g.region.add(f.off), f.len) };
         let s = if c.a == f.hdr { c.a } else { next_line_start(data, c.a - 1) };
         let e = if c.b >= f.len { f.len } else { next_line_start(data, c.b - 1) };
@@ -1221,7 +1450,6 @@ pub fn stage1(g: &G, tid: usize) {
             continue;
         }
         let buf = &data[s..e];
-        let mut ctx = Ctx { g, t: &mut *t, eb: &mut eb, cb: &mut cb, tabs: tb, tid: tid as u64, base: (f.off + s) as u64, fend: (f.off + f.len) as u64 };
         if unsafe { SKIP } & 512 != 0 {
             let mut x = 0u64;
             let mut i = 0;
@@ -1231,25 +1459,7 @@ pub fn stage1(g: &G, tid: usize) {
             }
             t.prof[7] = t.prof[7].wrapping_add(x);
         } else {
-            match f.kind {
-                Kind::Ev => {
-                    if unsafe { SKIP } & 16384 == 0 {
-                        <K as Kernel>::events(buf, &mut ctx);
-                    }
-                    ctx.ev_batch();
-                }
-                Kind::Ck => {
-                    if unsafe { SKIP } & 8192 == 0 {
-                        <K as Kernel>::clicks(buf, &mut ctx);
-                    }
-                    ctx.ck_batch();
-                }
-                Kind::Lk => {
-                    if unsafe { SKIP } & 1024 == 0 {
-                        links_chunk(&mut ctx, buf)
-                    }
-                }
-            }
+            parse_buf(g, &mut *t, &mut eb, &mut cb, tb, tid, f, buf, s);
         }
         if unsafe { RELEASE } {
             let a = (f.off + s + 4095) & !4095;
@@ -1261,4 +1471,69 @@ pub fn stage1(g: &G, tid: usize) {
     }
     t.ev.finish();
     t.us.finish();
+    if !rb.is_null() {
+        unsafe { madvise(rb.sub(4096), rd + 8192, MADV_DONTNEED) };
+    }
+    if pinned && (d.pin == 1 || tid == 0) {
+        unsafe { syscall(203, 0i32, 128usize, saved.as_ptr()) };
+    }
+    #[cfg(feature = "pmu")]
+    pmu::stop(pm, g.nt);
+}
+
+#[cfg(feature = "pmu")]
+pub mod pmu {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    extern "C" {
+        fn syscall(n: i64, ...) -> i64;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+        fn close(fd: i32) -> i32;
+        fn getrusage(who: i32, r: *mut i64) -> i32;
+    }
+    static RU: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    const N: usize = 6;
+    static SUM: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static MAXW: AtomicU64 = AtomicU64::new(0);
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    const EV: [(u32, u64, bool); N] = [(0, 1, true), (0, 0, true), (4, 0xC1, true), (1, 2, true), (1, 1, true), (0, 1, false)];
+    pub struct Pmu {
+        fd: [i32; N],
+        t0: std::time::Instant,
+    }
+    pub fn start() -> Pmu {
+        let mut fd = [-1; N];
+        for (k, &(ty, cfg, exk)) in EV.iter().enumerate() {
+            let mut a = [0u64; 16];
+            a[0] = ty as u64 | (128u64 << 32);
+            a[1] = cfg;
+            a[5] = if exk { (1 << 5) | (1 << 6) } else { 1 << 6 };
+            fd[k] = unsafe { syscall(298, a.as_ptr(), 0i32, -1i32, -1i32, 0u64) } as i32;
+        }
+        Pmu { fd, t0: std::time::Instant::now() }
+    }
+    pub fn stop(p: Pmu, nt: usize) {
+        let w = p.t0.elapsed().as_nanos() as u64;
+        let mut ru = [0i64; 18];
+        unsafe { getrusage(1, ru.as_mut_ptr()) };
+        RU[0].fetch_add((ru[0] * 1_000_000 + ru[1]) as u64, Ordering::Relaxed);
+        RU[1].fetch_add((ru[2] * 1_000_000 + ru[3]) as u64, Ordering::Relaxed);
+        RU[2].fetch_add(ru[16] as u64, Ordering::Relaxed);
+        RU[3].fetch_add(ru[17] as u64, Ordering::Relaxed);
+        MAXW.fetch_max(w, Ordering::Relaxed);
+        for k in 0..N {
+            let mut v = 0u64;
+            if p.fd[k] >= 0 {
+                unsafe {
+                    read(p.fd[k], &mut v as *mut u64 as *mut u8, 8);
+                    close(p.fd[k]);
+                }
+            }
+            SUM[k].fetch_add(v, Ordering::Relaxed);
+        }
+        if DONE.fetch_add(1, Ordering::AcqRel) + 1 == nt {
+            let s: Vec<u64> = SUM.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+            eprintln!("[pmu] parse: uinstr={:.1}M ucycles={:.1}M uops={:.1}M faults={} task_ms={:.1} allinstr={:.1}M (kinstr={:.1}M) max_thread_ms={:.1}", s[0] as f64 / 1e6, s[1] as f64 / 1e6, s[2] as f64 / 1e6, s[3], s[4] as f64 / 1e6, s[5] as f64 / 1e6, (s[5].saturating_sub(s[0])) as f64 / 1e6, MAXW.load(Ordering::Relaxed) as f64 / 1e6);
+            eprintln!("[pmu] thread totals (whole thread life): utime_ms={:.1} stime_ms={:.1} nvcsw={} nivcsw={}", RU[0].load(Ordering::Relaxed) as f64 / 1e3, RU[1].load(Ordering::Relaxed) as f64 / 1e3, RU[2].load(Ordering::Relaxed), RU[3].load(Ordering::Relaxed));
+        }
+    }
 }

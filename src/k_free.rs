@@ -926,6 +926,7 @@ unsafe fn cl_careful<S: ClickSink, const CHAIN: bool>(base: *const u8, len: usiz
 const CHUNK: usize = 8192;
 
 const PIPE: u8 = 0;
+const PFD: usize = 512;
 const CHAIN: u8 = 1;
 const PRE: u8 = 2;
 
@@ -1011,6 +1012,7 @@ macro_rules! runner {
                             let pre = next + 64 <= len;
                             let nxt = $masks(base.add(if pre { next } else { pos }));
                             let nxt = core::hint::black_box(nxt);
+                            _mm_prefetch::<_MM_HINT_T0>(base.wrapping_add(pos + PFD) as *const i8);
                             let r = $line::<S, true>(base, len, pos, 0, &cur.0, cur.1, cache, sink);
                             if (r == FAIL) | (r.wrapping_add(1) != next) | !pre {
                                 pos = if r == FAIL { $scan(buf, pos, sink) } else { r + 1 };
