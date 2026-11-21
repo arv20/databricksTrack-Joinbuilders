@@ -183,14 +183,54 @@ fn civil_fast(p: *const u8) -> Option<i64> {
     if mo.wrapping_sub(1) > 11 || h > 23 || mi > 59 || s > 59 || dd == 0 {
         return None;
     }
-    const MDAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let dim = MDAYS[(mo - 1) as usize] + (mo == 2 && leap(y)) as u32;
-    if dd > dim {
-        return None;
-    }
-    let days = days_from_civil(y as i64, mo as i64, dd as i64);
+    let days = if y.wrapping_sub(MT_Y0) < MT_YEARS {
+        // table path: day number of the month's first day, and its length
+        let (first, dim) = MONTHS[((y - MT_Y0) * 12 + mo - 1) as usize];
+        if dd > dim as u32 {
+            return None;
+        }
+        first as i64 + dd as i64 - 1
+    } else {
+        const MDAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let dim = MDAYS[(mo - 1) as usize] + (mo == 2 && leap(y)) as u32;
+        if dd > dim {
+            return None;
+        }
+        days_from_civil(y as i64, mo as i64, dd as i64)
+    };
     Some(((days * 24 + h as i64) * 60 + mi as i64) * MIN + s as i64 * SEC)
 }
+
+/// Years covered by `MONTHS`; others take the arithmetic path.
+const MT_Y0: u32 = 1970;
+const MT_YEARS: u32 = 130;
+
+/// For each month of `MT_Y0..MT_Y0 + MT_YEARS`: (days since the epoch of its
+/// first day, number of days in it). Built at compile time.
+static MONTHS: [(i32, u8); (MT_YEARS * 12) as usize] = {
+    let mut t = [(0i32, 0u8); (MT_YEARS * 12) as usize];
+    let mut i = 0;
+    while i < t.len() {
+        let y = MT_Y0 + (i / 12) as u32;
+        let m = (i % 12) as u32 + 1;
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let dim = match m {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        // days_from_civil(y, m, 1), written out for const evaluation
+        let yy = if m <= 2 { y as i64 - 1 } else { y as i64 };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+        let doy = (153 * mp + 2) / 5;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        t[i] = ((era * 146_097 + doe - 719_468) as i32, dim);
+        i += 1;
+    }
+    t
+};
 
 /// F1 only (ingest_ts).
 #[inline(always)]
@@ -287,6 +327,38 @@ pub fn parse(f: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f3_digits_match_reference() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for len in 1..=25usize {
+            for lead in 0..=len {
+                for _ in 0..200 {
+                    let mut f: Vec<u8> = (0..len).map(|i| if i < lead { b'0' } else { b'0' + (rnd() % 10) as u8 }).collect();
+                    if rnd() % 4 == 0 { let i = (rnd() as usize) % len; f[i] = (rnd() % 256) as u8; }
+                    let mut buf = f.clone();
+                    buf.extend_from_slice(&[0x55; 16]);
+                    let g = &buf[..len];
+                    assert_eq!(parse(g), parse_slow(g), "{:?}", f);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn month_table_matches_arithmetic() {
+        for y in 1900u32..2200 {
+            for m in 1u32..=12 {
+                for d in 1u32..=31 {
+                    let f = format!("{y:04}-{m:02}-{d:02}T12:34:56Z");
+                    let slow = parse_slow(f.as_bytes());
+                    assert_eq!(parse(f.as_bytes()), slow, "{f}");
+                    assert_eq!(parse_f1(f.as_bytes()), slow, "{f}");
+                }
+            }
+        }
+    }
     #[test]
     fn forms() {
         let f1 = parse(b"2026-10-03T23:58:10Z").unwrap();

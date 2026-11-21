@@ -1175,6 +1175,29 @@ fn canonical_num(id: &[u8], pfx: u8) -> Option<usize> {
     if !(2..=8).contains(&n) || id[0] != pfx || id[1] == b'0' {
         return None;
     }
+    // SWAR: the 1..=7 digits after the prefix, as one 8-byte word (fields are
+    // followed by padding, so reading 8 bytes is safe)
+    let m = n - 1;
+    let raw = u64::from_le_bytes(unsafe { std::ptr::read_unaligned(id.as_ptr().add(1) as *const [u8; 8]) });
+    let keep = (1u64 << (8 * m)) - 1;
+    let x = (raw ^ 0x3030_3030_3030_3030) & keep;
+    if ((x | x.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 & keep) != 0 {
+        return None;
+    }
+    // right-align the digits (leading zero digits), then combine pairwise
+    let y = x << (8 * (8 - m));
+    let y = (y & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+    let y = (y & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    let y = (y & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
+    Some(y as usize)
+}
+
+#[cfg(test)]
+fn canonical_num_slow(id: &[u8], pfx: u8) -> Option<usize> {
+    let n = id.len();
+    if !(2..=8).contains(&n) || id[0] != pfx || id[1] == b'0' {
+        return None;
+    }
     let mut v = 0usize;
     for &b in &id[1..] {
         let d = b.wrapping_sub(b'0');
@@ -1184,6 +1207,41 @@ fn canonical_num(id: &[u8], pfx: u8) -> Option<usize> {
         v = v * 10 + d as usize;
     }
     Some(v)
+}
+
+#[cfg(test)]
+mod pid_tests {
+    #[test]
+    fn swar_matches_loop() {
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for v in [0u64, 1, 7, 9, 10, 42, 99, 100, 12345, 50000, 99999, 123456, 999999, 1234567, 9999999] {
+            cases.push(format!("p{v}").into_bytes());
+            cases.push(format!("p0{v}").into_bytes());
+            cases.push(format!("P{v}").into_bytes());
+            cases.push(format!("p{v}x").into_bytes());
+            cases.push(format!(" p{v}").into_bytes());
+        }
+        for odd in ["p", "p١٢", "p１", "p12/", "p12:", "p 1", "p-1", "p1.5", "p12345678", "p1234567"] {
+            cases.push(odd.as_bytes().to_vec());
+        }
+        // every byte value in every position of a 1..=7 digit body
+        for len in 1..=7usize {
+            for pos in 0..len {
+                for b in 0..=255u8 {
+                    let mut c = vec![b'p'];
+                    c.extend(std::iter::repeat(b'5').take(len));
+                    c[1 + pos] = b;
+                    cases.push(c);
+                }
+            }
+        }
+        for c in cases {
+            let mut buf = c.clone();
+            buf.extend_from_slice(&[0xAA; 16]); // garbage after the field
+            let f = &buf[..c.len()];
+            assert_eq!(super::canonical_num(f, b'p'), super::canonical_num_slow(f, b'p'), "{:?}", c);
+        }
+    }
 }
 
 #[inline(always)]
