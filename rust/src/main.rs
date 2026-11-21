@@ -6,6 +6,7 @@
 // partitions. A separate, compact event-ID stream identifies the copies to tombstone before
 // sessions. Any detected hash collision (same 64-bit key, different check) or unsupported input
 // sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
+mod nova;
 mod slow;
 
 use ahash::AHashMap as HashMap;
@@ -1526,7 +1527,8 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
-    if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3) {
+    let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
+    if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {
         if std::env::var_os("TIMING").is_some() {
             eprintln!("fast engine declined; running the exact fallback");
         }
@@ -1629,6 +1631,7 @@ fn build_links(
     input: &[&[u8]],
     estimated_users: usize,
     seed: u64,
+    nova: bool,
 ) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
     let chunks = chunks(input, 1 << 18);
     // Physical rows give an upper bound on valid links, including a final
@@ -1663,7 +1666,15 @@ fn build_links(
                     collision.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = hs(s, seed);
+                let (key, check) = if nova {
+                    let Some(key) = nova::user_key(s) else {
+                        collision.store(true, Relaxed);
+                        return;
+                    };
+                    (key, 0)
+                } else {
+                    hs(s, seed)
+                };
                 let key = if key == 0 { 1 } else { key };
                 let shard = ((key as usize) & table.mask) >> shift;
                 ends[shard].push(LinkEnd { key, name, check, endpoint: count });
@@ -1827,7 +1838,7 @@ fn build_links(
 }
 
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
-fn fast(seed: u64) -> bool {
+fn fast(seed: u64, nova: bool) -> bool {
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -1915,144 +1926,152 @@ fn fast(seed: u64) -> bool {
         ra.wait(b);
     }
     lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed) else {
+    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
         return false;
     };
     let coll = AtomicBool::new(false);
     let users = Users::new(&mut ltab, nids, pname.len());
     lap(&format!("links: {} edges, {} ids, {} persons", nedges, nids, pname.len()));
 
-    // Events phase A: route valid copies directly to people, and record
-    // every eligible event ID for the global earliest-ingest decision.
+    // Produce person partitions with exactly the retained, valid events.
     let ech = LazyChunks::new(&evb, 1 << 20);
-    let shard_capacity = evb.iter().find(|b| b.len() >= 1 << 17).map_or(0, |b| {
-        let sample = &b[1 << 16..1 << 17];
-        let rows = memchr::memchr_iter(b'\n', sample).count();
-        let avg_bytes = (sample.len() / rows.max(1)).max(64);
-        let input_bytes: usize = ech.total();
-        let per_shard = (input_bytes / avg_bytes).div_ceil(SH * rayon::current_num_threads());
-        (per_shard + per_shard / 8).min(32_768)
-    });
-    let window_seconds = w0.div_euclid(1000);
-    let folds: Vec<EventFold> = pt_ordered(ech.len(),
-            || EventFold::new(shard_capacity),
-            |mut acc, ci| {
-                ra.wait(ech.raw(ci));
-                let c = ech.get(ci);
-                let mut dates = Dates::default();
-                let mut batch = Vec::<ParsedEvent>::with_capacity(16);
-                let mut short_writer = acc.short_copies.writer();
-                let mut block = (0u32, 0u32);
-                let mut flush = |batch: &mut Vec<ParsedEvent>| {
-                    for mut r in batch.drain(..) {
-                        if r.ts != TOMBSTONE {
-                            let person = users.person(r.pkey, r.pchk, r.name_ref, &mut block, &coll);
-                            let partition = person as usize & (P - 1);
-                            let events = &mut acc.people;
-                            let Ok(index) = u32::try_from(events.len(partition)) else {
-                                coll.store(true, Relaxed);
-                                continue;
-                            };
-                            events.push(partition, EvP {
-                                person,
-                                ts: AtomicU32::new(r.ts),
-                                price: r.price,
-                            });
-                            r.copy.loc = ((partition as u64) << 32) | u64::from(index);
-                        }
-                        let shard = (r.copy.hid >> (64 - SHB)) as usize;
-                        if r.short_id {
-                            if let Some(copy) = ShortD::pack(r.copy) {
-                                short_writer.push(shard, copy);
-                            } else {
-                                coll.store(true, Relaxed);
+    let (linked_count, pname, paccs) = if nova {
+        let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
+        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll) else {
+            return false;
+        };
+        result
+    } else {
+        let shard_capacity = evb.iter().find(|b| b.len() >= 1 << 17).map_or(0, |b| {
+            let sample = &b[1 << 16..1 << 17];
+            let rows = memchr::memchr_iter(b'\n', sample).count();
+            let avg_bytes = (sample.len() / rows.max(1)).max(64);
+            let input_bytes: usize = ech.total();
+            let per_shard = (input_bytes / avg_bytes).div_ceil(SH * rayon::current_num_threads());
+            (per_shard + per_shard / 8).min(32_768)
+        });
+        let window_seconds = w0.div_euclid(1000);
+        let folds: Vec<EventFold> = pt_ordered(ech.len(),
+                || EventFold::new(shard_capacity),
+                |mut acc, ci| {
+                    ra.wait(ech.raw(ci));
+                    let c = ech.get(ci);
+                    let mut dates = Dates::default();
+                    let mut batch = Vec::<ParsedEvent>::with_capacity(16);
+                    let mut short_writer = acc.short_copies.writer();
+                    let mut block = (0u32, 0u32);
+                    let mut flush = |batch: &mut Vec<ParsedEvent>| {
+                        for mut r in batch.drain(..) {
+                            if r.ts != TOMBSTONE {
+                                let person = users.person(r.pkey, r.pchk, r.name_ref, &mut block, &coll);
+                                let partition = person as usize & (P - 1);
+                                let events = &mut acc.people;
+                                let Ok(index) = u32::try_from(events.len(partition)) else {
+                                    coll.store(true, Relaxed);
+                                    continue;
+                                };
+                                events.push(partition, EvP {
+                                    person,
+                                    ts: AtomicU32::new(r.ts),
+                                    price: r.price,
+                                });
+                                r.copy.loc = ((partition as u64) << 32) | u64::from(index);
                             }
-                        } else {
-                            acc.copies[shard].push(r.copy);
+                            let shard = (r.copy.hid >> (64 - SHB)) as usize;
+                            if r.short_id {
+                                if let Some(copy) = ShortD::pack(r.copy) {
+                                    short_writer.push(shard, copy);
+                                } else {
+                                    coll.store(true, Relaxed);
+                                }
+                            } else {
+                                acc.copies[shard].push(r.copy);
+                            }
                         }
-                    }
-                };
-                event_rows(c, |_, [id, user, ts, ing, et, pr, pc]| {
-                    if id.is_empty() {
-                        return;
-                    }
-                    let short_key = short_event_key(id);
-                    let (hid, hchk) = short_key.map_or_else(|| hs(id, seed), |key| (key, 0));
-                    let ingest = dates.parse(ing);
-                    let (order, loc) = match ingest {
-                        None => (i32::MAX, NO_EVENT | UNPARSED_INGEST),
-                        Some(value) => {
-                            let Some(order) = compact_ingest(value, window_seconds) else {
-                                coll.store(true, Relaxed);
-                                return;
+                    };
+                    event_rows(c, |_, [id, user, ts, ing, et, pr, pc]| {
+                        if id.is_empty() {
+                            return;
+                        }
+                        let short_key = short_event_key(id);
+                        let (hid, hchk) = short_key.map_or_else(|| hs(id, seed), |key| (key, 0));
+                        let ingest = dates.parse(ing);
+                        let (order, loc) = match ingest {
+                            None => (i32::MAX, NO_EVENT | UNPARSED_INGEST),
+                            Some(value) => {
+                                let Some(order) = compact_ingest(value, window_seconds) else {
+                                    coll.store(true, Relaxed);
+                                    return;
+                                };
+                                (order, NO_EVENT)
+                            }
+                        };
+                        let mut r = ParsedEvent {
+                            copy: D { hid, hchk, ingest: order, loc },
+                            name_ref: 0,
+                            pkey: 0, pchk: 0, ts: TOMBSTONE, price: 0,
+                            short_id: short_key.is_some(),
+                        };
+                        'v: {
+                            let Some(ingest) = ingest else { break 'v };
+                            if user.is_empty() || pr.is_empty() {
+                                break 'v;
+                            }
+                            let purchase = match et {
+                                b"view" | b"cart" => false,
+                                b"purchase" => true,
+                                _ => break 'v,
                             };
-                            (order, NO_EVENT)
+                            let t = match dates.parse(ts) {
+                                Some(t) if t >= w0 && t < w1 => t,
+                                _ => break 'v,
+                            };
+                            if ingest - t > DAY {
+                                break 'v;
+                            }
+                            if purchase {
+                                let Some(p) = parse_price(pc) else { break 'v };
+                                let cat = *prod.get(pr).unwrap_or(&unknown);
+                                r.price = p | (cat << 24);
+                            }
+                            let Some(name) = pack_ref(user) else {
+                                coll.store(true, Relaxed);
+                                break 'v;
+                            };
+                            r.name_ref = name;
+                            (r.pkey, r.pchk) = hs(user, seed);
+                            users.prefetch(r.pkey);
+                            r.ts = (t - w0) as u32;
                         }
-                    };
-                    let mut r = ParsedEvent {
-                        copy: D { hid, hchk, ingest: order, loc },
-                        name_ref: 0,
-                        pkey: 0, pchk: 0, ts: TOMBSTONE, price: 0,
-                        short_id: short_key.is_some(),
-                    };
-                    'v: {
-                        let Some(ingest) = ingest else { break 'v };
-                        if user.is_empty() || pr.is_empty() {
-                            break 'v;
+                        batch.push(r);
+                        if batch.len() == 16 {
+                            flush(&mut batch);
                         }
-                        let purchase = match et {
-                            b"view" | b"cart" => false,
-                            b"purchase" => true,
-                            _ => break 'v,
-                        };
-                        let t = match dates.parse(ts) {
-                            Some(t) if t >= w0 && t < w1 => t,
-                            _ => break 'v,
-                        };
-                        if ingest - t > DAY {
-                            break 'v;
-                        }
-                        if purchase {
-                            let Some(p) = parse_price(pc) else { break 'v };
-                            let cat = *prod.get(pr).unwrap_or(&unknown);
-                            r.price = p | (cat << 24);
-                        }
-                        let Some(name) = pack_ref(user) else {
-                            coll.store(true, Relaxed);
-                            break 'v;
-                        };
-                        r.name_ref = name;
-                        (r.pkey, r.pchk) = hs(user, seed);
-                        users.prefetch(r.pkey);
-                        r.ts = (t - w0) as u32;
-                    }
-                    batch.push(r);
-                    if batch.len() == 16 {
-                        flush(&mut batch);
-                    }
-                });
-                flush(&mut batch);
-                acc
-            },
-        );
-    let (linked_count, pname) = users.names(&pname, &coll);
-    lap(&format!("events parsed ({} folds, {} persons)", folds.len(), pname.len()));
-    if coll.load(Relaxed) {
-        return false;
-    }
+                    });
+                    flush(&mut batch);
+                    acc
+                },
+            );
+        let (linked_count, pname) = users.names(&pname, &coll);
+        lap(&format!("events parsed ({} folds, {} persons)", folds.len(), pname.len()));
+        if coll.load(Relaxed) {
+            return false;
+        }
 
-    // Events phase B: keep the earliest copy and tombstone valid losers.
-    // Every EvP location belongs to exactly one event-ID shard.
-    pt((0..SH).into_par_iter(), Dedup::default, |mut table, shard| {
-        table.shard(&folds, shard, &coll, |f, s| f.short_copies.records(s));
-        table.shard(&folds, shard, &coll, |f, s| [&f.copies[s], &[]]);
-        table
-    });
-    if coll.load(Relaxed) {
-        return false;
-    }
-    let paccs: Vec<_> = folds.into_par_iter().map(|fold| fold.people).collect();
-    lap("events dedup + validate");
+        // Events phase B: keep the earliest copy and tombstone valid losers.
+        // Every EvP location belongs to exactly one event-ID shard.
+        pt((0..SH).into_par_iter(), Dedup::default, |mut table, shard| {
+            table.shard(&folds, shard, &coll, |f, s| f.short_copies.records(s));
+            table.shard(&folds, shard, &coll, |f, s| [&f.copies[s], &[]]);
+            table
+        });
+        if coll.load(Relaxed) {
+            return false;
+        }
+        let paccs: Vec<_> = folds.into_par_iter().map(|fold| fold.people).collect();
+        lap("events dedup + validate");
+        (linked_count, pname, paccs)
+    };
 
     // clicks: parse + validate, route by person. Copies of a click are identical, so a duplicate
     // can change neither the chosen click nor the set of assisting campaigns: no dedup needed.
@@ -2086,7 +2105,13 @@ fn fast(seed: u64) -> bool {
                     coll.store(true, Relaxed);
                     return;
                 };
-                let (key, check) = hs(user, seed);
+                let (key, check) = if nova {
+                    // A supported link or event user always has a short key.
+                    let Some(key) = nova::user_key(user) else { return };
+                    (key, 0)
+                } else {
+                    hs(user, seed)
+                };
                 users.prefetch(key);
                 batch.push(PendingClick { click: Click { person, id, ts, campaign }, key, check });
                 if batch.len() == 16 {
