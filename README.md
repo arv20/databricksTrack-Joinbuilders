@@ -6,8 +6,7 @@ A merge of two pipelines:
   (github.com/jason-scheffel/express-lane, commit 92cf412), used under the MIT
   License. Team 67's copyright notice is kept in LICENSE. It infers a compact ID
   representation from the input and checks it as it goes.
-- **General path** (`fallback/`): our own pipeline (joch44/shopping-sessions,
-  v36). When the data breaks the fast path's assumptions (long or opaque IDs,
+- **General path** (`fallback/`): the v36 pipeline, maintained by Aarav. When the data breaks the fast path's assumptions (long or opaque IDs,
   unusual categories, ...), the fast path hands the whole job to it
   (`/fallback` in the image). On such data it is 2-4x faster than the fast
   path's own generic mode.
