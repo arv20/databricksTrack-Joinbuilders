@@ -1706,8 +1706,8 @@ fn build_links(
                 };
                 let (key, check) = if nova {
                     // Short IDs use the packed key; anything else (including
-                    // v5's suffixed IDs) is interned by its full bytes.
-                    (nova::user_key(s).unwrap_or_else(|| ids.intern(s)), 0)
+                    // v5's suffixed IDs) is hashed lock-free (see user_ident).
+                    nova::user_ident(s)
                 } else {
                     ids.user(s)
                 };
@@ -1996,7 +1996,7 @@ fn fast(nova: bool) -> bool {
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &ids, &input, &pname, &coll, estimated_rows) else {
+        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, estimated_rows) else {
             return false;
         };
         result
@@ -2166,9 +2166,9 @@ fn fast(nova: bool) -> bool {
                     return;
                 };
                 let (key, check) = if nova {
-                    // Short IDs use the packed key; anything else is interned
-                    // by its full bytes so the click is never dropped.
-                    (nova::user_key(user).unwrap_or_else(|| ids.intern(user)), 0)
+                    // Short IDs use the packed key; anything else is hashed
+                    // lock-free (see user_ident) so the click is never dropped.
+                    nova::user_ident(user)
                 } else {
                     ids.user(user)
                 };
