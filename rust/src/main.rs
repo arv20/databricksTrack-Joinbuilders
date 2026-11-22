@@ -745,7 +745,7 @@ impl ExactIds {
         Self { shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect() }
     }
 
-    fn intern_in(&self, shard: usize, bytes: &'static [u8]) -> u64 {
+    fn intern_in(&self, shard: usize, bytes: &[u8]) -> u64 {
         let mut map = self.shards[shard].lock().unwrap();
         if let Some(&id) = map.get(bytes) {
             return id;
@@ -754,16 +754,19 @@ impl ExactIds {
         // Odd multiplication permutes the positive 63-bit ordinals. Allocating
         // enough distinct entries to exhaust this space exceeds addressable RAM.
         let id = ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (u64::MAX >> 1);
-        map.insert(bytes, id);
+        // SAFETY: every ID slice comes from an input that is memory-mapped and
+        // leaked for the whole process; the map is dropped only at process exit.
+        let owned: &'static [u8] = unsafe { std::mem::transmute(bytes) };
+        map.insert(owned, id);
         id
     }
 
-    fn intern(&self, bytes: &'static [u8]) -> u64 {
+    fn intern(&self, bytes: &[u8]) -> u64 {
         let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as u8;
         self.intern_in(shard as usize, bytes)
     }
 
-    fn user(&self, bytes: &'static [u8]) -> (u64, u32) {
+    fn user(&self, bytes: &[u8]) -> (u64, u32) {
         (nova::user_key(bytes).unwrap_or_else(|| self.intern(bytes)), 0)
     }
 }
@@ -1556,13 +1559,13 @@ fn pack_ref(s: &[u8]) -> Option<u64> {
     if p >> 48 != 0 || s.len() >= (1 << 16) { None } else { Some(p | ((s.len() as u64) << 48)) }
 }
 #[inline]
-fn unpack_ref(r: u64) -> &'static [u8] {
+pub(crate) fn unpack_ref(r: u64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts((r & ((1u64 << 48) - 1)) as *const u8, (r >> 48) as usize) }
 }
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
-    let nova = std::env::var_os("NOVA").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
     if std::env::var_os("FORCE_SLOW").is_some() || !fast(nova) {
         if std::env::var_os("TIMING").is_some() {
             eprintln!("fast engine declined; running the exact fallback");
@@ -1702,11 +1705,9 @@ fn build_links(
                     return;
                 };
                 let (key, check) = if nova {
-                    let Some(key) = nova::user_key(s) else {
-                        collision.store(true, Relaxed);
-                        return;
-                    };
-                    (key, 0)
+                    // Short IDs use the packed key; anything else (including
+                    // v5's suffixed IDs) is interned by its full bytes.
+                    (nova::user_key(s).unwrap_or_else(|| ids.intern(s)), 0)
                 } else {
                     ids.user(s)
                 };
@@ -1995,7 +1996,7 @@ fn fast(nova: bool) -> bool {
     let ech = LazyChunks::new(&evb, 1 << 20);
     let (linked_count, pname, paccs) = if nova {
         let input = nova::EventInput { products: &prod, unknown, start: w0, end: w1 };
-        let Some(result) = nova::run_events(&ech, ra, &users, &input, &pname, &coll, estimated_rows) else {
+        let Some(result) = nova::run_events(&ech, ra, &users, &ids, &input, &pname, &coll, estimated_rows) else {
             return false;
         };
         result
@@ -2165,9 +2166,9 @@ fn fast(nova: bool) -> bool {
                     return;
                 };
                 let (key, check) = if nova {
-                    // A supported link or event user always has a short key.
-                    let Some(key) = nova::user_key(user) else { return };
-                    (key, 0)
+                    // Short IDs use the packed key; anything else is interned
+                    // by its full bytes so the click is never dropped.
+                    (nova::user_key(user).unwrap_or_else(|| ids.intern(user)), 0)
                 } else {
                     ids.user(user)
                 };

@@ -89,20 +89,18 @@ fn person_names(users: &Users<'_>, linked: &[&'static [u8]]) -> Option<(u32, Vec
     if n < linked.len() || n >= crate::PERSON_SET as usize {
         return None;
     }
-    let names: &'static [PersonName] = Box::leak(
-        (linked.len()..n)
-            .into_par_iter()
-            .map(|id| PersonName::decode(users.names[id].load(Relaxed)))
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    );
+    // Every name slot holds a direct reference (pointer + length) to the
+    // user's bytes, so no per-person decode or allocation is needed.
+    let names: Vec<&'static [u8]> = (linked.len()..n)
+        .into_par_iter()
+        .map(|id| {
+            let v = users.names[id].load(Relaxed);
+            if v == 0 { &[][..] } else { crate::unpack_ref(v) }
+        })
+        .collect();
     let mut all = Vec::with_capacity(n);
     all.extend_from_slice(linked);
-    all.extend(
-        names
-            .iter()
-            .map(|person| &person.bytes[..person.len as usize]),
-    );
+    all.extend(names);
     Some((n.div_ceil(P) as u32, all))
 }
 
@@ -341,6 +339,7 @@ struct Pending {
     key: u64,
     ingest: i32,
     uid: u64,
+    name: u64,
     ts: u32,
     price: u32,
 }
@@ -350,6 +349,7 @@ impl Pending {
         key: 0,
         ingest: 0,
         uid: 0,
+        name: 0,
         ts: INVALID,
         price: 0,
     };
@@ -680,6 +680,7 @@ pub(super) struct EventInput<'a> {
 struct Parser<'a, 'catalog, 'table> {
     input: &'a EventInput<'catalog>,
     users: &'a Users<'table>,
+    interner: &'a crate::ExactIds,
     declined: &'a AtomicBool,
     window_seconds: i64,
     window_ms: u64,
@@ -703,7 +704,7 @@ impl Parser<'_, '_, '_> {
             let loc = if pending.ts != INVALID {
                 let person = self
                     .users
-                    .person(pending.uid, 0, pending.uid, &mut self.ids, self.declined);
+                    .person(pending.uid, 0, pending.name, &mut self.ids, self.declined);
                 let part = person as usize & (P - 1);
                 let index = self.people.push(part, person, pending.ts, pending.price);
                 if index >= INDEX_MASK as usize {
@@ -736,10 +737,10 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
         }
         // The parser can release its input chunk after this call. No
         // captured identities reference the source buffer.
-        let Some(key) = short_key(id, b'e').map(permute_short) else {
-            self.declined.store(true, Relaxed);
-            return;
-        };
+        // Short event IDs use the reversible packed key; v5's suffixed IDs
+        // are interned by their full bytes and stay exact.
+        let key = short_key(id, b'e').map(permute_short)
+            .unwrap_or_else(|| self.interner.intern(id));
         let Some(seconds) = self.dates.utc_seconds(fields.field::<3>()) else {
             self.declined.store(true, Relaxed);
             return;
@@ -779,10 +780,14 @@ impl<'a> EventSink<'a> for Parser<'_, '_, '_> {
                     .unwrap_or(&self.input.unknown);
                 pending.price = value | (category << 24);
             }
-            let Some(uid) = user_key(user) else {
+            let uid = user_key(user).unwrap_or_else(|| self.interner.intern(user));
+            // Keep a direct reference to the full ID for the name. This avoids
+            // decoding short keys later (and an allocation per person).
+            let Some(r) = crate::pack_ref(user) else {
                 self.declined.store(true, Relaxed);
                 break 'valid;
             };
+            pending.name = r;
             self.users.prefetch(uid);
             pending.ts = relative as u32;
             pending.uid = uid;
@@ -799,6 +804,7 @@ fn events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
+    interner: &crate::ExactIds,
     input: &EventInput<'_>,
     declined: &AtomicBool,
     estimated_rows: usize,
@@ -820,6 +826,7 @@ fn events(
             let mut parser = Parser {
                 input,
                 users,
+                interner,
                 declined,
                 window_seconds: input.start.div_euclid(1000),
                 window_ms: (input.end - input.start) as u64,
@@ -960,12 +967,13 @@ pub(super) fn run_events(
     work: &LazyChunks<'_>,
     read_ahead: &ReadAhead,
     users: &Users<'_>,
+    interner: &crate::ExactIds,
     input: &EventInput<'_>,
     linked_names: &[&'static [u8]],
     declined: &AtomicBool,
     estimated_rows: usize,
 ) -> Option<(u32, Vec<&'static [u8]>, Vec<People>)> {
-    let (claims, people) = events(work, read_ahead, users, input, declined, estimated_rows);
+    let (claims, people) = events(work, read_ahead, users, interner, input, declined, estimated_rows);
     if declined.load(Relaxed) {
         return None;
     }
