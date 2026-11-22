@@ -735,7 +735,9 @@ fn hs(b: &[u8], seed: u64) -> (u64, u32) {
 /// The top bit distinguishes packed user keys from interned keys. Shard-local
 /// ordinals identify complete byte strings; the hash only selects a lock.
 struct ExactIds {
-    shards: Vec<std::sync::Mutex<HashMap<Box<[u8]>, u64>>>,
+    // Keys borrow directly from the memory-mapped inputs, which live for the
+    // whole run. Interning a long ID therefore needs no allocation or copy.
+    shards: Vec<std::sync::Mutex<HashMap<&'static [u8], u64>>>,
 }
 
 impl ExactIds {
@@ -743,7 +745,7 @@ impl ExactIds {
         Self { shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect() }
     }
 
-    fn intern_in(&self, shard: usize, bytes: &[u8]) -> u64 {
+    fn intern_in(&self, shard: usize, bytes: &'static [u8]) -> u64 {
         let mut map = self.shards[shard].lock().unwrap();
         if let Some(&id) = map.get(bytes) {
             return id;
@@ -752,16 +754,16 @@ impl ExactIds {
         // Odd multiplication permutes the positive 63-bit ordinals. Allocating
         // enough distinct entries to exhaust this space exceeds addressable RAM.
         let id = ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (u64::MAX >> 1);
-        map.insert(bytes.into(), id);
+        map.insert(bytes, id);
         id
     }
 
-    fn intern(&self, bytes: &[u8]) -> u64 {
+    fn intern(&self, bytes: &'static [u8]) -> u64 {
         let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as u8;
         self.intern_in(shard as usize, bytes)
     }
 
-    fn user(&self, bytes: &[u8]) -> (u64, u32) {
+    fn user(&self, bytes: &'static [u8]) -> (u64, u32) {
         (nova::user_key(bytes).unwrap_or_else(|| self.intern(bytes)), 0)
     }
 }
@@ -1661,7 +1663,7 @@ fn link_root(parent: &[AtomicU32], mut node: u32) -> u32 {
 }
 
 fn build_links(
-    input: &[&[u8]],
+    input: &[&'static [u8]],
     estimated_users: usize,
     ids: &ExactIds,
     nova: bool,
