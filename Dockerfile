@@ -1,12 +1,17 @@
 # Shopping Sessions: Rust pipeline (rust/). The Python/DuckDB fallback is Dockerfile.python.
-FROM rust:1-slim-bookworm AS build
+# Pin the toolchain to the one used to train rust/pgo/merged.profdata (both LLVM 23.1.5).
+FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
+COPY rust/pgo/merged.profdata ./rust/pgo/merged.profdata
 # Portable baseline the Xeon scorers all support (AVX2, BMI2, FMA). Never target-cpu=native:
-# the image may be built on a different CPU than the one it runs on.
-RUN if [ "$TARGETARCH" = "amd64" ]; then export RUSTFLAGS="-C target-cpu=x86-64-v3"; fi; \
+# the image may be built on a different CPU than the one it runs on. The PGO profile was
+# trained on this exact source; -no-pgo-warn-mismatch tolerates residual function-hash drift.
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      export RUSTFLAGS="-C target-cpu=x86-64-v3 -C profile-use=/src/rust/pgo/merged.profdata -Cllvm-args=-no-pgo-warn-mismatch"; \
+    fi; \
     cargo build --release && strip target/release/rproto
 
 FROM gcr.io/distroless/cc-debian12:nonroot
