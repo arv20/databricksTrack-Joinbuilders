@@ -740,6 +740,19 @@ struct ExactIds {
     shards: Vec<std::sync::Mutex<HashMap<&'static [u8], u64>>>,
 }
 
+// A per-worker direct-mapped cache. Long user IDs repeat heavily (one person
+// has many events), so this absorbs most lookups before the shared mutex and
+// its AHash call. Each slot verifies the full bytes, so it is exact.
+const IDC_BITS: usize = 12;
+const IDC_LEN: usize = 1 << IDC_BITS;
+thread_local! {
+    // (id, borrowed bytes, length, first 8 bytes, last 8 bytes). The two words
+    // reject nearly every mismatch with a single integer compare, so the full
+    // byte comparison runs only when they agree.
+    static ID_CACHE: std::cell::RefCell<[(u64, &'static [u8], u32, u64, u64); IDC_LEN]> =
+        const { std::cell::RefCell::new([(0, &[], 0, 0, 0); IDC_LEN]) };
+}
+
 impl ExactIds {
     fn new() -> Self {
         Self { shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect() }
@@ -762,8 +775,29 @@ impl ExactIds {
     }
 
     fn intern(&self, bytes: &[u8]) -> u64 {
-        let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as u8;
-        self.intern_in(shard as usize, bytes)
+        let h = hs(bytes, 0x243f_6a88_85a3_08d3).0;
+        // SAFETY: every ID slice comes from a memory map leaked for the process.
+        let key: &'static [u8] = unsafe { std::mem::transmute(bytes) };
+        let slot = (h >> 52) as usize & (IDC_LEN - 1);
+        let (first, last) = if bytes.len() >= 16 {
+            (rd8(bytes, 0), rd8(bytes, bytes.len() - 8))
+        } else {
+            (0, 0)
+        };
+        if let Some(id) = ID_CACHE.with(|c| {
+            let c = c.borrow();
+            let (id, cached, len, cfirst, clast) = c[slot];
+            if len as usize == bytes.len() && cfirst == first && clast == last && cached == bytes {
+                Some(id)
+            } else {
+                None
+            }
+        }) {
+            return id;
+        }
+        let id = self.intern_in(h as usize & 255, bytes);
+        ID_CACHE.with(|c| c.borrow_mut()[slot] = (id, key, bytes.len() as u32, first, last));
+        id
     }
 
     fn user(&self, bytes: &[u8]) -> (u64, u32) {
