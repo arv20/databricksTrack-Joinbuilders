@@ -1,4 +1,4 @@
-# Stage 1: the fast path (Team 67's Express Lane design, MIT; see README).
+# Stage 1: the fast path
 FROM rust:1.100.0-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
