@@ -1,11 +1,8 @@
 // Shopping Sessions pipeline in Rust. This is the submitted pipeline (root Dockerfile).
 // Env: DATA_DIR, OUTPUT_DIR, NCPU, TIMING (stage times on stderr), FORCE_SLOW (use the fallback).
 //
-// Fast engine: input files are memory-mapped; strings are identified by a 64-bit hash plus an
-// independent 32-bit check instead of being interned. Valid event copies go straight into person
-// partitions. A separate, compact event-ID stream identifies the copies to tombstone before
-// sessions. Any detected hash collision (same 64-bit key, different check) or unsupported input
-// sends the run to the previous exact engine in slow.rs, so the output never depends on luck.
+// The mixed-ID engine packs common short IDs and interns other IDs by their full
+// bytes. The fixed-shape Nova engine remains available with NOVA=1.
 mod nova;
 mod slow;
 mod user_parquet;
@@ -735,6 +732,40 @@ fn hs(b: &[u8], seed: u64) -> (u64, u32) {
     (key, chk)
 }
 
+/// The top bit distinguishes packed user keys from interned keys. Shard-local
+/// ordinals identify complete byte strings; the hash only selects a lock.
+struct ExactIds {
+    shards: Vec<std::sync::Mutex<HashMap<Box<[u8]>, u64>>>,
+}
+
+impl ExactIds {
+    fn new() -> Self {
+        Self { shards: (0..256).map(|_| std::sync::Mutex::new(HashMap::default())).collect() }
+    }
+
+    fn intern_in(&self, shard: usize, bytes: &[u8]) -> u64 {
+        let mut map = self.shards[shard].lock().unwrap();
+        if let Some(&id) = map.get(bytes) {
+            return id;
+        }
+        let ordinal = (map.len() as u64 * 256) + shard as u64 + 1;
+        // Odd multiplication permutes the positive 63-bit ordinals. Allocating
+        // enough distinct entries to exhaust this space exceeds addressable RAM.
+        let id = ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15) & (u64::MAX >> 1);
+        map.insert(bytes.into(), id);
+        id
+    }
+
+    fn intern(&self, bytes: &[u8]) -> u64 {
+        let shard = hs(bytes, 0x243f_6a88_85a3_08d3).0 as u8;
+        self.intern_in(shard as usize, bytes)
+    }
+
+    fn user(&self, bytes: &[u8]) -> (u64, u32) {
+        (nova::user_key(bytes).unwrap_or_else(|| self.intern(bytes)), 0)
+    }
+}
+
 /// Open-addressing map from a 64-bit key (plus check) to a u32 value.
 struct Tab {
     slots: Vec<(u64, u64)>, // (key, (chk << 32) | val); key 0 = empty
@@ -851,7 +882,7 @@ impl D {
 
 /// Reversibly represent a common ID shape. The high bit of each ASCII byte
 /// is spare, so the prefix's case and the tail length can be kept in-band.
-/// All other IDs continue through the original hash-plus-check dedup path.
+/// Other IDs are interned and deduplicated in separate per-shard tables.
 #[inline]
 fn short_event_key(id: &[u8]) -> Option<u64> {
     let prefix = *id.first()?;
@@ -1529,8 +1560,8 @@ fn unpack_ref(r: u64) -> &'static [u8] {
 
 fn main() {
     unsafe { T0 = Some(Instant::now()) };
-    let nova = std::env::var_os("NOVA").as_deref() != Some(std::ffi::OsStr::new("0"));
-    if std::env::var_os("FORCE_SLOW").is_some() || !fast(0x243f_6a88_85a3_08d3, nova) {
+    let nova = std::env::var_os("NOVA").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if std::env::var_os("FORCE_SLOW").is_some() || !fast(nova) {
         if std::env::var_os("TIMING").is_some() {
             eprintln!("fast engine declined; running the exact fallback");
         }
@@ -1632,7 +1663,7 @@ fn link_root(parent: &[AtomicU32], mut node: u32) -> u32 {
 fn build_links(
     input: &[&[u8]],
     estimated_users: usize,
-    seed: u64,
+    ids: &ExactIds,
     nova: bool,
 ) -> Option<(Tab, usize, usize, Vec<&'static [u8]>)> {
     let chunks = chunks(input, 1 << 18);
@@ -1675,7 +1706,7 @@ fn build_links(
                     };
                     (key, 0)
                 } else {
-                    hs(s, seed)
+                    ids.user(s)
                 };
                 let key = if key == 0 { 1 } else { key };
                 let shard = ((key as usize) & table.mask) >> shift;
@@ -1840,7 +1871,7 @@ fn build_links(
 }
 
 /// Runs the fast engine. Returns false (having written nothing) if it cannot guarantee exactness.
-fn fast(seed: u64, nova: bool) -> bool {
+fn fast(nova: bool) -> bool {
     let data = std::env::var("DATA_DIR").unwrap_or("/data".into());
     let out = std::env::var("OUTPUT_DIR").unwrap_or("/output".into());
     let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -1950,7 +1981,8 @@ fn fast(seed: u64, nova: bool) -> bool {
         ra.wait(b);
     }
     lap("  links read");
-    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, seed, nova) else {
+    let ids = ExactIds::new();
+    let Some((mut ltab, nedges, nids, pname)) = build_links(&lkb, est_users, &ids, nova) else {
         return false;
     };
     let coll = AtomicBool::new(false);
@@ -2018,7 +2050,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                             return;
                         }
                         let short_key = short_event_key(id);
-                        let (hid, hchk) = short_key.map_or_else(|| hs(id, seed), |key| (key, 0));
+                        let (hid, hchk) = short_key.map_or_else(|| (ids.intern(id).rotate_left(1), 0), |key| (key, 0));
                         let ingest = dates.parse(ing);
                         let (order, loc) = match ingest {
                             None => (i32::MAX, NO_EVENT | UNPARSED_INGEST),
@@ -2063,7 +2095,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                                 break 'v;
                             };
                             r.name_ref = name;
-                            (r.pkey, r.pchk) = hs(user, seed);
+                            (r.pkey, r.pchk) = ids.user(user);
                             users.prefetch(r.pkey);
                             r.ts = (t - w0) as u32;
                         }
@@ -2135,7 +2167,7 @@ fn fast(seed: u64, nova: bool) -> bool {
                     let Some(key) = nova::user_key(user) else { return };
                     (key, 0)
                 } else {
-                    hs(user, seed)
+                    ids.user(user)
                 };
                 users.prefetch(key);
                 let tag = ptr | (u64::from(campaign) << 48);
@@ -2730,5 +2762,22 @@ fn lazy_chunks_cover_every_data_line_once() {
             }
             assert_eq!(got, want, "case {case} target {target}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mixed_id_tests {
+    use super::*;
+
+    #[test]
+    fn long_ids_in_one_bucket_are_compared_in_full() {
+        let ids = ExactIds::new();
+        let first = b"u0000000000000000000000000000000a";
+        let second = b"u0000000000000000000000000000000A";
+        let a = ids.intern_in(5, first);
+        let b = ids.intern_in(5, second);
+        assert_ne!(a, b);
+        assert_eq!(a, ids.intern_in(5, first));
+        assert_ne!(a, nova::user_key(b"u12345678").unwrap());
     }
 }
